@@ -24,10 +24,24 @@ to a more recent version, I will also import it myself to use it directly locall
 
 - ran a training run, obtained results similar to the logs shown in Appendix B. of Chapter 5 in the [thesis manuscript](https://theses.hal.science/tel-05467318v1), so hopefully nothing broken at the moment
 
+- fixed another env bug in the `ppo_eval_simple.py` script, where a function needed to be called on the unwrapped env instead of wrapped one
+
 #### Tasks identified
 
-- [ ] test training script doesn't break for SAC
+- [ ] test training script doesn't break for SAC (it does)
 
 - [ ] import TD-MPC2 properly (fix submodule/imports)
 
 - [ ] test TD-MPC2 training script 
+
+#### Notes
+
+Currently for PPO, I managed to train and evaluate a PPO agent and it achieves the same scores as the ones found in the paper. 
+The scores are between -50 and -25 approximately which is what we observe on the graphs in the appendix.
+
+The bugs I fixed are most lkely due to dependency version changes, so it was just not maintained for newer versions most likely.
+
+My agent is saved but ignored, i used this coommand to evaluate it: `python eval/attitude_control/ppo_eval_simple.py rl.PPO.env_id=ACBohnNoVaIErr-v0 env/jsbsim=gustsonly model_path=models/train/ppo/2864/ppo_gustsonly_2864.pt res_file=ppo_gustsonly_1 ref_file=simple_easy`,
+and to train it's the same one as in the README.md!
+
+Started working on SAC, execute train with: `python train/sac_train.py rl.SAC.env_id=ACBohnNoVaIErr-v0 rl.SAC.exp_name=gustsonly env/jsbsim=gustsonly`
