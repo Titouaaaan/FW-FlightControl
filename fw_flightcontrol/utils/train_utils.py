@@ -8,7 +8,7 @@ import wandb
 import plotly.graph_objects as go
 from math import pi
 from fw_flightcontrol.agents import sac_norm, sac, ppo_norm, ppo
-from fw_flightcontrol.agents.tdmpc2.tdmpc2.tdmpc2 import TDMPC2
+#from fw_flightcontrol.agents.tdmpc2.tdmpc2.tdmpc2 import TDMPC2
 from fw_jsbgym.utils import conversions
 from fw_jsbgym.utils import jsbsim_properties as prp
 from omegaconf import DictConfig, OmegaConf, ListConfig
@@ -116,13 +116,21 @@ def periodic_eval_AC(env_id, ref_seq, cfg_mdp, cfg_sim, env, agent, device):
     # computing the rmse of the roll and pitch angles across all episodes for each difficulty level
     obs_hist_size = cfg_mdp.obs_hist_size
 
-    if isinstance(agent, sac.Actor_SAC) or isinstance(agent, sac_norm.Actor_SAC):
+    #if isinstance(agent, sac.Actor_SAC) or isinstance(agent, sac_norm.Actor_SAC):
     # Check if dif_obs has an inhomogeneous shape and pad the dif_obs array with np.pi (if episode truncated fill the errors with np.pi)
     # only happens with SAC
     # (copilot generated snippet careful)
-        if len(set(np.shape(obs) for obs in dif_obs)) > 1:
-            max_shape = max(np.shape(obs) for obs in dif_obs)
-            dif_obs = [np.pad(obs, [(0, max_shape[0]-np.shape(obs)[0]), (0, max_shape[1]-np.shape(obs)[1])], constant_values=np.pi) for obs in dif_obs]
+    #    if len(set(np.shape(obs) for obs in dif_obs)) > 1:
+    #        max_shape = max(np.shape(obs) for obs in dif_obs)
+    #        dif_obs = [np.pad(obs, [(0, max_shape[0]-np.shape(obs)[0]), (0, max_shape[1]-np.shape(obs)[1])], constant_values=np.pi) for obs in dif_obs]
+    # Check if dif_obs has inhomogeneous shape and pad (works for all agent types)
+    
+    # NOTE: from testing with ppo too and not just sac i hit the same error so i remove the agent type chec
+    # to keep it general for all agent types and not just sac
+    if len(set(np.shape(obs) for obs in dif_obs)) > 1:
+        max_shape = max(np.shape(obs) for obs in dif_obs)
+        dif_obs = [np.pad(obs, [(0, max_shape[0]-np.shape(obs)[0]), (0, max_shape[1]-np.shape(obs)[1])], constant_values=np.pi) for obs in dif_obs]
+
 
     dif_obs = np.array(dif_obs)
     if obs_hist_size == 1 and not cfg_mdp.obs_is_matrix:
@@ -139,6 +147,7 @@ def periodic_eval_AC(env_id, ref_seq, cfg_mdp, cfg_sim, env, agent, device):
         medium_pitch_rmse = np.sqrt(np.mean(np.square(dif_obs[1, :, :, obs_hist_size-1, 7])))
         hard_roll_rmse = np.sqrt(np.mean(np.square(dif_obs[2, :, :, obs_hist_size-1, 6])))
         hard_pitch_rmse = np.sqrt(np.mean(np.square(dif_obs[2, :, :, obs_hist_size-1, 7])))
+        
 
     return dict(
         episode_reward=np.nanmean(ep_rewards),

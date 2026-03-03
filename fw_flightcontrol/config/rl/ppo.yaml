@@ -1,5 +1,8 @@
 # Description: Configuration file for PPO algorithm
 PPO:
+    roll_limit: 60 # 45 up to moderate, 60 up to hard
+    pitch_limit: 30 # 25 up to moderate, 30 up to hard
+
     exp_name: ppo_caps_nova
     seed: ???
     torch_deterministic: True
