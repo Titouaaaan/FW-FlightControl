@@ -30,7 +30,8 @@ def eval(cfg: DictConfig):
     # env setup
     env = make_env(cfg_ppo.env_id, cfg.env, cfg_sim.render_mode,
                        'telemetry/telemetry.csv', eval=True)()
-    env.init()
+    env_unwrapped = env.unwrapped
+    env_unwrapped.init()
 
     # loading the agent
     train_dict = torch.load(cfg.model_path, map_location=device)
@@ -86,7 +87,7 @@ def eval(cfg: DictConfig):
         # targets[0] = np.deg2rad(30)
         # targets[1] = np.deg2rad(15)
         while step < total_steps:
-            env.set_target_state(targets)
+            env_unwrapped.set_target_state(targets)
             action = ppo_agent.get_action_and_value(obs)[1].squeeze_(0).detach().cpu().numpy()
             obs, reward, terminated, truncated, info = env.step(action)
             if cfg_task.mdp.obs_is_matrix:
