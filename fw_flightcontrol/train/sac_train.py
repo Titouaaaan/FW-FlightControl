@@ -82,6 +82,7 @@ def train(cfg: DictConfig):
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
     print("Single Env Observation Space Shape = ", envs.single_observation_space.shape)
     unwr_envs = envs.envs[0].unwrapped
+    unwr_envs.init()
 
     actor = Actor_SAC(envs).to(device)
     qf1 = SoftQNetwork_SAC(envs).to(device)
@@ -112,7 +113,7 @@ def train(cfg: DictConfig):
     )
 
     # initial roll and pitch references
-    targets = train_utils.sample_targets(True, cfg_sac.env_id, cfg_sac)
+    targets = train_utils.sample_targets(True, cfg_sac.env_id, unwr_envs, cfg_sac)
     global_step = 0
     prev_gl_step = 0
 
@@ -128,7 +129,7 @@ def train(cfg: DictConfig):
         prev_div, _ = divmod(prev_gl_step, cfg_sac.eval_freq)
         curr_div, _ = divmod(global_step, cfg_sac.eval_freq)
         if cfg_sac.periodic_eval and (prev_div != curr_div or global_step == 0):
-            eval_dict = train_utils.periodic_eval(cfg_sac.env_id, cfg_mdp, cfg_sim, envs.envs[0], actor, device)
+            eval_dict = train_utils.periodic_eval(cfg_sac.env_id, cfg_mdp, cfg_sim, unwr_envs, actor, device)
             for k, v in eval_dict.items():
                 writer.add_scalar("eval/" + k, v, global_step)
         prev_gl_step = global_step
@@ -146,7 +147,7 @@ def train(cfg: DictConfig):
 
         done = np.logical_or(terminations, truncations)
         if done:
-            targets = train_utils.sample_targets(True, cfg_sac.env_id, cfg_sac)
+            targets = train_utils.sample_targets(True, cfg_sac.env_id, unwr_envs, cfg_sac)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
@@ -161,11 +162,13 @@ def train(cfg: DictConfig):
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
+                print(infos.keys())
+                real_next_obs[idx] = infos["non_norm_obs"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
+        print(obs[0])
 
         # ALGO LOGIC: training.
         if global_step > cfg_sac.learning_starts:
