@@ -12,15 +12,17 @@ import torch
 import hydra
 from termcolor import colored
 
-sys.path.append(f'{os.path.dirname(os.path.abspath(__file__))}/../agents/tdmpc2/tdmpc2/')
+sys.path.append(f'{os.path.dirname(os.path.abspath(__file__))}/../agents/tdmpc2/tdmpc2/tdmpc2')
 
-from fw_flightcontrol.agents.tdmpc2.tdmpc2.common.parser import parse_cfg
-from fw_flightcontrol.agents.tdmpc2.tdmpc2.common.buffer import Buffer
-from fw_flightcontrol.agents.tdmpc2.tdmpc2.envs import make_env
-from fw_flightcontrol.agents.tdmpc2.tdmpc2.tdmpc2 import TDMPC2
-from fw_flightcontrol.agents.tdmpc2.tdmpc2.trainer.offline_trainer import OfflineTrainer
-from fw_flightcontrol.agents.tdmpc2.tdmpc2.trainer.online_trainer import OnlineTrainer
-from fw_flightcontrol.agents.tdmpc2.tdmpc2.common.logger import Logger
+from common.parser import parse_cfg
+from common.buffer import Buffer
+from envs import make_env
+from trainer.offline_trainer import OfflineTrainer
+from trainer.online_trainer import OnlineTrainer
+from common.logger import Logger
+from tdmpc2.tdmpc2 import TDMPC2
+
+import fw_jsbgym
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('high')
@@ -54,7 +56,7 @@ def train(cfg: dict):
 
 	print(colored('Work dir:', 'yellow', attrs=['bold']), cfg.rl.work_dir)
 	trainer_cls = OfflineTrainer if cfg.rl.multitask else OnlineTrainer
-	env = make_env(cfg)
+	env = make_env(cfg.rl)
 	cfg_rl = update_cfg(cfg.rl)
 	trainer = trainer_cls(
 		cfg=cfg_rl,
