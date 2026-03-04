@@ -93,6 +93,7 @@ rl:
     wandb_entity: ???
     wandb_silent: false
     disable_wandb: true
+    enable_wandb: false
     save_csv: true
 
     # misc

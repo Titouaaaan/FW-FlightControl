@@ -16,13 +16,34 @@ sys.path.append(f'{os.path.dirname(os.path.abspath(__file__))}/../agents/tdmpc2/
 
 from common.parser import parse_cfg
 from common.buffer import Buffer
-from envs import make_env
+
+#from envs import make_env
+
 from trainer.offline_trainer import OfflineTrainer
 from trainer.online_trainer import OnlineTrainer
 from common.logger import Logger
 from tdmpc2.tdmpc2 import TDMPC2
 
+from envs import make_env as _make_env_original
 import fw_jsbgym
+import gymnasium as gym
+from omegaconf import OmegaConf
+from envs.wrappers.tensor import TensorWrapper
+
+def make_env(cfg):
+    OmegaConf.set_struct(cfg, False)
+    try:
+        env = gym.make(cfg.task, cfg_env=cfg.cfg_env, render_mode=cfg.render_mode) 
+        try:
+            cfg.obs_shape = {k: v.shape for k, v in env.observation_space.spaces.items()}
+        except:
+            cfg.obs_shape = {cfg.get('obs', 'state'): env.observation_space.shape}
+        cfg.action_dim = env.action_space.shape[0]
+        cfg.episode_length = int(cfg.cfg_env.jsbsim.episode_length_s * cfg.cfg_env.jsbsim.agent_freq)
+        cfg.seed_steps = max(1000, 5*cfg.episode_length)
+        return TensorWrapper(env)
+    except Exception:
+        return _make_env_original(cfg)
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('high')
@@ -51,20 +72,24 @@ def train(cfg: dict):
 	assert torch.cuda.is_available()
 	assert cfg.rl.steps > 0, 'Must train for at least 1 step.'
 	cfg.rl = parse_cfg(cfg.rl)
+	OmegaConf.set_struct(cfg.rl, False)
+	cfg.rl.cfg_env = cfg.env
 	os.chdir(hydra.utils.get_original_cwd())
 	np.set_printoptions(precision=3, suppress=True)
 
 	print(colored('Work dir:', 'yellow', attrs=['bold']), cfg.rl.work_dir)
 	trainer_cls = OfflineTrainer if cfg.rl.multitask else OnlineTrainer
 	env = make_env(cfg.rl)
+	env.unwrapped.init()
+	
 	cfg_rl = update_cfg(cfg.rl)
 	trainer = trainer_cls(
 		cfg=cfg_rl,
-		cfg_all=cfg,
+		#cfg_all=cfg,
 		env=env,
 		agent=TDMPC2(cfg_rl),
 		buffer=Buffer(cfg_rl),
-		logger=Logger(cfg, cfg_rl),
+		logger=Logger(cfg_rl),
 	)
 	trainer.train()
 	print('\nTraining completed successfully')
