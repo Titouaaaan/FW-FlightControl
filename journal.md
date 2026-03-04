@@ -30,9 +30,9 @@ to a more recent version, I will also import it myself to use it directly locall
 
 - [ ] test training script doesn't break for SAC (it does)
 
-- [ ] import TD-MPC2 properly (fix submodule/imports)
+- [x] import TD-MPC2 properly (fix submodule/imports)
 
-- [ ] test TD-MPC2 training script 
+- [x] test TD-MPC2 training script 
 
 #### Notes
 
@@ -45,3 +45,14 @@ My agent is saved but ignored, i used this coommand to evaluate it: `python eval
 and to train it's the same one as in the README.md!
 
 Started working on SAC, execute train with: `python train/sac_train.py rl.SAC.env_id=ACBohnNoVaIErr-v0 rl.SAC.exp_name=gustsonly env/jsbsim=gustsonly`
+
+### 004/03/2026
+
+- managed to make TD-MPC2 run locally but not on the custom env yet (tried with dog-walk and it runs). Tested the training, evaluation, saving and video recordings (it all works). Did not go through a full training however, no need to at the moment
+
+- 
+
+### Notes
+
+Remarks: should i fully integrate TD-MPC2 code into the repository? At the moment it is a pointer to the official repo.
+That's fine to avoid having to much code but also it means we cant touch the code (which I guess well cause issues once we try and add code to TD-MPC2, but maybe i'll have to create another repo for our implementation with the infused physics? interesting discussion point).
