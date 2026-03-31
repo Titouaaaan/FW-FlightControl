@@ -1,6 +1,7 @@
 """
-Attitude Control Data Collection Script
-Runs N random attitude control experiments and prints results to terminal.
+Trajectory Data Collection Script
+Generates trajectories systematically to cover the observable space.
+Saves trajectory statistics without file logging.
 
 Usage:
     python data_collection.py
@@ -13,34 +14,42 @@ import hydra
 from fw_flightcontrol.agents.pid import PID
 from fw_jsbgym.trim.trim_point import TrimPoint
 from omegaconf import DictConfig
+import itertools
 
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-NUM_EXPERIMENTS = 5
+# Define systematic target angles for space coverage (in degrees)
+ROLL_TARGETS = [5, 10, 15, 20, 25, 30, 35]      # 7 roll angles
+PITCH_TARGETS = [5, 15, 20]                      # 3 pitch angles
+# Total trajectories: 7 * 3 = 21 (easily extensible by adding more values)
+
 NUM_STEPS = 2000  # 20 seconds at 100 Hz
+TRAJECTORIES = []  # Will store trajectory history for future incremental additions
 
 
-def run_single_experiment(env, experiment_num, target_roll_deg, target_pitch_deg):
+def run_single_trajectory(env, trajectory_num, target_roll_deg, target_pitch_deg):
     """
-    Run a single attitude control experiment with PID controllers.
+    Run a single attitude control trajectory with PID controllers.
     
     Args:
         env: The attitude control environment
-        experiment_num: Experiment number for display
+        trajectory_num: Trajectory number for display
         target_roll_deg: Target roll angle in degrees
         target_pitch_deg: Target pitch angle in degrees
     
     Returns:
-        Tuple of (roll_rmse, pitch_rmse, total_reward)
+        Dictionary with trajectory statistics:
+        - target_roll, target_pitch
+        - avg_roll, avg_pitch (actual observed angles)
+        - avg_roll_error, avg_pitch_error
+        - total_reward
     """
     
     # Convert targets to radians
     target_roll_rad = np.deg2rad(target_roll_deg)
     target_pitch_rad = np.deg2rad(target_pitch_deg)
-    
-    print(f"\n[Exp {experiment_num}/{NUM_EXPERIMENTS}] Target: Roll={target_roll_deg:.1f}°, Pitch={target_pitch_deg:.1f}°")
     
     # Initialize PID controllers
     pid_aileron = PID(
@@ -67,8 +76,10 @@ def run_single_experiment(env, experiment_num, target_roll_deg, target_pitch_deg
     target_state = np.array([target_roll_rad, target_pitch_rad])
     env.set_target_state(target_state)
     
-    # Run simulation
+    # Run trajectory
     episode_reward = 0.0
+    roll_angles = []
+    pitch_angles = []
     roll_errors = []
     pitch_errors = []
     
@@ -92,10 +103,16 @@ def run_single_experiment(env, experiment_num, target_roll_deg, target_pitch_deg
         obs, reward, terminated, truncated, info = env.step(action)
         episode_reward += reward
         
-        # Track errors
+        # Track angles and errors
+        roll_angles.append(np.rad2deg(obs[0]))
+        pitch_angles.append(np.rad2deg(obs[1]))
+        
         if len(obs) > 7:
             roll_errors.append(np.rad2deg(obs[6]))
             pitch_errors.append(np.rad2deg(obs[7]))
+        else:
+            roll_errors.append(np.rad2deg(target_roll_rad - obs[0]))
+            pitch_errors.append(np.rad2deg(target_pitch_rad - obs[1]))
         
         if terminated or truncated:
             break
@@ -103,72 +120,129 @@ def run_single_experiment(env, experiment_num, target_roll_deg, target_pitch_deg
     env.close()
     
     # Compute statistics
-    roll_errors = np.array(roll_errors)
-    pitch_errors = np.array(pitch_errors)
-    roll_rmse = np.sqrt(np.mean(roll_errors**2)) if len(roll_errors) > 0 else 0.0
-    pitch_rmse = np.sqrt(np.mean(pitch_errors**2)) if len(pitch_errors) > 0 else 0.0
+    avg_roll = np.mean(roll_angles) if roll_angles else 0.0
+    avg_pitch = np.mean(pitch_angles) if pitch_angles else 0.0
+    avg_roll_error = np.mean(np.abs(roll_errors)) if roll_errors else 0.0
+    avg_pitch_error = np.mean(np.abs(pitch_errors)) if pitch_errors else 0.0
     
-    print(f"  → Roll RMSE: {roll_rmse:.4f}°, Pitch RMSE: {pitch_rmse:.4f}°, Reward: {episode_reward:.4f}")
+    trajectory_data = {
+        'trajectory_num': trajectory_num,
+        'target_roll': target_roll_deg,
+        'target_pitch': target_pitch_deg,
+        'avg_roll': avg_roll,
+        'avg_pitch': avg_pitch,
+        'avg_roll_error': avg_roll_error,
+        'avg_pitch_error': avg_pitch_error,
+        'total_reward': episode_reward,
+        'steps_executed': len(roll_angles)
+    }
     
-    return roll_rmse, pitch_rmse, episode_reward
+    print(f"[Traj {trajectory_num:2d}] Targets: Roll={target_roll_deg:5.1f}°, Pitch={target_pitch_deg:5.1f}° → "
+          f"Avg Roll={avg_roll:6.2f}°, Avg Pitch={avg_pitch:6.2f}°, "
+          f"Errors: Roll={avg_roll_error:5.2f}°, Pitch={avg_pitch_error:5.2f}°")
+    
+    return trajectory_data
 
 
-def main(cfg: DictConfig):
-    """Main function to run N random attitude control experiments."""
+def print_trajectory_summary(trajectory_results):
+    """Print a formatted table of trajectory results."""
+    print("\n" + "="*120)
+    print("TRAJECTORY SUMMARY")
+    print("="*120)
+    print(f"{'Traj':>4} | {'Target Roll':>12} | {'Target Pitch':>13} | {'Avg Roll':>10} | {'Avg Pitch':>11} | "
+          f"{'Roll Error':>11} | {'Pitch Error':>12} | {'Reward':>10} | {'Steps':>6}")
+    print("-" * 120)
     
-    print("\n" + "="*80)
-    print(f"RUNNING {NUM_EXPERIMENTS} RANDOM ATTITUDE CONTROL EXPERIMENTS")
-    print("="*80)
-    print(f"Target angles: Roll and Pitch each in range [10°, 20°]")
-    print(f"Steps per experiment: {NUM_STEPS}")
-    print("="*80)
+    for traj in trajectory_results:
+        print(f"{traj['trajectory_num']:4d} | {traj['target_roll']:12.2f}° | {traj['target_pitch']:13.2f}° | "
+              f"{traj['avg_roll']:10.2f}° | {traj['avg_pitch']:11.2f}° | "
+              f"{traj['avg_roll_error']:11.2f}° | {traj['avg_pitch_error']:12.2f}° | "
+              f"{traj['total_reward']:10.4f} | {traj['steps_executed']:6d}")
     
-    results = []
+    print("-" * 120)
     
-    try:
-        for exp_num in range(1, NUM_EXPERIMENTS + 1):
-            # Generate random target angles between 10 and 20 degrees
-            target_roll = np.random.uniform(10, 20)
-            target_pitch = np.random.uniform(10, 20)
-            
-            # Create fresh environment for each experiment
+    # Compute and print averages
+    num_trajectories = len(trajectory_results)
+    avg_target_roll = np.mean([t['target_roll'] for t in trajectory_results])
+    avg_target_pitch = np.mean([t['target_pitch'] for t in trajectory_results])
+    avg_obs_roll = np.mean([t['avg_roll'] for t in trajectory_results])
+    avg_obs_pitch = np.mean([t['avg_pitch'] for t in trajectory_results])
+    avg_roll_err = np.mean([t['avg_roll_error'] for t in trajectory_results])
+    avg_pitch_err = np.mean([t['avg_pitch_error'] for t in trajectory_results])
+    avg_reward = np.mean([t['total_reward'] for t in trajectory_results])
+    
+    print(f"{'AVG':>4} | {avg_target_roll:12.2f}° | {avg_target_pitch:13.2f}° | "
+          f"{avg_obs_roll:10.2f}° | {avg_obs_pitch:11.2f}° | "
+          f"{avg_roll_err:11.2f}° | {avg_pitch_err:12.2f}° | "
+          f"{avg_reward:10.4f} |")
+    print("="*120 + "\n")
+    
+    print(f"Total trajectories generated: {num_trajectories}")
+    print(f"Configuration: ROLL_TARGETS = {ROLL_TARGETS}")
+    print(f"Configuration: PITCH_TARGETS = {PITCH_TARGETS}")
+    print(f"(To extend coverage, add more values to ROLL_TARGETS or PITCH_TARGETS at the top of the script)\n")
+
+
+def generate_systematic_trajectories(cfg: DictConfig):
+    """
+    Generate trajectories systematically to cover the observable space.
+    
+    Args:
+        cfg: Hydra configuration
+    
+    Returns:
+        List of trajectory result dictionaries
+    """
+    trajectory_results = []
+    
+    print("\n" + "="*120)
+    print(f"GENERATING SYSTEMATIC TRAJECTORIES FOR SPACE COVERAGE")
+    print("="*120)
+    print(f"Nominal conditions (no wind or disturbances)")
+    print(f"Roll targets: {ROLL_TARGETS}")
+    print(f"Pitch targets: {PITCH_TARGETS}")
+    print(f"Number of trajectories: {len(ROLL_TARGETS) * len(PITCH_TARGETS)}")
+    print("="*120 + "\n")
+    
+    trajectory_num = 1
+    
+    # Generate all combinations of roll and pitch targets
+    for target_roll, target_pitch in itertools.product(ROLL_TARGETS, PITCH_TARGETS):
+        try:
+            # Create fresh environment for each trajectory
             env = gym.make(
                 'ACBohnNoVaIErr-v0',
                 cfg_env=cfg.env,
                 render_mode='none'
             )
             
-            # Run experiment
-            roll_rmse, pitch_rmse, reward = run_single_experiment(
-                env, exp_num, target_roll, target_pitch
+            # Run trajectory
+            trajectory_data = run_single_trajectory(
+                env, trajectory_num, target_roll, target_pitch
             )
             
-            results.append({
-                'exp': exp_num,
-                'target_roll': target_roll,
-                'target_pitch': target_pitch,
-                'roll_rmse': roll_rmse,
-                'pitch_rmse': pitch_rmse,
-                'reward': reward
-            })
+            trajectory_results.append(trajectory_data)
+            TRAJECTORIES.append(trajectory_data)  # Store for future incremental additions
+            
+            trajectory_num += 1
+            
+        except Exception as e:
+            print(f"Error in trajectory {trajectory_num}: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    return trajectory_results
+
+
+def main(cfg: DictConfig):
+    """Main function to generate systematic trajectories."""
+    
+    try:
+        # Generate trajectories with systematic coverage
+        trajectory_results = generate_systematic_trajectories(cfg)
         
         # Print summary table
-        print("\n" + "="*80)
-        print("SUMMARY")
-        print("="*80)
-        print(f"{'Exp':>3} | {'Target Roll':>12} | {'Target Pitch':>13} | {'Roll RMSE':>10} | {'Pitch RMSE':>11} | {'Reward':>10}")
-        print("-" * 80)
-        
-        for r in results:
-            print(f"{r['exp']:3d} | {r['target_roll']:12.2f}° | {r['target_pitch']:13.2f}° | {r['roll_rmse']:10.4f}° | {r['pitch_rmse']:11.4f}° | {r['reward']:10.4f}")
-        
-        print("-" * 80)
-        roll_rmses = np.array([r['roll_rmse'] for r in results])
-        pitch_rmses = np.array([r['pitch_rmse'] for r in results])
-        rewards = np.array([r['reward'] for r in results])
-        
-        print(f"{'AVG':>3} | {np.mean([r['target_roll'] for r in results]):12.2f}° | {np.mean([r['target_pitch'] for r in results]):13.2f}° | {np.mean(roll_rmses):10.4f}° | {np.mean(pitch_rmses):11.4f}° | {np.mean(rewards):10.4f}")
-        print("="*80 + "\n")
+        print_trajectory_summary(trajectory_results)
         
     except Exception as e:
         print(f"\nError: {e}")
