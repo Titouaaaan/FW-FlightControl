@@ -31,7 +31,7 @@ STATE_NAMES = [
 ACTION_NAMES = ['aileron', 'elevator', 'throttle']
 
 
-def load_trajectory_data(csv_path='data/trajectory_data.csv'):
+def load_trajectory_data(csv_path='../data/trajectory_data.csv'):
     """Load trajectory data from CSV."""
     print(f"Loading data from {csv_path}...")
     df = pd.read_csv(csv_path)
@@ -255,7 +255,7 @@ def calculate_trajectory_statistics(df):
 
 def main():
     # Load data
-    csv_path = Path('data/trajectory_data.csv')
+    csv_path = Path('../data/trajectory_data.csv')
     if not csv_path.exists():
         print(f"Error: {csv_path} not found!")
         return

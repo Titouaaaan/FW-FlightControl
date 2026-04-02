@@ -1,0 +1,70 @@
+# Aerodynamic Coefficients for Skywalker X8 (Gryte et al. 2018)
+# Priority: Wind Tunnel (WT) values preferred; XFLR5 used when WT unavailable
+# Table 5: "Aerodynamic modeling of the Skywalker X8 Fixed-Wing Unmanned Aerial Vehicle"
+# State variables: [phi, theta, Va, p, q, r, alpha, beta]
+# Action variables: [delta_a (aileron), delta_e (elevator)]
+# Note: Throttle is currently fixed; can be added as third action later
+
+# Lift coefficients
+C_L0: 0.0867           # WT
+C_L_alpha: 4.02        # WT
+C_L_delta_e: 0.278     # WT
+C_L_q: 3.87            # XFLR5 (WT unavailable)
+
+# Drag coefficients (linear approximation - C_D_q not available)
+C_D0: 0.0197           # WT
+C_D_alpha: 0.0791      # WT (linear term, C_D_alpha^1)
+C_D_delta_e: 0.0633    # WT
+
+# Side force coefficients
+C_Y0: 0.00316          # WT
+C_Y_beta: -0.224       # WT
+C_Y_p: -0.137          # XFLR5 (WT unavailable)
+C_Y_r: 0.0839          # XFLR5 (WT unavailable)
+C_Y_delta_a: 0.0433    # WT
+
+# Rolling moment coefficients
+C_l0: 0.00413          # WT
+C_l_beta: -0.0849      # WT
+C_l_p: -0.404          # XFLR5 (WT unavailable)
+C_l_r: 0.0555          # XFLR5 (WT unavailable)
+C_l_delta_a: 0.12      # WT
+
+# Pitching moment coefficients
+C_m0: 0.0302           # WT
+C_m_alpha: -0.126      # WT
+C_m_q: -1.3            # XFLR5 (WT unavailable)
+C_m_delta_e: -0.206    # WT
+
+# Yawing moment coefficients
+C_n0: -0.000471        # WT
+C_n_beta: 0.0283       # WT
+C_n_p: 0.00437         # XFLR5 (WT unavailable)
+C_n_r: -0.012          # XFLR5 (WT unavailable)
+C_n_delta_a: -0.00339  # WT
+
+# Aircraft physical parameters
+g: 9.81           # m/s^2
+rho: 1.225        # kg/m^3 (air density at sea level)
+
+# Wing geometry (from JSBSim x8.xml)
+S: 0.75           # m^2 (planform area / wing area)
+b: 2.10           # m (wingspan)
+c: 0.3571         # m (mean chord)
+
+# Inertia tensor (kg*m^2)
+# From JSBSim X8 aircraft model
+J_x: 1.2290
+J_y: 0.1702
+J_z: 0.8808
+J_xz: 0.9343
+
+# Mass (kg) - empty weight
+mass: 3.3640
+
+# Propulsion
+C_p: 5.9          # thrust coefficient (T_p = C_p * delta_t where delta_t in [0,1])
+
+# Throttle (DEPRECATED - now dynamic from action[2] in the physics model)
+# This value is no longer used; throttle is extracted from the 3rd action dimension at runtime
+throttle: 0.5     # [DEPRECATED] kept for reference only

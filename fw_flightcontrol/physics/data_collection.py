@@ -459,8 +459,8 @@ def main(cfg: DictConfig):
         print_trajectory_summary(trajectory_results)
         
         # Save trajectory data to both CSV and Parquet
-        csv_file = save_trajectory_data_to_csv(trajectory_results, 'data/trajectory_data.csv')
-        parquet_file = save_trajectory_data_to_parquet(trajectory_results, 'data/trajectory_data.parquet')
+        csv_file = save_trajectory_data_to_csv(trajectory_results, '../data/trajectory_data.csv')
+        parquet_file = save_trajectory_data_to_parquet(trajectory_results, '../data/trajectory_data.parquet')
         
         print(f"\n{'='*80}")
         print("✓ Data collection complete!")
