@@ -13,6 +13,7 @@ import fw_jsbgym
 import hydra
 from fw_flightcontrol.agents.pid import PID
 from fw_jsbgym.trim.trim_point import TrimPoint
+from fw_jsbgym.utils import jsbsim_properties as prp
 from omegaconf import DictConfig, OmegaConf
 import itertools
 import csv
@@ -110,12 +111,16 @@ def run_single_trajectory(env, trajectory_num, target_roll_deg, target_pitch_deg
         aileron_cmd, _, _ = pid_aileron.update(state=roll, state_dot=p_radps, saturate=True, normalize=False)
         elevator_cmd, _, _ = pid_elevator.update(state=pitch, state_dot=q_radps, saturate=True, normalize=False)
         
-        # Store action (a_t)
-        action = np.array([aileron_cmd, elevator_cmd])
+        # Store action (a_t) - will be updated with throttle after step
+        action = np.array([aileron_cmd, elevator_cmd, 0.0])  # throttle added below
         
         # Step environment
-        obs, reward, terminated, truncated, info = env.step(action)
+        obs, reward, terminated, truncated, info = env.step(action[:2])  # Only send aileron/elevator to env
         episode_reward += reward
+        
+        # Query throttle from environment after step
+        throttle = env.unwrapped.sim[prp.throttle_cmd]
+        action[2] = throttle  # Update 3rd dimension with actual throttle
         
         # Store next state (s_t+1) and transition info
         state_next = obs.copy()
@@ -206,7 +211,7 @@ def save_trajectory_data_to_csv(trajectory_results, output_file='trajectory_data
             fieldnames.append(f's_t_{i}')
         
         # Add action dimensions
-        for i in range(2):
+        for i in range(3):
             fieldnames.append(f'a_t_{i}')
         
         # Add next state dimensions
@@ -241,7 +246,7 @@ def save_trajectory_data_to_csv(trajectory_results, output_file='trajectory_data
                 
                 # Add action values
                 action = transition['action']
-                for i in range(2):
+                for i in range(3):
                     row[f'a_t_{i}'] = action[i]
                 
                 # Add next state values
@@ -258,7 +263,7 @@ def save_trajectory_data_to_csv(trajectory_results, output_file='trajectory_data
     
     print(f"\n✓ Saved {total_transitions} state transitions to '{output_file}'")
     print(f"  CSV format: trajectory_id, step_id, target_roll, target_pitch, ")
-    print(f"              s_t_0-13 (state), a_t_0-1 (action), s_t+1_0-13 (next state), reward, terminal")
+    print(f"              s_t_0-13 (state), a_t_0-2 (action), s_t+1_0-13 (next state), reward, terminal")
     return output_file
 
 
@@ -268,7 +273,7 @@ def save_trajectory_data_to_parquet(trajectory_results, output_file='trajectory_
     
     Parquet format (efficient columnar storage with nested arrays):
         trajectory_id, step_id, target_roll, target_pitch,
-        state (array[14]), action (array[2]), next_state (array[14]),
+        state (array[14]), action (array[3]), next_state (array[14]),
         reward, terminal
     
     Benefits:
@@ -454,8 +459,8 @@ def main(cfg: DictConfig):
         print_trajectory_summary(trajectory_results)
         
         # Save trajectory data to both CSV and Parquet
-        csv_file = save_trajectory_data_to_csv(trajectory_results, 'trajectory_data.csv')
-        parquet_file = save_trajectory_data_to_parquet(trajectory_results, 'trajectory_data.parquet')
+        csv_file = save_trajectory_data_to_csv(trajectory_results, 'data/trajectory_data.csv')
+        parquet_file = save_trajectory_data_to_parquet(trajectory_results, 'data/trajectory_data.parquet')
         
         print(f"\n{'='*80}")
         print("✓ Data collection complete!")

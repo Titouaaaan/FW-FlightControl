@@ -28,7 +28,7 @@ STATE_NAMES = [
     'airspeed'        # 13: true airspeed (m/s)
 ]
 
-ACTION_NAMES = ['aileron', 'elevator']
+ACTION_NAMES = ['aileron', 'elevator', 'throttle']
 
 
 def load_trajectory_data(csv_path='data/trajectory_data.csv'):
@@ -43,11 +43,11 @@ def parse_state_columns(df):
     """
     Parse state, action, and next_state from CSV.
     These are stored as flattened columns in the CSV format.
-    Format: s_t_0..s_t_13, a_t_0..a_t_1, s_t+1_0..s_t+1_13
+    Format: s_t_0..s_t_13, a_t_0..a_t_2 (aileron, elevator, throttle), s_t+1_0..s_t+1_13
     """
     # Extract state columns s_t_0 to s_t_13
     state_cols = [f's_t_{i}' for i in range(14)]
-    action_cols = [f'a_t_{i}' for i in range(2)]
+    action_cols = [f'a_t_{i}' for i in range(3)]
     next_state_cols = [f's_t+1_{i}' for i in range(14)]
     
     # Extract as numpy arrays
@@ -105,11 +105,19 @@ def calculate_action_stats(action):
         print(f"    Median:              {np.percentile(actions, 50):10.6f}")
         print(f"    75th percentile:     {np.percentile(actions, 75):10.6f}")
         
-        # Count saturation
-        at_minus_one = np.sum(np.isclose(actions, -1.0)) / len(actions) * 100
-        at_plus_one = np.sum(np.isclose(actions, 1.0)) / len(actions) * 100
-        print(f"    Saturation at -1:    {at_minus_one:.2f}%")
-        print(f"    Saturation at +1:    {at_plus_one:.2f}%")
+        # Count saturation - different ranges for throttle vs control surfaces
+        if name == 'throttle':
+            # Throttle range is [0, 1]
+            at_min = np.sum(np.isclose(actions, 0.0)) / len(actions) * 100
+            at_max = np.sum(np.isclose(actions, 1.0)) / len(actions) * 100
+            print(f"    Saturation at 0:     {at_min:.2f}%")
+            print(f"    Saturation at 1:     {at_max:.2f}%")
+        else:
+            # Aileron/elevator range is [-1, 1]
+            at_minus_one = np.sum(np.isclose(actions, -1.0)) / len(actions) * 100
+            at_plus_one = np.sum(np.isclose(actions, 1.0)) / len(actions) * 100
+            print(f"    Saturation at -1:    {at_minus_one:.2f}%")
+            print(f"    Saturation at +1:    {at_plus_one:.2f}%")
 
 
 def calculate_pid_accuracy(state, df):
@@ -270,6 +278,6 @@ def main():
     calculate_state_statistics(state)
     calculate_dynamics_statistics(state, action, next_state)
     print("\n✓ Data analysis complete!")
-    
+
 if __name__ == '__main__':
     main()
