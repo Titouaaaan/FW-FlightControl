@@ -6,51 +6,59 @@
 # Note: Throttle is currently fixed; can be added as third action later
 
 # Lift coefficients
-C_L0: 0.0867           # WT
-C_L_alpha: 4.02        # WT
-C_L_delta_e: 0.278     # WT
+C_L0: 0.08673557       # WT (exact from sim config)
+C_L_alpha: 4.02032824  # WT (exact from sim config)
+C_L_delta_e: 0.27807362 # WT (exact from sim config)
 C_L_q: 3.87            # XFLR5 (WT unavailable)
 
-# Drag coefficients (linear approximation - C_D_q not available)
-C_D0: 0.0197           # WT
-C_D_alpha: 0.0791      # WT (linear term, C_D_alpha^1)
-C_D_delta_e: 0.0633    # WT
+# Drag coefficients
+C_D0: 0.01970001       # WT (exact from sim config)
+C_D_alpha: 0.07909146  # WT linear term (exact from sim config)
+C_D_alpha2: 1.05546999 # WT quadratic term (not currently used in simple linear model)
+C_D_beta1: -0.00584298 # WT side slip term (not currently used)
+C_D_beta2: 0.14781193  # WT quadratic beta term (not currently used)
+C_D_p: 0.0102          # WT roll rate effect (not currently used)
+C_D_delta_e: 0.0633474 # WT (exact from sim config)
 
 # Side force coefficients
-C_Y0: 0.00316          # WT
-C_Y_beta: -0.224       # WT
-C_Y_p: -0.137          # XFLR5 (WT unavailable)
-C_Y_r: 0.0839          # XFLR5 (WT unavailable)
-C_Y_delta_a: 0.0433    # WT
+C_Y0: 0.0              # WT (CORRECTED: was 0.00316, sim has 0)
+C_Y_beta: -0.22387216  # WT (exact from sim config)
+C_Y_p: -0.13735505     # XFLR5 (exact from sim config)
+C_Y_r: 0.08386877      # XFLR5 (exact from sim config)
+C_Y_delta_a: 0.0432764 # WT (exact from sim config)
+C_Y_delta_r: 0.0        # Rudder effect (not used - no rudder control)
 
 # Rolling moment coefficients
-C_l0: 0.00413          # WT
-C_l_beta: -0.0849      # WT
-C_l_p: -0.404          # XFLR5 (WT unavailable)
-C_l_r: 0.0555          # XFLR5 (WT unavailable)
-C_l_delta_a: 0.12      # WT
+C_l0: 0.0              # WT (CORRECTED: was 0.00413, sim has 0)
+C_l_beta: -0.08489629  # WT (exact from sim config)
+C_l_p: -0.404198       # XFLR5 (exact from sim config)
+C_l_r: 0.0555206       # XFLR5 (exact from sim config)
+C_l_delta_a: 0.12018814 # WT (exact from sim config)
+C_l_delta_r: 0.0        # Rudder effect (not used - no rudder control)
 
 # Pitching moment coefficients
-C_m0: 0.0302           # WT
-C_m_alpha: -0.126      # WT
-C_m_q: -1.3            # XFLR5 (WT unavailable)
-C_m_delta_e: -0.206    # WT
+C_m0: 0.0227           # WT (JSBSim 2020 x8.xml value)
+C_m_alpha: -0.4629     # WT (JSBSim 2020 x8.xml value - WAS -0.2524, big difference!)
+C_m_q: -1.30123704     # XFLR5 (exact from sim config, matches JSBSim)
+C_m_delta_e: -0.2292   # WT (matches JSBSim 2020 x8.xml)
+C_m_fp: -0.2168        # Flap pitching moment (not used - no flaps)
 
 # Yawing moment coefficients
-C_n0: -0.000471        # WT
-C_n_beta: 0.0283       # WT
-C_n_p: 0.00437         # XFLR5 (WT unavailable)
-C_n_r: -0.012          # XFLR5 (WT unavailable)
-C_n_delta_a: -0.00339  # WT
+C_n0: 0.0              # WT (CORRECTED: was -0.000471, sim has 0)
+C_n_beta: 0.0283       # WT (exact from sim config)
+C_n_p: 0.00436551      # XFLR5 (exact from sim config)
+C_n_r: -0.072          # XFLR5 (CORRECTED: was -0.012, sim has -0.072)
+C_n_delta_a: -0.00339  # WT (exact from sim config)
+C_n_delta_r: 0.0        # Rudder effect (not used - no rudder control)
 
 # Aircraft physical parameters
 g: 9.81           # m/s^2
 rho: 1.225        # kg/m^3 (air density at sea level)
 
 # Wing geometry (from JSBSim x8.xml)
-S: 0.75           # m^2 (planform area / wing area)
-b: 2.10           # m (wingspan)
-c: 0.3571         # m (mean chord)
+S: 0.75           # m^2 (planform area / wing area, exact from sim config)
+b: 2.1            # m (wingspan, exact from sim config)
+c: 0.35714286     # m (mean chord, exact from sim config)
 
 # Inertia tensor (kg*m^2)
 # From JSBSim X8 aircraft model

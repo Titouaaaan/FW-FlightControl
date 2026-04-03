@@ -39,9 +39,9 @@ from pathlib import Path
 WITH_PRIOR = True           # Include physics prior model (F_p) in forward pass
 WITH_RESIDUAL = False       # Include learned residual model (F_r) in forward pass
 
-# Moment scaling (empirical calibration for Gryte coeff + JSBSim inertia mismatch)
-APPLY_MOMENT_SCALING = True  # Enable empirical moment coefficient scaling
-MOMENT_SCALING_FACTOR = 0.002  # Scale all moments by this factor (0.002 = 1/500th original)
+# Moment scaling (empirical calibration for linear model vs JSBSim nonlinear aerodynamics)
+APPLY_MOMENT_SCALING = True  # Enable - necessary for linear approximation
+MOMENT_SCALING_FACTOR = 1  # Scale all moments by this factor (0.002 = 1/500th original)
                                # Reason: Gryte et al. 2018 coefficients + JSBSim inertia produce
                                # ~600x too large angular accelerations. This scales to realistic values.
                                # TUNING: Adjust this value to get realistic physics:
@@ -145,7 +145,7 @@ class PhysicsPrior(torch.nn.Module):
                          self.C_L_delta_e * delta_e)
         
         F_drag = q_dyn * (self.C_D0 + self.C_D_alpha * alpha + 
-                         self.C_D_delta_e * delta_e)
+                         self.C_D_delta_e * delta_e) # we remove the term that depends on C_D_q because it is set to zero
         
         # Transform lift/drag to body axes
         f_x_a = (-torch.cos(alpha) * F_drag + torch.sin(alpha) * F_lift)
