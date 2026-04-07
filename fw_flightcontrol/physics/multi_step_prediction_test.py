@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Multi-Step Prediction Test: Physics Prior Only
+Multi-Step Prediction Test: Hybrid Physics Model
 
 Tests how prediction error grows over multiple steps when using predicted states
 instead of ground truth states. Helps understand model drift/accumulation.
 
+Supports ablation studies with flags:
+- with_prior=True, with_residual=False: Physics prior only
+- with_prior=False, with_residual=True: Residual network only
+- with_prior=True, with_residual=True: Full hybrid (prior + residual)
+
 Configuration:
 - Trajectory horizon: H = 10 steps
 - Number of random trajectories: n = 5
-- Only uses physics prior (F_p), no residual network
+- Integration per step: 10 RK4 substeps × 0.001s = 0.01s (one 100 Hz environment step)
 """
 
 import torch
@@ -17,11 +22,16 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from physics_prior import PhysicsPrior
+from physics_augmented import PhysicsAugmented, HybridDynamicsModel
 
 # ====================== CONFIGURATION ======================
 TRAJECTORY_HORIZON = 10  # H = 10 steps
 NUM_TRAJECTORIES = 5     # n = 5 random trajectory samples
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Ablation study flags
+WITH_PRIOR = True        # Include physics prior in hybrid model
+WITH_RESIDUAL = False    # Include residual network in hybrid model
 
 STATE_DIMS = ['phi', 'theta', 'Va', 'p', 'q', 'r', 'alpha', 'beta']
 ACTION_DIMS = ['aileron', 'elevator', 'throttle']
@@ -89,9 +99,9 @@ def extract_trajectory_sequence(csv_path: str, start_idx: int, horizon: int):
     return states, actions, next_states
 
 
-def multi_step_rollout(physics_prior, states, actions, next_states_true):
+def multi_step_rollout(hybrid_model, states, actions, next_states_true):
     """
-    Perform multi-step rollout using physics prior.
+    Perform multi-step rollout using hybrid dynamics model with RK4 integration.
     
     Returns:
         - errors_per_step: L2 errors at each step
@@ -110,14 +120,9 @@ def multi_step_rollout(physics_prior, states, actions, next_states_true):
         current_action = actions[step].unsqueeze(0).to(DEVICE)  # (1, 3)
         ground_truth_next = next_states_true[step].to(DEVICE)    # (8,)
         
-        # Predict next state using physics prior
+        # Predict next state using hybrid model with RK4 integration (1.0 second)
         with torch.no_grad():
-            # Get derivatives from physics prior
-            dx_dt = physics_prior(current_state, current_action)  # (1, 8)
-            
-            # Simple Euler step: s_t+1 = s_t + dt * dx_dt
-            # For our 0.01s timestep with 10 RK4 substeps of 0.001s
-            predicted_next = current_state + 0.01 * dx_dt
+            predicted_next = hybrid_model.integrate_rk4(current_state, current_action)
             predicted_next = predicted_next.squeeze(0)  # (8,)
         
         # Calculate error
@@ -144,8 +149,11 @@ def multi_step_rollout(physics_prior, states, actions, next_states_true):
 
 def main():
     print("\n" + "="*80)
-    print("MULTI-STEP PREDICTION TEST: Physics Prior Only")
+    print("MULTI-STEP PREDICTION TEST: Hybrid Physics Model")
     print("="*80)
+    print(f"Ablation Configuration:")
+    print(f"  - Physics Prior: {WITH_PRIOR}")
+    print(f"  - Residual Network: {WITH_RESIDUAL}")
     print(f"Trajectory Horizon: H = {TRAJECTORY_HORIZON} steps")
     print(f"Number of Trajectories: n = {NUM_TRAJECTORIES}")
     print(f"Device: {DEVICE}")
@@ -156,7 +164,26 @@ def main():
     physics_prior = PhysicsPrior(config_path='aero_coefficients.yaml')
     physics_prior = physics_prior.to(DEVICE)
     physics_prior.eval()
-    print("✓ Physics prior loaded\n")
+    print("✓ Physics prior loaded")
+    
+    # Initialize residual network
+    print("Initializing Residual Network...")
+    residual_network = PhysicsAugmented(state_dim=8, action_dim=3, hidden_dims=[128, 128])
+    residual_network = residual_network.to(DEVICE)
+    residual_network.eval()
+    print("✓ Residual network initialized\n")
+    
+    # Create hybrid dynamics model with instance-level flags
+    print("Creating Hybrid Dynamics Model...")
+    hybrid_model = HybridDynamicsModel(
+        physics_prior=physics_prior,
+        residual_network=residual_network,
+        with_prior=WITH_PRIOR,
+        with_residual=WITH_RESIDUAL
+    )
+    hybrid_model = hybrid_model.to(DEVICE)
+    hybrid_model.eval()
+    print("✓ Hybrid model created\n")
     
     # Load dataset
     csv_path = Path('../data/trajectory_data_constwind.csv')
@@ -202,9 +229,9 @@ def main():
         
         print(f"  Initial state: phi={states[0][0]:.6f}, theta={states[0][1]:.6f}, Va={states[0][2]:.2f}, p={states[0][3]:.4f}, q={states[0][4]:.4f}, r={states[0][5]:.4f}")
         
-        # Run multi-step rollout
+        # Run multi-step rollout using hybrid model
         errors, rel_errors, state_errors = multi_step_rollout(
-            physics_prior, states, actions, next_states_true
+            hybrid_model, states, actions, next_states_true
         )
         
         all_errors.append(errors)

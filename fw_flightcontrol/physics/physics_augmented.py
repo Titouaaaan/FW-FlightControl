@@ -15,11 +15,7 @@ Output: Residual corrections to state derivatives (8 dims)
 
 import torch
 import torch.nn as nn
-
-# Global configuration flags (set by learn_physics_model.py or training scripts)
-# These allow selective testing of physics prior vs. residual network components
-WITH_PRIOR = True        # Include physics prior F_p in computations
-WITH_RESIDUAL = True     # Include residual network F_a in computations
+from torchdiffeq import odeint
 
 
 class PhysicsAugmented(nn.Module):
@@ -111,37 +107,40 @@ class PhysicsAugmented(nn.Module):
 
 
 class HybridDynamicsModel(nn.Module):
-    """Combined physics prior + learned augmentation."""
+    """Combined physics prior + learned augmentation with instance-level flags."""
     
     def __init__(self, 
                  physics_prior,
                  residual_network,
-                 dt: float = 0.01):
+                 with_prior: bool = True,
+                 with_residual: bool = True):
         """
         Initialize hybrid dynamics model.
         
         Args:
-            physics_prior: PhysicsPrior instance (F_p)
-            residual_network: PhysicsAugmented instance (F_a)
-            dt: Integration timestep for RK4
+            physics_prior: PhysicsPrior instance that returns state derivatives F_p(s, u)
+            residual_network: PhysicsAugmented instance that returns residual corrections F_a(s, u)
+            with_prior: Include physics prior in forward pass
+            with_residual: Include learned residual in forward pass
         """
         super().__init__()
         
         self.physics_prior = physics_prior
         self.residual_network = residual_network
-        self.dt = dt
+        self.with_prior = with_prior
+        self.with_residual = with_residual
     
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """
-        Combined dynamics: F = F_p + F_a with flag control.
+        Combined dynamics: F = F_p + F_a (respecting instance flags).
         
-        Respects global flags WITH_PRIOR and WITH_RESIDUAL to allow:
-        - Physics prior only: WITH_PRIOR=True, WITH_RESIDUAL=False
-        - Residual only: WITH_PRIOR=False, WITH_RESIDUAL=True
-        - Full hybrid: WITH_PRIOR=True, WITH_RESIDUAL=True
+        Supports ablation studies:
+        - Physics prior only: with_prior=True, with_residual=False
+        - Residual only: with_prior=False, with_residual=True
+        - Full hybrid: with_prior=True, with_residual=True
         
         Args:
-            state: (batch_size, 8) state vector
+            state: (batch_size, 8) state vector [phi, theta, Va, p, q, r, alpha, beta]
             action: (batch_size, 2 or 3) action vector
         
         Returns:
@@ -150,14 +149,14 @@ class HybridDynamicsModel(nn.Module):
         dx_dt_combined = torch.zeros_like(state)
         
         # Physics prior prediction (if enabled)
-        if WITH_PRIOR:
+        if self.with_prior:
             dx_dt_physics = self.physics_prior(state, action)
             dx_dt_combined = dx_dt_physics
         
         # Learned residual correction (if enabled)
-        if WITH_RESIDUAL:
+        if self.with_residual:
             residuals = self.residual_network(state, action)
-            if WITH_PRIOR:
+            if self.with_prior:
                 # Add residuals to physics prior
                 dx_dt_combined = dx_dt_combined + residuals
             else:
@@ -168,39 +167,31 @@ class HybridDynamicsModel(nn.Module):
     
     def integrate_rk4(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """
-        RK4 integration using combined dynamics (respects global flags).
+        RK4 integration using combined dynamics for one environment step.
         
-        Performs 100 substeps of RK4 integration (dt=0.01 each) for a total of
-        1.0 second integration. The combined dynamics uses:
-        - Physics prior only if WITH_PRIOR=True, WITH_RESIDUAL=False
-        - Residual only if WITH_PRIOR=False, WITH_RESIDUAL=True
-        - Full hybrid (F_p + F_a) if both flags are True
+        Integrates from s_t to s_t+1 (one 100 Hz environment step = 0.01 seconds).
+        Uses torchdiffeq.odeint with RK4 method for stable integration with automatic
+        differentiation support (crucial for training residual network).
+        Respects instance flags with_prior and with_residual.
         
         Args:
-            state: (batch_size, 8) initial state
-            action: (batch_size, 3) action vector [delta_a, delta_e, throttle] (constant over timestep)
+            state: (batch_size, 8) initial state s_t
+            action: (batch_size, 3) action vector [delta_a, delta_e, throttle] (constant over integration)
         
         Returns:
-            state_next: (batch_size, 8) state after 100 RK4 substeps (1.0 second total)
+            state_next: (batch_size, 8) state after 0.01 seconds integration (s_t+1)
         """
-        dt = self.dt
-        state_integrated = state.clone()
+        # Define ODE dynamics function for torchdiffeq
+        def ode_dynamics(t, state_t):
+            # t is unused (time-invariant system), but required by odeint API
+            return self(state_t, action)
         
-        # 100 substeps of RK4 integration
-        for _ in range(100):
-            # K1: derivatives at current state
-            k1 = self(state_integrated, action)
-            
-            # K2: derivatives at midpoint using K1
-            k2 = self(state_integrated + 0.5 * dt * k1, action)
-            
-            # K3: derivatives at midpoint using K2
-            k3 = self(state_integrated + 0.5 * dt * k2, action)
-            
-            # K4: derivatives at next point using K3
-            k4 = self(state_integrated + dt * k3, action)
-            
-            # RK4 integration step
-            state_integrated = state_integrated + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        # Integration times: start at t=0, end at t=0.01
+        t_eval = torch.tensor([0.0, 0.01], dtype=state.dtype, device=state.device)
         
-        return state_integrated
+        # Integrate using RK4 method
+        # Returns trajectory shape (2, batch_size, 8) - one for each time point
+        trajectory = odeint(ode_dynamics, state, t_eval, method='rk4')
+        
+        # Return final state at t=0.01
+        return trajectory[-1]

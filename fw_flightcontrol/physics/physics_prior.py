@@ -33,22 +33,17 @@ import yaml
 from pathlib import Path
 
 
-# ===================== GLOBAL CONFIGURATION FLAGS =====================
-# These flags enable/disable components for ablation studies and tuning
+# ===================== MOMENT SCALING CONFIGURATION =====================
+# Empirical calibration for coefficient definition mismatch between Gryte et al. 2018
+# and JSBSim inertia tensor values. Linear aerodynamic model produces unrealistically
+# large angular accelerations (~600x) without this scaling.
 
-WITH_PRIOR = True           # Include physics prior model (F_p) in forward pass
-WITH_RESIDUAL = False       # Include learned residual model (F_r) in forward pass
-
-# Moment scaling (empirical calibration for linear model vs JSBSim nonlinear aerodynamics)
 APPLY_MOMENT_SCALING = True  # Enable - necessary for linear approximation
-MOMENT_SCALING_FACTOR = 1  # Scale all moments by this factor (0.002 = 1/500th original)
-                               # Reason: Gryte et al. 2018 coefficients + JSBSim inertia produce
-                               # ~600x too large angular accelerations. This scales to realistic values.
-                               # TUNING: Adjust this value to get realistic physics:
-                               #   - 0.001 = very docile aircraft (low authority, ~2-3 rad/s²)
-                               #   - 0.002 = moderate control authority (~3-6 rad/s²)
-                               #   - 0.003 = aggressive control (~6-10 rad/s²)
-                               #   - Typical real aircraft: 2-5 rad/s² angular acceleration at max deflection
+MOMENT_SCALING_FACTOR = 1    # Scale all moments by this factor
+                             # TUNING OPTIONS:
+                             #   - 0.001 = very docile aircraft (~2-3 rad/s²)
+                             #   - 0.002 = moderate control authority (~3-6 rad/s²)
+                             #   - 0.003 = aggressive control (~6-10 rad/s²)
 
 
 class PhysicsPrior(torch.nn.Module):
