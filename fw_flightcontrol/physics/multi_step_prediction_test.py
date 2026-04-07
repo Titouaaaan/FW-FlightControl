@@ -107,11 +107,15 @@ def multi_step_rollout(hybrid_model, states, actions, next_states_true):
         - errors_per_step: L2 errors at each step
         - errors_relative_per_step: Relative errors at each step
         - state_errors_per_dim: Errors for each state dimension at each step
+        - predicted_states: Predicted states at each step (8, horizon)
+        - actual_states: Actual states at each step (8, horizon)
     """
     horizon = len(states)
     errors_per_step = []
     errors_relative_per_step = []
     state_errors_per_dim = []  # (horizon, 8) - error for each dimension at each step
+    predicted_states = []
+    actual_states = []
     
     # Start with ground truth first state
     current_state = states[0].unsqueeze(0).to(DEVICE)  # (1, 8)
@@ -120,7 +124,7 @@ def multi_step_rollout(hybrid_model, states, actions, next_states_true):
         current_action = actions[step].unsqueeze(0).to(DEVICE)  # (1, 3)
         ground_truth_next = next_states_true[step].to(DEVICE)    # (8,)
         
-        # Predict next state using hybrid model with RK4 integration (1.0 second)
+        # Predict next state using hybrid model with RK4 integration (0.01 second)
         with torch.no_grad():
             predicted_next = hybrid_model.integrate_rk4(current_state, current_action)
             predicted_next = predicted_next.squeeze(0)  # (8,)
@@ -138,13 +142,17 @@ def multi_step_rollout(hybrid_model, states, actions, next_states_true):
         errors_per_step.append(error)
         errors_relative_per_step.append(relative_error)
         state_errors_per_dim.append(state_errors)
+        predicted_states.append(predicted_next.cpu().numpy())
+        actual_states.append(ground_truth_next.cpu().numpy())
         
         # Use predicted state for next step (NOT ground truth)
         current_state = predicted_next.unsqueeze(0)
     
     state_errors_per_dim = np.array(state_errors_per_dim)  # (horizon, 8)
+    predicted_states = np.array(predicted_states)  # (horizon, 8)
+    actual_states = np.array(actual_states)  # (horizon, 8)
     
-    return errors_per_step, errors_relative_per_step, state_errors_per_dim
+    return errors_per_step, errors_relative_per_step, state_errors_per_dim, predicted_states, actual_states
 
 
 def main():
@@ -230,7 +238,7 @@ def main():
         print(f"  Initial state: phi={states[0][0]:.6f}, theta={states[0][1]:.6f}, Va={states[0][2]:.2f}, p={states[0][3]:.4f}, q={states[0][4]:.4f}, r={states[0][5]:.4f}")
         
         # Run multi-step rollout using hybrid model
-        errors, rel_errors, state_errors = multi_step_rollout(
+        errors, rel_errors, state_errors, pred_states, actual_states = multi_step_rollout(
             hybrid_model, states, actions, next_states_true
         )
         
@@ -239,21 +247,22 @@ def main():
         all_state_errors.append(state_errors)
         
         # Print step-by-step results for this trajectory
-        print(f"\n  Step-by-step errors:")
-        print(f"  Step | L2 Error  | Rel Error |  phi err  | theta err |  Va err   |   p err   |   q err   |   r err   | alpha err | beta err  |")
-        print(f"  -----|-----------|-----------|-----------|-----------|-----------|-----------|-----------|-----------|-----------|-----------|")
+        print(f"\n  Step-by-step predictions (Predicted vs Actual):")
+        print(f"  {'-'*160}")
+        print(f"  Step |    phi        |    theta      |    Va         |    p          |    q          |    r          |   alpha       |   beta        |")
+        print(f"       | Pred  | Real  | Pred  | Real  | Pred  | Real  | Pred  | Real  | Pred  | Real  | Pred  | Real  | Pred  | Real  | Pred  | Real  |")
+        print(f"  {'-'*160}")
         
         for step in range(TRAJECTORY_HORIZON):
-            phi_err = state_errors[step][0]
-            theta_err = state_errors[step][1]
-            va_err = state_errors[step][2]
-            p_err = state_errors[step][3]
-            q_err = state_errors[step][4]
-            r_err = state_errors[step][5]
-            alpha_err = state_errors[step][6]
-            beta_err = state_errors[step][7]
-            
-            print(f"   {step:2d}  | {errors[step]:9.6f} | {rel_errors[step]:9.6f} | {phi_err:9.6f} | {theta_err:9.6f} | {va_err:9.6f} | {p_err:9.6f} | {q_err:9.6f} | {r_err:9.6f} | {alpha_err:9.6f} | {beta_err:9.6f} |")
+            pred = pred_states[step]
+            real = actual_states[step]
+            print(f"   {step:2d}  | ", end="")
+            for dim in range(8):
+                if dim == 2:  # Va
+                    print(f"{pred[dim]:6.2f} | {real[dim]:6.2f} | ", end="")
+                else:
+                    print(f"{pred[dim]:6.4f} | {real[dim]:6.4f} | ", end="")
+            print()
         
         print(f"\n  Summary for this trajectory:")
         print(f"    Max L2 Error: {max(errors):.6f} (at step {np.argmax(errors)})")
