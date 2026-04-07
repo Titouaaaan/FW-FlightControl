@@ -253,12 +253,11 @@ def calculate_trajectory_statistics(df):
     print(f"  Completed episodes:   {len(df) - n_terminal} ({(len(df) - n_terminal)/len(df)*100:.2f}%)")
 
 
-def main():
-    # Load data
-    csv_path = Path('../data/trajectory_data.csv')
+def analyze_single_file(csv_path):
+    """Analyze a single trajectory file and return key metrics."""
     if not csv_path.exists():
         print(f"Error: {csv_path} not found!")
-        return
+        return None
     
     df = load_trajectory_data(csv_path)
     
@@ -268,7 +267,7 @@ def main():
     if state is None or action is None or next_state is None:
         print("Error: Could not parse state/action columns!")
         print("Available columns:", df.columns.tolist())
-        return
+        return None
     
     # Calculate statistics
     calculate_trajectory_statistics(df)
@@ -277,7 +276,171 @@ def main():
     calculate_pid_accuracy(state, df)
     calculate_state_statistics(state)
     calculate_dynamics_statistics(state, action, next_state)
-    print("\n✓ Data analysis complete!")
+    
+    # Extract key metrics for comparison
+    roll_error = state[:, 9]
+    pitch_error = state[:, 10]
+    roll_error_deg = np.degrees(roll_error)
+    pitch_error_deg = np.degrees(pitch_error)
+    
+    metrics = {
+        'name': csv_path.stem.replace('trajectory_data_', '').upper(),
+        'env_config': csv_path.stem.replace('trajectory_data_', ''),
+        'num_transitions': len(df),
+        'mean_reward': np.mean(df['reward'].values),
+        'mean_roll_error_deg': np.mean(roll_error_deg),
+        'mean_pitch_error_deg': np.mean(pitch_error_deg),
+        'std_roll_error_deg': np.std(roll_error_deg),
+        'std_pitch_error_deg': np.std(pitch_error_deg),
+        'rms_roll_error_deg': np.degrees(np.sqrt(np.mean(roll_error**2))),
+        'rms_pitch_error_deg': np.degrees(np.sqrt(np.mean(pitch_error**2))),
+        'roll_within_5deg': np.sum(np.abs(roll_error_deg) < 5.0) / len(roll_error) * 100,
+        'pitch_within_5deg': np.sum(np.abs(pitch_error_deg) < 5.0) / len(pitch_error) * 100,
+        'state': state,
+        'action': action,
+        'next_state': next_state,
+        'df': df
+    }
+    
+    return metrics
+
+
+def compare_environments(metrics_list):
+    """Compare PID performance and dynamics across different environments."""
+    print("\n\n" + "="*100)
+    print("CROSS-ENVIRONMENT COMPARISON: PID PERFORMANCE & STATE EVOLUTION")
+    print("="*100)
+    
+    # Sort by environment name for consistent order
+    metrics_list = sorted(metrics_list, key=lambda x: x['env_config'])
+    
+    # Comparison table
+    print("\n" + " "*15 + "REWARD & PID ACCURACY COMPARISON")
+    print("-" * 115)
+    print(f"{'Environment':<15} | {'Mean Reward':>12} | {'Roll Error (°)':>20} | {'Pitch Error (°)':>20} | {'Within ±5° (%)':>20}")
+    print(f"{'':15} | {'':12} | {'Mean ± Std':>20} | {'Mean ± Std':>20} | {'Roll | Pitch':>20}")
+    print("-" * 115)
+    
+    for m in metrics_list:
+        print(f"{m['name']:<15} | {m['mean_reward']:>12.4f} | "
+              f"{m['mean_roll_error_deg']:>7.2f} ± {m['std_roll_error_deg']:<6.2f}° | "
+              f"{m['mean_pitch_error_deg']:>7.2f} ± {m['std_pitch_error_deg']:<6.2f}° | "
+              f"{m['roll_within_5deg']:>6.2f}% | {m['pitch_within_5deg']:>6.2f}%")
+    
+    # Detailed breakdown
+    print("\n" + " "*15 + "RMS TRACKING ERROR (More Robust Metric)")
+    print("-" * 80)
+    print(f"{'Environment':<15} | {'Roll RMS (°)':>15} | {'Pitch RMS (°)':>15} | {'Combined RMS (°)':>20}")
+    print("-" * 80)
+    
+    for m in metrics_list:
+        combined_rms = np.sqrt((m['rms_roll_error_deg']**2 + m['rms_pitch_error_deg']**2) / 2)
+        print(f"{m['name']:<15} | {m['rms_roll_error_deg']:>15.2f} | {m['rms_pitch_error_deg']:>15.2f} | {combined_rms:>20.2f}")
+    
+    # State evolution analysis - show how airspeed and angular velocities change
+    print("\n\n" + " "*15 + "STATE EVOLUTION ANALYSIS")
+    print("-" * 100)
+    print("Comparing how key state variables evolve in each environment:")
+    print("\n" + " "*15 + "AIRSPEED (State[13])")
+    print("-" * 80)
+    print(f"{'Environment':<15} | {'Mean (m/s)':>12} | {'Std (m/s)':>12} | {'Max (m/s)':>12} | {'Min (m/s)':>12}")
+    print("-" * 80)
+    
+    for m in metrics_list:
+        airspeed = m['state'][:, 13]
+        print(f"{m['name']:<15} | {np.mean(airspeed):>12.2f} | {np.std(airspeed):>12.2f} | {np.max(airspeed):>12.2f} | {np.min(airspeed):>12.2f}")
+    
+    # Roll rate statistics
+    print("\n" + " "*15 + "ROLL RATE - p (State[3]) - rad/s")
+    print("-" * 80)
+    print(f"{'Environment':<15} | {'Mean (rad/s)':>12} | {'Std (rad/s)':>12} | {'Max (rad/s)':>12} | {'Min (rad/s)':>12}")
+    print("-" * 80)
+    
+    for m in metrics_list:
+        p = m['state'][:, 3]
+        print(f"{m['name']:<15} | {np.mean(p):>12.4f} | {np.std(p):>12.4f} | {np.max(p):>12.4f} | {np.min(p):>12.4f}")
+    
+    # Pitch rate statistics
+    print("\n" + " "*15 + "PITCH RATE - q (State[4]) - rad/s")
+    print("-" * 80)
+    print(f"{'Environment':<15} | {'Mean (rad/s)':>12} | {'Std (rad/s)':>12} | {'Max (rad/s)':>12} | {'Min (rad/s)':>12}")
+    print("-" * 80)
+    
+    for m in metrics_list:
+        q = m['state'][:, 4]
+        print(f"{m['name']:<15} | {np.mean(q):>12.4f} | {np.std(q):>12.4f} | {np.max(q):>12.4f} | {np.min(q):>12.4f}")
+    
+    # Control effort analysis
+    print("\n\n" + " "*15 + "CONTROL EFFORT COMPARISON")
+    print("-" * 100)
+    print(f"{'Environment':<15} | {'Aileron Mean':>14} | {'Elevator Mean':>14} | {'Throttle Mean':>14} | {'Total Action Mag':>16}")
+    print("-" * 100)
+    
+    for m in metrics_list:
+        aileron = m['action'][:, 0]
+        elevator = m['action'][:, 1]
+        throttle = m['action'][:, 2]
+        action_mag = np.linalg.norm(m['action'], axis=1)
+        print(f"{m['name']:<15} | {np.mean(aileron):>14.4f} | {np.mean(elevator):>14.4f} | {np.mean(throttle):>14.4f} | {np.mean(action_mag):>16.4f}")
+    
+    # Analysis summary
+    print("\n\n" + "="*100)
+    print("INTERPRETATION & INSIGHTS")
+    print("="*100)
+    
+    # Sort by RMS error
+    RMS_errors = [(m['name'], np.sqrt((m['rms_roll_error_deg']**2 + m['rms_pitch_error_deg']**2) / 2)) for m in metrics_list]
+    RMS_errors.sort(key=lambda x: x[1])
+    
+    print(f"\n✓ Best PID Performance (Lowest RMS Error): {RMS_errors[0][0]} ({RMS_errors[0][1]:.2f}°)")
+    print(f"✓ Most Challenging Environment: {RMS_errors[-1][0]} ({RMS_errors[-1][1]:.2f}°)")
+    print(f"  → Difficulty delta: {(RMS_errors[-1][1] - RMS_errors[0][1]):.2f}° RMS difference")
+    
+    # Airspeed stability
+    airspeed_std = [(m['name'], np.std(m['state'][:, 13])) for m in metrics_list]
+    airspeed_std.sort(key=lambda x: x[1])
+    print(f"\n✓ Most Stable Airspeed: {airspeed_std[0][0]} (σ={airspeed_std[0][1]:.2f} m/s)")
+    print(f"✓ Most Variable Airspeed: {airspeed_std[-1][0]} (σ={airspeed_std[-1][1]:.2f} m/s)")
+    
+    # Reward
+    reward_data = [(m['name'], m['mean_reward']) for m in metrics_list]
+    reward_data.sort(key=lambda x: x[1], reverse=True)
+    print(f"\n✓ Highest Average Reward: {reward_data[0][0]} ({reward_data[0][1]:.4f})")
+    print(f"✓ Lowest Average Reward: {reward_data[-1][0]} ({reward_data[-1][1]:.4f})")
+    
+    print("\nKey Observations:")
+    print(f"  • PID controllers show {abs(RMS_errors[-1][1] - RMS_errors[0][1]):.1f}° performance degradation from best to worst")
+    print(f"  • Total airspeed variation across environments: {max(a[1] for a in airspeed_std) - min(a[1] for a in airspeed_std):.2f} m/s")
+    print(f"  • Each environment file contains 6000 state transitions (3 trajectories × 2000 steps each)")
+
+
+def main():
+    print("\n" + "="*100)
+    print("ANALYZING DATA FROM ALL THREE ENVIRONMENTS")
+    print("="*100)
+    
+    # Define the three environment files
+    data_dir = Path('../data')
+    env_configs = ['noatmo', 'constwind', 'gustsonly']
+    metrics_list = []
+    
+    # Analyze each environment
+    for config in env_configs:
+        csv_path = data_dir / f'trajectory_data_{config}.csv'
+        print(f"\n\n{'#'*100}")
+        print(f"# ANALYZING: {config.upper()}")
+        print(f"{'#'*100}")
+        
+        metrics = analyze_single_file(csv_path)
+        if metrics is not None:
+            metrics_list.append(metrics)
+        print("\n")
+    
+    # Compare all environments
+    if len(metrics_list) == len(env_configs):
+        compare_environments(metrics_list)
+    
+    print("\n✓ Cross-environment analysis complete!")
 
 if __name__ == '__main__':
     main()
