@@ -159,7 +159,7 @@ def main():
     print("✓ Physics prior loaded\n")
     
     # Load dataset
-    csv_path = Path('../data/trajectory_data.csv')
+    csv_path = Path('../data/trajectory_data_constwind.csv')
     if not csv_path.exists():
         print(f"Error: {csv_path} not found!")
         return

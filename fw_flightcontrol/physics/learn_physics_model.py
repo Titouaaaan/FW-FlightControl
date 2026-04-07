@@ -48,7 +48,7 @@ STATE_DIMS = ['phi', 'theta', 'Va', 'p', 'q', 'r', 'alpha', 'beta']
 ACTION_DIMS = ['aileron', 'elevator', 'throttle']
 
 
-def load_sample_transition(csv_path: str = '../data/trajectory_data.csv', 
+def load_sample_transition(csv_path: str = '../data/trajectory_data_constwind.csv', 
                            sample_idx: int = None):
     """
     Load a single transition from the CSV dataset.
