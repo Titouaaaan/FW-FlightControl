@@ -25,20 +25,22 @@ from pathlib import Path
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+# Maximum number of trajectories per environment configuration file
+MAX_TRAJECTORIES_PER_FILE = 3
+
 # Define systematic target angles for space coverage (in degrees)
 ROLL_TARGETS = [-10, 10, -20, 20, -30, 30, 35, -35]      # 8 roll angles
-PITCH_TARGETS = [-10,10 , -20, 20]                      # 4 pitch angles
-# Total trajectories: 8 * 4 = 32 (easily extensible by adding more values)
+PITCH_TARGETS = [-10, 10, -20, 20]                       # 4 pitch angles
+# Note: Only first MAX_TRAJECTORIES_PER_FILE combinations will be generated
 
 NUM_STEPS = 2000  # 20 seconds at 100 Hz
 TRAJECTORIES = []  # Will store trajectory history for future incremental additions
 
+# JSBSim environment configurations to generate data for
 #   - 'noatmo': No atmospheric disturbances (baseline)
 #   - 'constwind': Constant wind from the north
 #   - 'gustsonly': Gusts only (no wind/turbulence)
-#   - 'turbonly': Turbulence only
-#   - 'alldist': All disturbances combined
-JSBSIM_CONFIG = 'constwind'  
+JSBSIM_CONFIGS = ['noatmo', 'constwind', 'gustsonly']  
 
 
 def run_single_trajectory(env, trajectory_num, target_roll_deg, target_pitch_deg):
@@ -395,12 +397,14 @@ def print_trajectory_summary(trajectory_results):
     print(f"(To extend coverage, add more values to ROLL_TARGETS or PITCH_TARGETS at the top of the script)\n")
 
 
-def generate_systematic_trajectories(cfg: DictConfig):
+def generate_systematic_trajectories(cfg: DictConfig, jsbsim_config_name='constwind', max_trajectories=3):
     """
     Generate trajectories systematically to cover the observable space.
     
     Args:
         cfg: Hydra configuration
+        jsbsim_config_name: Name of the JSBSim config to use (e.g., 'noatmo', 'constwind', 'gustsonly')
+        max_trajectories: Maximum number of trajectories to generate for this configuration
     
     Returns:
         List of trajectory result dictionaries
@@ -408,20 +412,23 @@ def generate_systematic_trajectories(cfg: DictConfig):
     trajectory_results = []
     
     print("\n" + "="*120)
-    print(f"GENERATING SYSTEMATIC TRAJECTORIES FOR SPACE COVERAGE")
+    print(f"GENERATING TRAJECTORIES FOR ENVIRONMENT: {jsbsim_config_name.upper()}")
     print("="*120)
-    print(f"Nominal conditions (no wind or disturbances)")
+    print(f"JSBSim config: {jsbsim_config_name}")
+    print(f"Max trajectories: {max_trajectories}")
     print(f"Roll targets: {ROLL_TARGETS}")
     print(f"Pitch targets: {PITCH_TARGETS}")
-    print(f"Number of trajectories: {len(ROLL_TARGETS) * len(PITCH_TARGETS)}")
     print("="*120 + "\n")
     
     trajectory_num = 1
     
-    # Generate all combinations of roll and pitch targets
+    # Generate combinations of roll and pitch targets until max_trajectories reached
     for target_roll, target_pitch in itertools.product(ROLL_TARGETS, PITCH_TARGETS):
-        print(f"Loading JSBSim configuration: '{JSBSIM_CONFIG}'")
-        cfg.env.jsbsim = OmegaConf.load(f'config/env/jsbsim/{JSBSIM_CONFIG}.yaml')
+        if trajectory_num > max_trajectories:
+            break
+        
+        print(f"Loading JSBSim configuration: '{jsbsim_config_name}'")
+        cfg.env.jsbsim = OmegaConf.load(f'../config/env/jsbsim/{jsbsim_config_name}.yaml')
         try:
             # Create fresh environment for each trajectory
             env = gym.make(
@@ -449,27 +456,40 @@ def generate_systematic_trajectories(cfg: DictConfig):
 
 
 def main(cfg: DictConfig):
-    """Main function to generate systematic trajectories and save trajectory data."""
+    """Main function to generate systematic trajectories and save trajectory data for all environment configs."""
     
     try:
-        # Generate trajectories with systematic coverage
-        trajectory_results = generate_systematic_trajectories(cfg)
+        # Loop through each JSBSim environment configuration
+        for config_name in JSBSIM_CONFIGS:
+            print(f"\n{'='*100}")
+            print(f"Processing environment configuration: {config_name.upper()}")
+            print(f"{'='*100}")
+            
+            # Generate trajectories for this configuration
+            trajectory_results = generate_systematic_trajectories(
+                cfg, 
+                jsbsim_config_name=config_name,
+                max_trajectories=MAX_TRAJECTORIES_PER_FILE
+            )
+            
+            # Print summary table
+            print_trajectory_summary(trajectory_results)
+            
+            # Save trajectory data to CSV file (CSV format only)
+            output_file = f'../data/trajectory_data_{config_name}.csv'
+            csv_file = save_trajectory_data_to_csv(trajectory_results, output_file)
         
-        # Print summary table
-        print_trajectory_summary(trajectory_results)
-        
-        # Save trajectory data to both CSV and Parquet
-        csv_file = save_trajectory_data_to_csv(trajectory_results, '../data/trajectory_data.csv')
-        parquet_file = save_trajectory_data_to_parquet(trajectory_results, '../data/trajectory_data.parquet')
-        
-        print(f"\n{'='*80}")
-        print("✓ Data collection complete!")
-        print(f"{'='*80}")
-        print(f"CSV format (for inspection):    {csv_file}")
-        print(f"Parquet format (for training): {parquet_file}")
-        print(f"\nYou can now use either format for dynamics learning:")
-        print(f"  Python: df = pd.read_parquet('trajectory_data.parquet')")
-        print(f"  Or:     df = pd.read_csv('trajectory_data.csv')")
+        print(f"\n{'='*100}")
+        print("✓ Data collection complete for all environments!")
+        print(f"{'='*100}")
+        print(f"\nGenerated 3 CSV files in fw_flightcontrol/data/:")
+        for config_name in JSBSIM_CONFIGS:
+            print(f"  - trajectory_data_{config_name}.csv")
+        print(f"\nEach file contains {MAX_TRAJECTORIES_PER_FILE} trajectories for that environment.")
+        print(f"\nYou can load each file with:")
+        print(f"  df = pd.read_csv('fw_flightcontrol/data/trajectory_data_noatmo.csv')")
+        print(f"  df = pd.read_csv('fw_flightcontrol/data/trajectory_data_constwind.csv')")
+        print(f"  df = pd.read_csv('fw_flightcontrol/data/trajectory_data_gustsonly.csv')")
         
     except Exception as e:
         print(f"\nError: {e}")
@@ -477,7 +497,7 @@ def main(cfg: DictConfig):
         traceback.print_exc()
 
 
-@hydra.main(config_name='default', config_path='config', version_base=None)
+@hydra.main(config_name='default', config_path='../config', version_base=None)
 def app(cfg: DictConfig):
     main(cfg)
 
