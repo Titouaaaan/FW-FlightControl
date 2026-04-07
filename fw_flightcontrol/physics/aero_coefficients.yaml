@@ -1,55 +1,56 @@
-# Aerodynamic Coefficients for Skywalker X8 (Gryte et al. 2018)
-# Priority: Wind Tunnel (WT) values preferred; XFLR5 used when WT unavailable
-# Table 5: "Aerodynamic modeling of the Skywalker X8 Fixed-Wing Unmanned Aerial Vehicle"
+# Aerodynamic Coefficients for Skywalker X8
+# Source: JSBSim 2020 x8.xml (primary) based on Gryte et al. 2018 measurements
+# Reference: "Aerodynamic modeling of the Skywalker X8 Fixed-Wing Unmanned Aerial Vehicle"
 # State variables: [phi, theta, Va, p, q, r, alpha, beta]
 # Action variables: [delta_a (aileron), delta_e (elevator)]
-# Note: Throttle is currently fixed; can be added as third action later
+# Note: All coefficients extracted from JSBSim 2020 flight dynamics model
 
-# Lift coefficients
-C_L0: 0.08673557       # WT (exact from sim config)
-C_L_alpha: 4.02032824  # WT (exact from sim config)
-C_L_delta_e: 0.27807362 # WT (exact from sim config)
-C_L_q: 3.87            # XFLR5 (WT unavailable)
+# Lift coefficients (from JSBSim 2020 x8.xml)
+C_L0: 0.08673557       # JSBSim 2020 ✓ matches Gryte WT (0.0867)
+C_L_alpha: 4.02032824  # JSBSim 2020 ✓ matches Gryte WT (4.02)
+C_L_delta_e: 0.27807362 # JSBSim 2020 ✓ matches Gryte WT (0.278)
+C_L_q: 3.87            # JSBSim 2020 ✓ matches Gryte XFLR5 (3.87)
 
-# Drag coefficients
-C_D0: 0.01970001       # WT (exact from sim config)
-C_D_alpha: 0.07909146  # WT linear term (exact from sim config)
-C_D_alpha2: 1.05546999 # WT quadratic term (not currently used in simple linear model)
-C_D_beta1: -0.00584298 # WT side slip term (not currently used)
-C_D_beta2: 0.14781193  # WT quadratic beta term (not currently used)
-C_D_p: 0.0102          # WT roll rate effect (not currently used)
-C_D_delta_e: 0.0633474 # WT (exact from sim config)
+# Drag coefficients (from JSBSim 2020 x8.xml)
+C_D0: 0.01970001       # JSBSim 2020 ✓ matches Gryte WT (0.0197)
+C_D_alpha: 0.07909146  # JSBSim 2020 ✓ matches Gryte WT (0.0791)
+C_D_alpha2: 1.05546999 # JSBSim 2020 ✓ matches Gryte WT (1.06) - quadratic term, not currently used
+C_D_beta1: -0.00584298 # JSBSim 2020 ✓ matches Gryte WT (-0.00584) - not currently used
+C_D_beta2: 0.14781193  # JSBSim 2020 ✓ matches Gryte WT (0.148) - not currently used
+C_D_p: 0.0102          # JSBSim 2020 - not currently used
+C_D_delta_e: 0.0633474 # JSBSim 2020 ✓ matches Gryte WT (0.0633)
 
-# Side force coefficients
-C_Y0: 0.0              # WT (CORRECTED: was 0.00316, sim has 0)
-C_Y_beta: -0.22387216  # WT (exact from sim config)
-C_Y_p: -0.13735505     # XFLR5 (exact from sim config)
-C_Y_r: 0.08386877      # XFLR5 (exact from sim config)
-C_Y_delta_a: 0.0432764 # WT (exact from sim config)
-C_Y_delta_r: 0.0        # Rudder effect (not used - no rudder control)
+# Side force coefficients (from JSBSim 2020 x8.xml)
+C_Y0: 0.0              # JSBSim 2020 ✗ set to 0.0 (Gryte WT: 0.00316, XFLR5: 1.08E-08)
+C_Y_beta: -0.22387216  # JSBSim 2020 ✓ matches Gryte WT (-0.224)
+C_Y_p: -0.13735505     # JSBSim 2020 ✓ matches Gryte XFLR5 (-0.137)
+C_Y_r: 0.08386877      # JSBSim 2020 ✓ matches Gryte XFLR5 (0.0839)
+C_Y_delta_a: 0.0432764 # JSBSim 2020 ✓ matches Gryte WT (0.0433)
+C_Y_delta_r: 0.0        # Not used (no rudder control)
 
-# Rolling moment coefficients
-C_l0: 0.0              # WT (CORRECTED: was 0.00413, sim has 0)
-C_l_beta: -0.08489629  # WT (exact from sim config)
-C_l_p: -0.404198       # XFLR5 (exact from sim config)
-C_l_r: 0.0555206       # XFLR5 (exact from sim config)
-C_l_delta_a: 0.12018814 # WT (exact from sim config)
-C_l_delta_r: 0.0        # Rudder effect (not used - no rudder control)
+# Rolling moment coefficients (from JSBSim 2020 x8.xml)
+C_l0: 0.0              # JSBSim 2020 ✗ set to 0.0 (Gryte WT: 0.00413, XFLR5: 1.29E-07)
+C_l_beta: -0.08489629  # JSBSim 2020 ✓ matches Gryte WT (-0.0849)
+C_l_p: -0.404198       # JSBSim 2020 ✓ matches Gryte XFLR5 (-0.404)
+C_l_r: 0.0555206       # JSBSim 2020 ✓ matches Gryte XFLR5 (0.0555)
+C_l_delta_a: 0.12018814 # JSBSim 2020 ✓ matches Gryte WT (0.12)
+C_l_delta_r: 0.0        # Not used (no rudder control)
 
-# Pitching moment coefficients
-C_m0: 0.0227           # WT (JSBSim 2020 x8.xml value)
-C_m_alpha: -0.4629     # WT (JSBSim 2020 x8.xml value - WAS -0.2524, big difference!)
-C_m_q: -1.30123704     # XFLR5 (exact from sim config, matches JSBSim)
-C_m_delta_e: -0.2292   # WT (matches JSBSim 2020 x8.xml)
-C_m_fp: -0.2168        # Flap pitching moment (not used - no flaps)
+# Pitching moment coefficients (from JSBSim 2020 x8.xml)
+# NOTE: C_m0 and C_m_alpha are from JSBSim 2020, significantly different from Gryte paper!
+C_m0: 0.0227           # JSBSim 2020 ✗ differs from Gryte WT (0.0302) & XFLR5 (0.00439)
+C_m_alpha: -0.4629     # JSBSim 2020 ✗ differs from Gryte WT (-0.126) & XFLR5 (-0.227)
+C_m_q: -1.30123704     # JSBSim 2020 ✓ matches Gryte XFLR5 (-1.3)
+C_m_delta_e: -0.2292   # JSBSim 2020 ✗ differs from Gryte WT (-0.206) & XFLR5 (-0.325)
+C_m_fp: -0.2168        # Not used (no flaps)
 
-# Yawing moment coefficients
-C_n0: 0.0              # WT (CORRECTED: was -0.000471, sim has 0)
-C_n_beta: 0.0283       # WT (exact from sim config)
-C_n_p: 0.00436551      # XFLR5 (exact from sim config)
-C_n_r: -0.072          # XFLR5 (CORRECTED: was -0.012, sim has -0.072)
-C_n_delta_a: -0.00339  # WT (exact from sim config)
-C_n_delta_r: 0.0        # Rudder effect (not used - no rudder control)
+# Yawing moment coefficients (from JSBSim 2020 x8.xml)
+C_n0: 0.0              # JSBSim 2020 ✗ set to 0.0 (Gryte WT: -0.000471, XFLR5: 1.51E-07)
+C_n_beta: 0.0283       # JSBSim 2020 ✓ matches Gryte WT (0.0283)
+C_n_p: 0.00436551      # JSBSim 2020 ✓ matches Gryte XFLR5 (0.00437)
+C_n_r: -0.072          # JSBSim 2020 ✗ differs from Gryte XFLR5 (-0.012) - 6x larger!
+C_n_delta_a: -0.00339  # JSBSim 2020 ✓ matches Gryte WT (-0.00339)
+C_n_delta_r: 0.0        # Not used (no rudder control)
 
 # Aircraft physical parameters
 g: 9.81           # m/s^2
@@ -76,3 +77,45 @@ C_p: 5.9          # thrust coefficient (T_p = C_p * delta_t where delta_t in [0,
 # Throttle (DEPRECATED - now dynamic from action[2] in the physics model)
 # This value is no longer used; throttle is extracted from the 3rd action dimension at runtime
 throttle: 0.5     # [DEPRECATED] kept for reference only
+
+
+# ============================================================
+# REFERENCE DATA (Gryte et al. 2018 Table 5 - for comparison)
+# ============================================================
+# The following is commented out for reference. Current coefficients are from JSBSim 2020 x8.xml
+#
+# Gryte et al. Wind Tunnel (WT) vs XFLR5 values:
+# 
+# Coefficient        | WT Value  | XFLR5 Value | Current (JSBSim 2020)
+# --------           | --------  | ----------- | --------------------
+# C_L0               | 0.0867    | 0.0477      | 0.08673557
+# C_L_alpha          | 4.02      | 4.06        | 4.02032824
+# C_L_delta_e        | 0.278     | 0.7         | 0.27807362
+# C_L_q              | --        | 3.87        | 3.87
+# C_D0               | 0.0197    | 0.0107      | 0.01970001
+# C_D_alpha          | 0.0791    | -0.00955    | 0.07909146
+# C_D_alpha2         | 1.06      | 1.1         | 1.05546999
+# C_D_beta1          | -0.00584  | -2.34E-19   | -0.00584298
+# C_D_beta2          | 0.148     | 0.115       | 0.14781193
+# C_D_delta_e        | 0.0633    | 0.0196      | 0.0633474
+# C_Y0               | 0.00316   | 1.08E-08    | 0.0 (JSBSim)
+# C_Y_beta           | -0.224    | -0.194      | -0.22387216
+# C_Y_delta_a        | 0.0433    | 0.0439      | 0.0432764
+# C_Y_p              | --        | -0.137      | -0.13735505
+# C_Y_r              | --        | 0.0839      | 0.08386877
+# C_l0               | 0.00413   | 1.29E-07    | 0.0 (JSBSim)
+# C_l_beta           | -0.0849   | -0.0751     | -0.08489629
+# C_l_delta_a        | 0.12      | 0.202       | 0.12018814
+# C_l_p              | --        | -0.404      | -0.404198
+# C_l_r              | --        | 0.0555      | 0.0555206
+# C_m0               | 0.0302    | 0.00439     | 0.0227 (JSBSim - different!)
+# C_m_alpha          | -0.126    | -0.227      | -0.4629 (JSBSim - different!)
+# C_m_delta_e        | -0.206    | -0.325      | -0.2292
+# C_m_q              | --        | -1.3        | -1.30123704
+# C_n0               | -0.000471 | 1.51E-07    | 0.0 (JSBSim)
+# C_n_beta           | 0.0283    | 0.0312      | 0.0283
+# C_n_delta_a        | -0.00339  | -0.00628    | -0.00339
+# C_n_p              | --        | 0.00437     | 0.00436551
+# C_n_r              | --        | -0.012      | -0.072 (JSBSim - different!)
+#
+# Reference: Kristofer Gryte, "Aerodynamic modeling of the Skywalker X8 Fixed-Wing Unmanned Aerial Vehicle"
