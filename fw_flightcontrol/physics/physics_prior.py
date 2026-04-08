@@ -1,42 +1,8 @@
 #!/usr/bin/env python3
-"""
-Physics Prior F_p: Deterministic aerodynamic + gravity + propulsion dynamics.
-
-Following the hybrid modeling framework from the thesis:
-  x = [phi, theta, Va, p, q, r, alpha, beta] (8 dims)
-  u = [delta_a, delta_e, throttle] (3 dims, aileron, elevator, and throttle)
-  
-Returns:
-  dx/dt = F_p(x, u) (8 dims)
-
-Key assumptions:
-  - No wind (null or constant)
-  - Fixed aerodynamic coefficients (from Skywalker X8 - Gryte et al. 2018)
-  - Linear drag approximation
-  - Throttle provided as 3rd action dimension (0 to 1)
-
-CONFIGURATION FLAGS:
-  WITH_PRIOR (line ~35): Include physics prior in hybrid model
-  WITH_RESIDUAL (line ~36): Include learned residual in hybrid model
-  APPLY_MOMENT_SCALING (line ~39): Apply empirical scaling to moment coefficients
-  MOMENT_SCALING_FACTOR (line ~40): Scale factor for all moment coefficients (0.01 = 1% of original)
-  
-MOMENT SCALING NOTE:
-  Gryte et al. 2018 aerodynamic coefficients are theoretically correct, but when combined
-  with JSBSim inertia tensor values, produce unrealistically large angular accelerations
-  (~600x too large). This is likely due to a mismatch between the coefficient definitions
-  used in the paper vs. the inertia values from JSBSim. Empirical scaling compensates.
-"""
-
 import torch
 import yaml
 from pathlib import Path
 
-
-# ===================== MOMENT SCALING CONFIGURATION =====================
-# Empirical calibration for coefficient definition mismatch between Gryte et al. 2018
-# and JSBSim inertia tensor values. Linear aerodynamic model produces unrealistically
-# large angular accelerations (~600x) without this scaling.
 
 APPLY_MOMENT_SCALING = True  # Enable - necessary for linear approximation
 MOMENT_SCALING_FACTOR = 1    # Scale all moments by this factor
@@ -214,7 +180,6 @@ class PhysicsPrior(torch.nn.Module):
         Gamma = J_x * J_z - J_xz**2
         
         # Gamma parameters for angular rate derivatives
-        # Ref: User provided equations (from thesis)
         Gamma1 = J_xz * (J_x - J_y + J_z) / Gamma
         Gamma2 = (J_z * (J_z - J_y) + J_xz**2) / Gamma
         Gamma3 = J_z / Gamma

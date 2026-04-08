@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""
-Multi-Step Prediction Test: Hybrid Physics Model
-
-Tests how prediction error grows over multiple steps when using predicted states
-instead of ground truth states. Helps understand model drift/accumulation.
-
-Supports ablation studies with flags:
-- with_prior=True, with_residual=False: Physics prior only
-- with_prior=False, with_residual=True: Residual network only
-- with_prior=True, with_residual=True: Full hybrid (prior + residual)
-
-Configuration:
-- Trajectory horizon: H = 10 steps
-- Number of random trajectories: n = 5
-- Integration per step: 10 RK4 substeps × 0.001s = 0.01s (one 100 Hz environment step)
-"""
-
 import torch
 import torch.nn as nn
 import pandas as pd

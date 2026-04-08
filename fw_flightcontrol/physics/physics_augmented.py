@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""
-Physics-Augmented Network F_a: Learned residual corrections to physics prior.
-
-The combined model is F = F_p + F_a, where:
-  F_p: deterministic physics (equations of motion)
-  F_a: learned neural network (captures unmodeled phenomena)
-
-This follows the APHYNITY framework for error compounding during training.
-
-State variables: [phi, theta, Va, p, q, r, alpha, beta] (8 dims)
-Action variables: [delta_a, delta_e] (2 dims) or [delta_a, delta_e, throttle] (3 dims)
-Output: Residual corrections to state derivatives (8 dims)
-"""
-
 import torch
 import torch.nn as nn
 from torchdiffeq import odeint
@@ -107,7 +93,7 @@ class PhysicsAugmented(nn.Module):
 
 
 class HybridDynamicsModel(nn.Module):
-    """Combined physics prior + learned augmentation with instance-level flags."""
+    """Combined physics prior + learned augmentation with instance-level flags for ablation studies."""
     
     def __init__(self, 
                  physics_prior,
@@ -119,7 +105,7 @@ class HybridDynamicsModel(nn.Module):
         
         Args:
             physics_prior: PhysicsPrior instance that returns state derivatives F_p(s, u)
-            residual_network: PhysicsAugmented instance that returns residual corrections F_a(s, u)
+            residual_network: PhysicsAugmented instance that returns residual corrections F_a(s, u) of derivatives
             with_prior: Include physics prior in forward pass
             with_residual: Include learned residual in forward pass
         """
