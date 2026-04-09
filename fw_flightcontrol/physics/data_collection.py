@@ -26,7 +26,7 @@ from pathlib import Path
 # CONFIGURATION
 # ============================================================================
 # Maximum number of trajectories per environment configuration file
-MAX_TRAJECTORIES_PER_FILE = 3
+MAX_TRAJECTORIES_PER_FILE = 40
 
 # Define systematic target angles for space coverage (in degrees)
 ROLL_TARGETS = [-10, 10, -20, 20, -30, 30, 35, -35]      # 8 roll angles
