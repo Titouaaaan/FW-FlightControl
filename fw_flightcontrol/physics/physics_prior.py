@@ -15,8 +15,12 @@ MOMENT_SCALING_FACTOR = 1    # Scale all moments by this factor
 class PhysicsPrior(torch.nn.Module):
     """Deterministic physics prior using aerodynamic equations."""
 
-    def __init__(self, config_path: str = 'aero_coefficients.yaml'):
+    def __init__(self, config_path: str = None):
         super().__init__()
+        
+        # Use default config path if not provided (find it relative to this file)
+        if config_path is None:
+            config_path = str(Path(__file__).parent / 'aero_coefficients.yaml')
         
         # Load aerodynamic coefficients and aircraft parameters
         self.load_config(config_path)

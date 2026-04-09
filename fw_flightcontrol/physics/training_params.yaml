@@ -1,0 +1,113 @@
+# Training parameters for hybrid physics-augmented world model
+# This config controls all aspects of APHYNITY training
+
+# ============================================================================
+# NETWORK ARCHITECTURE
+# ============================================================================
+network:
+  # State and action dimensions
+  state_dim: 8          # [phi, theta, Va, p, q, r, alpha, beta]
+  action_dim: 3         # [delta_a, delta_e, throttle]
+  
+  # Residual network hidden layers
+  hidden_dims: [128, 128]
+  activation: relu      # Options: relu, tanh, elu
+  use_batch_norm: false
+  
+  # Weight initialization
+  init_mean: 0.0
+  init_std: 0.001       # Very small initialization to prevent early gradient explosion
+
+
+# ============================================================================
+# TRAINING HYPERPARAMETERS
+# ============================================================================
+training:
+  # Trajectory prediction horizon (number of simulation steps)
+  # Each step is 0.01 seconds, so horizon=20 means 0.2 seconds prediction
+  horizon: 1
+  
+  # Batch parameters
+  batch_size: 32
+  num_epochs: 100
+  
+  # Learning rate and optimizer
+  learning_rate: 0.00005
+  optimizer: adam
+  
+  # Gradient clipping for stability
+  grad_clip_norm: 1.0
+  
+  # Validation frequency
+  val_freq: 5           # Validate every N epochs
+  checkpoint_freq: 10   # Save checkpoint every N epochs
+
+
+# ============================================================================
+# APHYNITY DUAL ASCENT PARAMETERS
+# ============================================================================
+aphynity:
+  # Regularization coefficient (explicit weight on residual norms)
+  tau_1: 0.1            # Weight on regularization term: ||F_a||^2
+  # Lagrange multiplier initialization and update
+  lambda_init: 1.0     # Initial λ (weighted balance between regularization and trajectory loss)
+  tau_2: 0.001         # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
+  
+  # Lagrange multiplier bounds (prevent unbounded growth)
+  lambda_max: 10.0
+  lambda_min: 0.0
+
+
+# ============================================================================
+# ODE INTEGRATION SETTINGS
+# ============================================================================
+integration:
+  dt: 0.01              # Simulation step size (100 Hz environment)
+  method: rk4           # Integration method: rk4 (fastest), dopri5 (more stable but slow)
+  
+  # For adaptive step solvers (if used)
+  rtol: 1.0e-5
+  atol: 1.0e-6
+
+
+# ============================================================================
+# DATA HANDLING
+# ============================================================================
+data:
+  # Train/val/test split
+  train_fraction: 0.7
+  val_fraction: 0.15
+  test_fraction: 0.15
+  
+  # Data normalization (recommended for numerical stability)
+  normalize: true
+  normalize_method: standard  # Options: standard (z-score), minmax
+  
+  # Sequence sampling
+  random_seed: 42
+  shuffle: true
+
+
+# ============================================================================
+# REGULARIZATION
+# ============================================================================
+regularization:
+  # L2 weight decay on residual network
+  weight_decay: 0.0
+  
+  # Early stopping patience (epochs without improvement)
+  early_stopping_patience: 20
+  early_stopping_metric: val_loss
+
+
+# ============================================================================
+# LOGGING AND CHECKPOINTING
+# ============================================================================
+logging:
+  verbose: true
+  log_freq: 10          # Log metrics every N batches
+  tensorboard: true
+  
+  # Output directories
+  checkpoint_dir: ./checkpoints
+  log_dir: ./logs
