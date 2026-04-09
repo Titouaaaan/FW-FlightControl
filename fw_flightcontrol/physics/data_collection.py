@@ -33,14 +33,14 @@ ROLL_TARGETS = [-10, 10, -20, 20, -30, 30, 35, -35]      # 8 roll angles
 PITCH_TARGETS = [-10, 10, -20, 20]                       # 4 pitch angles
 # Note: Only first MAX_TRAJECTORIES_PER_FILE combinations will be generated
 
-NUM_STEPS = 2000  # 20 seconds at 100 Hz
+NUM_STEPS = 1000  # 10 seconds at 100 Hz
 TRAJECTORIES = []  # Will store trajectory history for future incremental additions
 
 # JSBSim environment configurations to generate data for
 #   - 'noatmo': No atmospheric disturbances (baseline)
 #   - 'constwind': Constant wind from the north
 #   - 'gustsonly': Gusts only (no wind/turbulence)
-JSBSIM_CONFIGS = ['noatmo', 'constwind', 'gustsonly']  
+JSBSIM_CONFIGS = ['noatmo']  
 
 
 def run_single_trajectory(env, trajectory_num, target_roll_deg, target_pitch_deg):
@@ -182,7 +182,7 @@ def run_single_trajectory(env, trajectory_num, target_roll_deg, target_pitch_deg
     return trajectory_data
 
 
-def save_trajectory_data_to_csv(trajectory_results, output_file='trajectory_data.csv'):
+def save_trajectory_data_to_csv(trajectory_results, output_file='updated_trajectory_data.csv'):
     """
     Save trajectory data (state transitions) to CSV file for dynamics learning.
     
@@ -266,90 +266,6 @@ def save_trajectory_data_to_csv(trajectory_results, output_file='trajectory_data
     print(f"\n✓ Saved {total_transitions} state transitions to '{output_file}'")
     print(f"  CSV format: trajectory_id, step_id, target_roll, target_pitch, ")
     print(f"              s_t_0-13 (state), a_t_0-2 (action), s_t+1_0-13 (next state), reward, terminal")
-    return output_file
-
-
-def save_trajectory_data_to_parquet(trajectory_results, output_file='trajectory_data.parquet'):
-    """
-    Save trajectory data to Parquet format (optimized for ML/dynamics learning).
-    
-    Parquet format (efficient columnar storage with nested arrays):
-        trajectory_id, step_id, target_roll, target_pitch,
-        state (array[14]), action (array[3]), next_state (array[14]),
-        reward, terminal
-    
-    Benefits:
-    - 5x compression vs CSV (~3-4MB vs 17MB for 42k transitions)
-    - Native array support (state/action/next_state as arrays, not 30 separate columns)
-    - Columnar storage (optimal for ML training)
-    - Widely supported (pandas, PyTorch, TensorFlow, DuckDB, Spark)
-    
-    Args:
-        trajectory_results: List of trajectory data dictionaries
-        output_file: Path to save Parquet file
-    """
-    try:
-        import pandas as pd
-    except ImportError:
-        print("Warning: pandas not available for Parquet output")
-        return None
-    
-    # Create output directory if needed
-    output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Collect all transitions into lists
-    data = {
-        'trajectory_id': [],
-        'step_id': [],
-        'target_roll': [],
-        'target_pitch': [],
-        'state': [],
-        'action': [],
-        'next_state': [],
-        'reward': [],
-        'terminal': []
-    }
-    
-    total_transitions = 0
-    
-    for traj_data in trajectory_results:
-        meta = traj_data['metadata']
-        trajectory_id = meta['trajectory_num']
-        target_roll = meta['target_roll']
-        target_pitch = meta['target_pitch']
-        
-        for step_id, transition in enumerate(traj_data['transitions']):
-            data['trajectory_id'].append(trajectory_id)
-            data['step_id'].append(step_id)
-            data['target_roll'].append(target_roll)
-            data['target_pitch'].append(target_pitch)
-            
-            # Store as numpy arrays (will be nested in Parquet)
-            data['state'].append(np.array(transition['state_t'], dtype=np.float32))
-            data['action'].append(np.array(transition['action'], dtype=np.float32))
-            data['next_state'].append(np.array(transition['state_next'], dtype=np.float32))
-            
-            data['reward'].append(transition['reward'])
-            data['terminal'].append(1 if transition['terminal'] else 0)
-            
-            total_transitions += 1
-    
-    # Create DataFrame
-    df = pd.DataFrame(data)
-    
-    # Save to Parquet with compression
-    df.to_parquet(output_file, compression='snappy', index=False)
-    
-    # Get file size for display
-    file_size = os.path.getsize(output_file) / (1024 * 1024)  # Convert to MB
-    
-    print(f"\n✓ Saved {total_transitions} state transitions to '{output_file}' ({file_size:.2f}MB)")
-    print(f"  Parquet format (optimized for ML):")
-    print(f"    - Nested arrays: state[14], action[2], next_state[14]")
-    print(f"    - Compression: snappy (5x smaller than CSV)")
-    print(f"    - Columnar storage (optimal for training)")
-    
     return output_file
 
 
@@ -476,7 +392,7 @@ def main(cfg: DictConfig):
             print_trajectory_summary(trajectory_results)
             
             # Save trajectory data to CSV file (CSV format only)
-            output_file = f'../data/trajectory_data_{config_name}.csv'
+            output_file = f'../data/updated_trajectory_data_{config_name}.csv'
             csv_file = save_trajectory_data_to_csv(trajectory_results, output_file)
         
         print(f"\n{'='*100}")
@@ -484,12 +400,10 @@ def main(cfg: DictConfig):
         print(f"{'='*100}")
         print(f"\nGenerated 3 CSV files in fw_flightcontrol/data/:")
         for config_name in JSBSIM_CONFIGS:
-            print(f"  - trajectory_data_{config_name}.csv")
-        print(f"\nEach file contains {MAX_TRAJECTORIES_PER_FILE} trajectories for that environment.")
+            print(f"  - updated_trajectory_data_{config_name}.csv")
         print(f"\nYou can load each file with:")
-        print(f"  df = pd.read_csv('fw_flightcontrol/data/trajectory_data_noatmo.csv')")
-        print(f"  df = pd.read_csv('fw_flightcontrol/data/trajectory_data_constwind.csv')")
-        print(f"  df = pd.read_csv('fw_flightcontrol/data/trajectory_data_gustsonly.csv')")
+        print(f"  df = pd.read_csv('fw_flightcontrol/data/updated_trajectory_data_noatmo.csv')")
+
         
     except Exception as e:
         print(f"\nError: {e}")
