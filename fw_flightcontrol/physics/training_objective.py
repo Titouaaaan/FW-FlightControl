@@ -64,13 +64,14 @@ def train_aphynity_epoch(
     over H steps. This teaches the residual network to correct errors that grow
     when predictions are chained together.
     
-    Mathematical formulation:
-        L_λ(θ_a) = (1/H) Σ_k ||F_a(s_k, u_k)||^2 + λ * (1/NH) Σ_i,k ||ŝ_k^(i) - s_k^(i)||^2
+    Mathematical formulation (from paper):
+        θ_{j+1} = θ_j - τ₁∇[λⱼL_traj(θⱼ) + ‖F_a‖]
     
     where:
-        - First term regularizes residual magnitude (smoothness constraint)
-        - Second term minimizes trajectory prediction error over H steps
-        - λ controls the trade-off (updated via dual ascent)
+        - L = regularization + λ * trajectory_loss
+        - τ₁ is gradient scaling (step size regularization for residual parameters)
+        - λ is updated via dual ascent: λ_{j+1} = λ_j + τ₂ * L_traj
+        - ∇ is gradient w.r.t. residual network parameters
     
     Args:
         hybrid_model: HybridDynamicsModel with physics_prior and residual_network
@@ -80,7 +81,7 @@ def train_aphynity_epoch(
             - 'states': (batch_size, H, 8) ground truth trajectory s_1...s_H
         optimizer: Configured for residual_network parameters only
         lambda_current: Current λ value (Lagrange multiplier for dual ascent)
-        tau_1: Regularization coefficient weight on ||F_a||^2 term
+        tau_1: Gradient scaling factor (step size regularization). Applied as τ₁∇L before optimizer.step()
         tau_2: Step size for λ update
         device: CPU or CUDA
     
@@ -207,10 +208,9 @@ def train_aphynity_epoch(
         print(f"  residual_norms: {torch.stack(residual_norms)}")
         raise ValueError("NaN in regularization loss")
     
-    # Combined APHYNITY loss with explicit regularization weight and Lagrange multiplier
-    # L_λ = τ_1 * regularization + λ * trajectory_loss
-    # τ_1 ensures regularization isn't overwhelmed by trajectory loss
-    total_loss = tau_1 * regularization_loss + lambda_current * trajectory_loss
+    # Combined APHYNITY loss: regularization + λ * trajectory_loss
+    # Note: τ_1 is applied to gradients, not the loss itself (see APHYNITY paper)
+    total_loss = regularization_loss + lambda_current * trajectory_loss
     
     # Check for NaN in total loss
     if torch.isnan(total_loss):
@@ -237,6 +237,12 @@ def train_aphynity_epoch(
     # Clip gradients for stability
     torch.nn.utils.clip_grad_norm_(hybrid_model.residual_network.parameters(), 
                                    max_norm=1.0)
+    
+    # Scale gradients by tau_1 as per APHYNITY paper: τ₁∇[λⱼLtraj(θⱼ) + ‖Fₐ‖]
+    # This regularizes parameter update step size (not loss weighting)
+    for param in hybrid_model.residual_network.parameters():
+        if param.grad is not None:
+            param.grad.mul_(tau_1)
     
     # Update residual network parameters
     optimizer.step()

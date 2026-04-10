@@ -25,13 +25,15 @@ from typing import Dict, Tuple
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 
 # Add project to path
 sys.path.insert(0, '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl')
 
 from fw_flightcontrol.physics.physics_prior import PhysicsPrior
 from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel
-from fw_flightcontrol.physics.training_objective import train_aphynity_epoch
+from fw_flightcontrol.physics.training_objective import train_aphynity_epoch, HybridDynamicsODE
 
 
 def load_config(config_path: str) -> Dict:
@@ -305,6 +307,13 @@ def main():
     lambda_min = aphynity_config['lambda_min']
     lambda_max = aphynity_config['lambda_max']
     
+    # Initialize TensorBoard writer with timestamped directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_base = Path(__file__).parent.parent / "logs" / "tensorboard"
+    log_dir = log_base / timestamp
+    log_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(str(log_dir))
+    
     print("\n" + "="*80)
     print("TRAINING CONFIGURATION")
     print("="*80)
@@ -346,6 +355,9 @@ def main():
     print("TRAINING")
     print("="*80)
     
+    # Global step counter for per-batch TensorBoard logging
+    global_step = 0
+    
     for epoch in tqdm(range(num_epochs), desc="Training", unit="epoch"):
         # ====================================================================
         # Training epoch: process all batches
@@ -376,7 +388,7 @@ def main():
                 ode_atol=config['integration']['atol']
             )
             
-            # Accumulate metrics
+            # Accumulate metrics for epoch-level statistics
             epoch_metrics['loss_total'] += metrics['loss_total']
             epoch_metrics['loss_trajectory'] += metrics['loss_trajectory']
             epoch_metrics['loss_regularization'] += metrics['loss_regularization']
@@ -385,6 +397,13 @@ def main():
             # Update lambda for next batch (dual ascent)
             lambda_current = metrics['lambda_new']
             lambda_current = max(lambda_min, min(lambda_current, lambda_max))
+            
+            # Log per-batch metrics to TensorBoard (high-resolution data)
+            writer.add_scalar('Batch/loss_total', metrics['loss_total'], global_step)
+            writer.add_scalar('Batch/loss_trajectory', metrics['loss_trajectory'], global_step)
+            writer.add_scalar('Batch/loss_regularization', metrics['loss_regularization'], global_step)
+            writer.add_scalar('Batch/lambda', lambda_current, global_step)
+            global_step += 1
             
             # Update progress bar with current metrics
             pbar.set_postfix({
@@ -402,6 +421,11 @@ def main():
         train_history['loss_regularization'].append(epoch_metrics['loss_regularization'])
         train_history['lambda_history'].append(lambda_current)
         
+        # Log epoch-level metrics to TensorBoard (aggregated statistics)
+        writer.add_scalar('Epoch/train_loss_total', epoch_metrics['loss_total'], epoch)
+        writer.add_scalar('Epoch/train_loss_trajectory', epoch_metrics['loss_trajectory'], epoch)
+        writer.add_scalar('Epoch/train_loss_regularization', epoch_metrics['loss_regularization'], epoch)
+        writer.add_scalar('Epoch/lambda_final', lambda_current, epoch)
         # ====================================================================
         # Validation: assess performance on held-out set
         # ====================================================================
@@ -424,10 +448,14 @@ def main():
                     batch_actions = batch_data['actions'].to(device)
                     batch_states = batch_data['states'].to(device)
                     
-                    # Unroll trajectory
+                    # Unroll trajectory using proper ODE wrapper (same as training)
+                    from torchdiffeq import odeint
                     predicted_states = []
                     residual_norms = []
                     current_state = batch_initial
+                    
+                    # Create ODE wrapper once per batch
+                    ode_module = HybridDynamicsODE(hybrid_model, device).to(device)
                     
                     for step in range(horizon):
                         action = batch_actions[:, step, :]
@@ -435,13 +463,15 @@ def main():
                         residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
                         residual_norms.append(residual_norm)
                         
-                        # ODE integration
-                        def ode_dynamics(t, state_t):
-                            return hybrid_model(state_t, action)
+                        # Set action and integrate using stable wrapper
+                        ode_module.set_action(action)
                         t_eval = torch.tensor([0.0, 0.01], dtype=current_state.dtype, device=device)
-                        from torchdiffeq import odeint
-                        solution = odeint(ode_dynamics, current_state, t_eval, method='rk4')
+                        solution = odeint(ode_module, current_state, t_eval, 
+                                        method=config['integration']['method'],
+                                        rtol=config['integration']['rtol'],
+                                        atol=config['integration']['atol'])
                         next_state = solution[-1]
+                        next_state = next_state.clamp(-100.0, 100.0)  # Clamp like training
                         predicted_states.append(next_state)
                         current_state = next_state
                     
@@ -450,12 +480,13 @@ def main():
                     trajectory_loss = torch.norm(prediction_error, p=2, dim=2).mean()
                     regularization_loss = torch.stack(residual_norms).mean()
                     
+                    # APHYNITY loss (same as training): regularization + λ * trajectory
+                    # Note: τ_1 is gradient scaling applied during training, not part of loss value
                     batch_loss_total = regularization_loss.item() + lambda_current * trajectory_loss.item()
                     val_metrics['loss_total'] += batch_loss_total
                     val_metrics['loss_trajectory'] += trajectory_loss.item()
                     val_metrics['loss_regularization'] += regularization_loss.item()
                     val_metrics['batch_count'] += 1
-                    
                     # Update progress bar with current batch metrics
                     val_pbar.set_postfix({
                         'L_total': f"{batch_loss_total:.4f}",
@@ -468,6 +499,11 @@ def main():
             val_history['loss_total'].append(val_metrics['loss_total'])
             val_history['loss_trajectory'].append(val_metrics['loss_trajectory'])
             val_history['loss_regularization'].append(val_metrics['loss_regularization'])
+            
+            # Log epoch-level validation metrics to TensorBoard
+            writer.add_scalar('Epoch/val_loss_total', val_metrics['loss_total'], epoch)
+            writer.add_scalar('Epoch/val_loss_trajectory', val_metrics['loss_trajectory'], epoch)
+            writer.add_scalar('Epoch/val_loss_regularization', val_metrics['loss_regularization'], epoch)
             
             # Early stopping check
             if val_metrics['loss_total'] < best_val_loss:
@@ -524,6 +560,12 @@ def main():
     final_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(hybrid_model.residual_network.state_dict(), final_path)
     print(f"Saved final model to {final_path}")
+    
+    # Close TensorBoard writer
+    writer.close()
+    print(f"TensorBoard logs saved to: {log_dir}")
+    print(f"  → Run: tensorboard --logdir {log_base}")
+    print("  → Then open http://localhost:6006 in your browser")
 
 
 if __name__ == '__main__':

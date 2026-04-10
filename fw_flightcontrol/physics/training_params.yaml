@@ -10,7 +10,7 @@ network:
   action_dim: 3         # [delta_a, delta_e, throttle]
   
   # Residual network hidden layers
-  hidden_dims: [128, 128]
+  hidden_dims: [200,200]
   activation: relu      # Options: relu, tanh, elu
   use_batch_norm: false
   
@@ -25,14 +25,14 @@ network:
 training:
   # Trajectory prediction horizon (number of simulation steps)
   # Each step is 0.01 seconds, so horizon=20 means 0.2 seconds prediction
-  horizon: 1
+  horizon: 10
   
   # Batch parameters
-  batch_size: 32
+  batch_size: 25
   num_epochs: 100
   
   # Learning rate and optimizer
-  learning_rate: 0.00005
+  learning_rate: 0.001
   optimizer: adam
   
   # Gradient clipping for stability
@@ -48,14 +48,16 @@ training:
 # ============================================================================
 aphynity:
   # Regularization coefficient (explicit weight on residual norms)
-  tau_1: 0.1            # Weight on regularization term: ||F_a||^2
+  tau_1: 0.001            # can be lowered even more i thtink, Weight on regularization term: ||F_a||^2
   # Lagrange multiplier initialization and update
   lambda_init: 1.0     # Initial λ (weighted balance between regularization and trajectory loss)
   tau_2: 0.001         # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
   
-  # Lagrange multiplier bounds (prevent unbounded growth)
-  lambda_max: 10.0
-  lambda_min: 0.0
+  # Lagrange multiplier bounds
+  # NOTE: Official APHYNITY has NO upper bound - lambda grows naturally
+  # Setting to high value for safety (detects pathological loss explosion only)
+  lambda_max: 1000.0   # Effectively unbounded; grows naturally via dual ascent
+  lambda_min: 0.1      # Prevent numerical issues at very low values
 
 
 # ============================================================================
