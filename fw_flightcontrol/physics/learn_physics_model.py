@@ -247,12 +247,16 @@ def initialize_models(config: Dict, device: torch.device) -> Tuple[PhysicsAugmen
     return residual_network, hybrid_model
 
 
-def create_optimizer(residual_network: PhysicsAugmented, config: Dict) -> torch.optim.Optimizer:
+def create_optimizer(residual_network: PhysicsAugmented, config: Dict):
     """
     Create optimizer for residual network parameters.
     
     We only optimize the residual network weights. The physics prior
     is frozen and provides fixed baseline predictions.
+    
+    Returns:
+        tuple: (optimizer, scheduler, min_lr) if scheduler enabled
+               (optimizer, None, None) if scheduler disabled
     """
     train_config = config['training']
     
@@ -263,7 +267,24 @@ def create_optimizer(residual_network: PhysicsAugmented, config: Dict) -> torch.
     )
     
     print(f"Created Adam optimizer with lr={train_config['learning_rate']}")
-    return optimizer
+    
+    # Create scheduler if enabled in config
+    scheduler = None
+    min_lr = None
+    
+    scheduler_config = train_config.get('scheduler', {})
+    if scheduler_config.get('enabled', False):
+        if scheduler_config.get('type') == 'steplr':
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=scheduler_config.get('step_size', 20),
+                gamma=scheduler_config.get('gamma', 0.7)
+            )
+            min_lr = scheduler_config.get('min_lr', 1e-5)
+            print(f"Created StepLR scheduler: step_size={scheduler_config.get('step_size', 20)}, "
+                  f"gamma={scheduler_config.get('gamma', 0.7)}, min_lr={min_lr}")
+    
+    return optimizer, scheduler, min_lr
 
 
 def main():
@@ -285,7 +306,7 @@ def main():
     residual_network, hybrid_model = initialize_models(config, device)
     
     # Create optimizer (only for residual network; physics prior is frozen)
-    optimizer = create_optimizer(residual_network, config)
+    optimizer, scheduler, min_lr = create_optimizer(residual_network, config)
     
     # Load trajectory data from CSV
     csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_noatmo.csv"
@@ -358,7 +379,19 @@ def main():
     # Global step counter for per-batch TensorBoard logging
     global_step = 0
     
+    # Log configuration to TensorBoard on first epoch
+    import yaml
+    config_yaml = yaml.dump(config, default_flow_style=False)
+    
     for epoch in tqdm(range(num_epochs), desc="Training", unit="epoch"):
+        # Log config on first epoch
+        if epoch == 0:
+            writer.add_text('Config/full_config', config_yaml)
+            # Also log key hyperparameters
+            writer.add_scalar('Hyperparams/learning_rate', train_config['learning_rate'], 0)
+            writer.add_scalar('Hyperparams/init_std', train_config.get('init_std', 0.001), 0)
+            writer.add_scalar('Hyperparams/batch_size', batch_size, 0)
+            writer.add_scalar('Hyperparams/horizon', horizon, 0)
         # ====================================================================
         # Training epoch: process all batches
         # ====================================================================
@@ -426,6 +459,18 @@ def main():
         writer.add_scalar('Epoch/train_loss_trajectory', epoch_metrics['loss_trajectory'], epoch)
         writer.add_scalar('Epoch/train_loss_regularization', epoch_metrics['loss_regularization'], epoch)
         writer.add_scalar('Epoch/lambda_final', lambda_current, epoch)
+        
+        # Step learning rate scheduler if enabled
+        if scheduler is not None:
+            scheduler.step()
+            # Apply minimum learning rate constraint
+            for param_group in optimizer.param_groups:
+                if param_group['lr'] < min_lr:
+                    param_group['lr'] = min_lr
+            # Log current learning rate to TensorBoard
+            current_lr = optimizer.param_groups[0]['lr']
+            writer.add_scalar('Training/learning_rate', current_lr, epoch)
+        
         # ====================================================================
         # Validation: assess performance on held-out set
         # ====================================================================
@@ -534,14 +579,20 @@ def main():
             checkpoint_path = Path(config['logging']['checkpoint_dir']) / f"epoch_{epoch+1}.pt"
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             
-            torch.save({
+            checkpoint_dict = {
                 'epoch': epoch,
                 'residual_state': hybrid_model.residual_network.state_dict(),
                 'optimizer_state': optimizer.state_dict(),
                 'lambda': lambda_current,
                 'train_history': train_history,
                 'val_history': val_history,
-            }, checkpoint_path)
+            }
+            
+            # Include scheduler state if active
+            if scheduler is not None:
+                checkpoint_dict['scheduler_state'] = scheduler.state_dict()
+            
+            torch.save(checkpoint_dict, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
         
         # Early stopping

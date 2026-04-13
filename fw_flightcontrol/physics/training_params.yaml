@@ -16,7 +16,7 @@ network:
   
   # Weight initialization
   init_mean: 0.0
-  init_std: 0.001       # Very small initialization to prevent early gradient explosion
+  init_std: 0.005       # Very small initialization to prevent early gradient explosion
 
 
 # ============================================================================
@@ -29,11 +29,19 @@ training:
   
   # Batch parameters
   batch_size: 25
-  num_epochs: 100
+  num_epochs: 1000
   
   # Learning rate and optimizer
-  learning_rate: 0.001
+  learning_rate: 0.005
   optimizer: adam
+  
+  # Learning rate scheduler (optional)
+  scheduler:
+    enabled: true
+    type: 'steplr'        # Options: 'steplr', 'exponential', 'cosine'
+    step_size: 20         # Decay every N epochs
+    gamma: 0.7            # Multiply LR by this factor (0.7 = 30% reduction per step)
+    min_lr: 0.0001        # Floor - don't go below this
   
   # Gradient clipping for stability
   grad_clip_norm: 1.0
