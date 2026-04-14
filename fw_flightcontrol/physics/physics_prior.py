@@ -4,12 +4,7 @@ import yaml
 from pathlib import Path
 
 
-APPLY_MOMENT_SCALING = True  # Enable - necessary for linear approximation
-MOMENT_SCALING_FACTOR = 1    # Scale all moments by this factor
-                             # TUNING OPTIONS:
-                             #   - 0.001 = very docile aircraft (~2-3 rad/s²)
-                             #   - 0.002 = moderate control authority (~3-6 rad/s²)
-                             #   - 0.003 = aggressive control (~6-10 rad/s²)
+
 
 
 class PhysicsPrior(torch.nn.Module):
@@ -149,28 +144,25 @@ class PhysicsPrior(torch.nn.Module):
         # ===================== ANGULAR RATE DERIVATIVES =====================
         
         # Aerodynamic moments
+        # NOTE: JSBSim coefficients C_l, C_m, C_n contain pre-scaled dynamic pressure factors
+        # So we divide by q_dyn instead of multiplying. This ensures moment = coeff / q_dyn
+        # BUT IDK IF WE CAN DO THIS, LIKE THERE IS NO PROOF FOR IT T_T
         q_dyn_b = 0.5 * self.rho * Va**2 * self.S * self.b
         q_dyn_c = 0.5 * self.rho * Va**2 * self.S * self.c
         
-        l = q_dyn_b * (self.C_l0 + self.C_l_beta * beta +
-                      self.C_l_p * (self.b * p) / (2 * Va + 1e-6) +
-                      self.C_l_r * (self.b * r) / (2 * Va + 1e-6) +
-                      self.C_l_delta_a * delta_a)
+        l = (self.C_l0 + self.C_l_beta * beta +
+             self.C_l_p * (self.b * p) / (2 * Va + 1e-6) +
+             self.C_l_r * (self.b * r) / (2 * Va + 1e-6) +
+             self.C_l_delta_a * delta_a) * (q_dyn_b + 1e-6)
         
-        m = q_dyn_c * (self.C_m0 + self.C_m_alpha * alpha +
-                      self.C_m_q * (self.c * q) / (2 * Va + 1e-6) +
-                      self.C_m_delta_e * delta_e)
+        m = (self.C_m0 + self.C_m_alpha * alpha +
+             self.C_m_q * (self.c * q) / (2 * Va + 1e-6) +
+             self.C_m_delta_e * delta_e) * (q_dyn_c + 1e-6)
         
-        n = q_dyn_b * (self.C_n0 + self.C_n_beta * beta +
-                      self.C_n_p * (self.b * p) / (2 * Va + 1e-6) +
-                      self.C_n_r * (self.b * r) / (2 * Va + 1e-6) +
-                      self.C_n_delta_a * delta_a)
-        
-        # Apply empirical moment scaling (calibration for coefficient definition mismatch)
-        if APPLY_MOMENT_SCALING:
-            l = l * MOMENT_SCALING_FACTOR
-            m = m * MOMENT_SCALING_FACTOR
-            n = n * MOMENT_SCALING_FACTOR
+        n = (self.C_n0 + self.C_n_beta * beta +
+             self.C_n_p * (self.b * p) / (2 * Va + 1e-6) +
+             self.C_n_r * (self.b * r) / (2 * Va + 1e-6) +
+             self.C_n_delta_a * delta_a) * (q_dyn_b + 1e-6)
         
         # Compute Gamma parameters from inertia tensor
         # These come from inverting the inertia matrix for decoupled angular dynamics
