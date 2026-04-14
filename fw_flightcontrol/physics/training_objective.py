@@ -234,9 +234,27 @@ def train_aphynity_epoch(
             print(f"  grad range: [{param.grad.min()}, {param.grad.max()}]")
             raise ValueError(f"NaN gradient in {name}")
     
+    # Compute gradient statistics before clipping
+    grad_norms_before = []
+    for param in hybrid_model.residual_network.parameters():
+        if param.grad is not None:
+            grad_norms_before.append(torch.norm(param.grad).item())
+    
+    grad_norm_before_clipping = sum(grad_norms_before) / len(grad_norms_before) if grad_norms_before else 0.0
+    grad_max_before_clipping = max(grad_norms_before) if grad_norms_before else 0.0
+    
     # Clip gradients for stability
-    torch.nn.utils.clip_grad_norm_(hybrid_model.residual_network.parameters(), 
-                                   max_norm=1.0)
+    grad_norm_clipped = torch.nn.utils.clip_grad_norm_(hybrid_model.residual_network.parameters(), 
+                                                       max_norm=1.0)
+    
+    # Compute gradient statistics after clipping
+    grad_norms_after = []
+    for param in hybrid_model.residual_network.parameters():
+        if param.grad is not None:
+            grad_norms_after.append(torch.norm(param.grad).item())
+    
+    grad_norm_after_clipping = sum(grad_norms_after) / len(grad_norms_after) if grad_norms_after else 0.0
+    grad_max_after_clipping = max(grad_norms_after) if grad_norms_after else 0.0
     
     # Scale gradients by tau_1 as per APHYNITY paper: τ₁∇[λⱼLtraj(θⱼ) + ‖Fₐ‖]
     # This regularizes parameter update step size (not loss weighting)
@@ -259,7 +277,12 @@ def train_aphynity_epoch(
         'loss_total': total_loss.item(),
         'loss_trajectory': trajectory_loss.item(),
         'loss_regularization': regularization_loss.item(),
-        'lambda_new': lambda_new
+        'lambda_new': lambda_new,
+        'grad_norm_before_clipping': grad_norm_before_clipping,
+        'grad_max_before_clipping': grad_max_before_clipping,
+        'grad_norm_after_clipping': grad_norm_after_clipping,
+        'grad_max_after_clipping': grad_max_after_clipping,
+        'grad_norm_clipped': grad_norm_clipped.item() if isinstance(grad_norm_clipped, torch.Tensor) else grad_norm_clipped
     }
 
 

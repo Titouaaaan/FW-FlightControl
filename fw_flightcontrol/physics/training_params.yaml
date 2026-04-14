@@ -89,8 +89,8 @@ data:
   val_fraction: 0.15
   test_fraction: 0.15
   
-  # Data normalization (recommended for numerical stability)
-  normalize: true
+  # Data normalization (disabled - physics prior works in raw physical units)
+  normalize: false
   normalize_method: standard  # Options: standard (z-score), minmax
   
   # Sequence sampling

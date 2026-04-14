@@ -387,11 +387,43 @@ def main():
         # Log config on first epoch
         if epoch == 0:
             writer.add_text('Config/full_config', config_yaml)
-            # Also log key hyperparameters
-            writer.add_scalar('Hyperparams/learning_rate', train_config['learning_rate'], 0)
-            writer.add_scalar('Hyperparams/init_std', train_config.get('init_std', 0.001), 0)
-            writer.add_scalar('Hyperparams/batch_size', batch_size, 0)
-            writer.add_scalar('Hyperparams/horizon', horizon, 0)
+            
+            # Format hyperparameters as readable text (not scalars/plots)
+            hyperparams_text = f"""
+## Training Hyperparameters
+
+**Learning:**
+- Learning Rate: {train_config['learning_rate']}
+- Init Std Dev: {train_config.get('init_std', 0.001)}
+- Optimizer: {train_config.get('optimizer', 'adam')}
+- Gradient Clip Norm: {train_config.get('grad_clip_norm', 1.0)}
+
+**Scheduling:**
+- Scheduler Enabled: {train_config.get('scheduler', {}).get('enabled', False)}
+- Scheduler Type: {train_config.get('scheduler', {}).get('type', 'none')}
+- Step Size: {train_config.get('scheduler', {}).get('step_size', 'N/A')}
+- Gamma: {train_config.get('scheduler', {}).get('gamma', 'N/A')}
+- Min LR: {train_config.get('scheduler', {}).get('min_lr', 'N/A')}
+
+**Data & Architecture:**
+- Batch Size: {batch_size}
+- Horizon: {horizon} steps (~{horizon*config['integration']['dt']:.2f}s)
+- State Dim: {config['network']['state_dim']}
+- Action Dim: {config['network']['action_dim']}
+- Hidden Dims: {config['network']['hidden_dims']}
+
+**APHYNITY:**
+- Lambda Init: {aphynity_config['lambda_init']}
+- Tau 1: {aphynity_config['tau_1']}
+- Tau 2: {aphynity_config['tau_2']}
+- Lambda Bounds: [{aphynity_config['lambda_min']}, {aphynity_config['lambda_max']}]
+
+**Integration:**
+- ODE Method: {config['integration']['method']}
+- rtol: {config['integration']['rtol']}
+- atol: {config['integration']['atol']}
+"""
+            writer.add_text('Hyperparameters/text_summary', hyperparams_text)
         # ====================================================================
         # Training epoch: process all batches
         # ====================================================================
@@ -401,6 +433,11 @@ def main():
             'loss_trajectory': 0,
             'loss_regularization': 0,
             'batch_count': 0,
+            'grad_norm_before_clipping': 0,
+            'grad_norm_after_clipping': 0,
+            'grad_max_before_clipping': 0,
+            'grad_max_after_clipping': 0,
+            'grad_norm_clipped': 0,
         }
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:3d}/{num_epochs}: Train", 
@@ -436,6 +473,15 @@ def main():
             writer.add_scalar('Batch/loss_trajectory', metrics['loss_trajectory'], global_step)
             writer.add_scalar('Batch/loss_regularization', metrics['loss_regularization'], global_step)
             writer.add_scalar('Batch/lambda', lambda_current, global_step)
+            
+            # Accumulate gradient statistics
+            if 'grad_norm_before_clipping' in metrics:
+                epoch_metrics['grad_norm_before_clipping'] = epoch_metrics.get('grad_norm_before_clipping', 0) + metrics['grad_norm_before_clipping']
+                epoch_metrics['grad_max_before_clipping'] = max(epoch_metrics.get('grad_max_before_clipping', 0), metrics['grad_max_before_clipping'])
+                epoch_metrics['grad_norm_after_clipping'] = epoch_metrics.get('grad_norm_after_clipping', 0) + metrics['grad_norm_after_clipping']
+                epoch_metrics['grad_max_after_clipping'] = max(epoch_metrics.get('grad_max_after_clipping', 0), metrics['grad_max_after_clipping'])
+                epoch_metrics['grad_norm_clipped'] = max(epoch_metrics.get('grad_norm_clipped', 0), metrics['grad_norm_clipped'])
+            
             global_step += 1
             
             # Update progress bar with current metrics
@@ -445,9 +491,14 @@ def main():
                 'λ': f"{lambda_current:.4f}"
             })
         
-        # Average metrics over batches
+        # Average metrics over batches and compute gradient stats
         for key in ['loss_total', 'loss_trajectory', 'loss_regularization']:
             epoch_metrics[key] /= epoch_metrics['batch_count']
+        
+        # Average gradient metrics if they were collected
+        if 'grad_norm_before_clipping' in epoch_metrics:
+            epoch_metrics['grad_norm_before_clipping'] /= epoch_metrics['batch_count']
+            epoch_metrics['grad_norm_after_clipping'] /= epoch_metrics['batch_count']
         
         train_history['loss_total'].append(epoch_metrics['loss_total'])
         train_history['loss_trajectory'].append(epoch_metrics['loss_trajectory'])
@@ -459,6 +510,14 @@ def main():
         writer.add_scalar('Epoch/train_loss_trajectory', epoch_metrics['loss_trajectory'], epoch)
         writer.add_scalar('Epoch/train_loss_regularization', epoch_metrics['loss_regularization'], epoch)
         writer.add_scalar('Epoch/lambda_final', lambda_current, epoch)
+        
+        # Log gradient statistics per epoch
+        if 'grad_norm_before_clipping' in epoch_metrics:
+            writer.add_scalar('Gradients/norm_before_clipping', epoch_metrics['grad_norm_before_clipping'], epoch)
+            writer.add_scalar('Gradients/norm_after_clipping', epoch_metrics['grad_norm_after_clipping'], epoch)
+            writer.add_scalar('Gradients/max_norm_before_clipping', epoch_metrics['grad_max_before_clipping'], epoch)
+            writer.add_scalar('Gradients/max_norm_after_clipping', epoch_metrics['grad_max_after_clipping'], epoch)
+            writer.add_scalar('Gradients/clipping_threshold', epoch_metrics['grad_norm_clipped'], epoch)
         
         # Step learning rate scheduler if enabled
         if scheduler is not None:
