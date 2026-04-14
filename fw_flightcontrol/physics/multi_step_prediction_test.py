@@ -107,9 +107,9 @@ def multi_step_rollout(hybrid_model, states, actions, next_states_true):
         current_action = actions[step].unsqueeze(0).to(DEVICE)  # (1, 3)
         ground_truth_next = next_states_true[step].to(DEVICE)    # (8,)
         
-        # Predict next state using hybrid model with RK4 integration (0.01 second)
+        # Predict next state using hybrid model with integration (0.01 second)
         with torch.no_grad():
-            predicted_next = hybrid_model.integrate_rk4(current_state, current_action)
+            predicted_next = hybrid_model.integrate(current_state, current_action)
             predicted_next = predicted_next.squeeze(0)  # (8,)
         
         # Calculate error
@@ -170,7 +170,8 @@ def main():
         physics_prior=physics_prior,
         residual_network=residual_network,
         with_prior=WITH_PRIOR,
-        with_residual=WITH_RESIDUAL
+        with_residual=WITH_RESIDUAL,
+        integration_method='rk4'
     )
     hybrid_model = hybrid_model.to(DEVICE)
     hybrid_model.eval()

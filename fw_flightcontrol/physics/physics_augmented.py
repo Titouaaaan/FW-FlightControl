@@ -129,13 +129,16 @@ class HybridDynamicsModel(nn.Module):
     - Hybrid: with_prior=True, with_residual=True (full model)
     
     The combined dynamics are: ds/dt = F_p(s,u) + F_a(s,u)
+    
+    Supports multiple ODE integration methods for accuracy vs speed tradeoff.
     """
     
     def __init__(self, 
                  physics_prior,
                  residual_network,
                  with_prior: bool = True,
-                 with_residual: bool = True):
+                 with_residual: bool = True,
+                 integration_method: str = 'rk4'):
         """
         Initialize hybrid model.
         
@@ -144,6 +147,7 @@ class HybridDynamicsModel(nn.Module):
             residual_network: PhysicsAugmented instance (trained)
             with_prior: Include physics prior in forward pass
             with_residual: Include learned residuals in forward pass
+            integration_method: ODE integration method ('rk4' or 'dopri8')
         """
         super().__init__()
         
@@ -151,6 +155,10 @@ class HybridDynamicsModel(nn.Module):
         self.residual_network = residual_network
         self.with_prior = with_prior
         self.with_residual = with_residual
+        self.integration_method = integration_method
+        
+        if integration_method not in ['rk4', 'dopri8']:
+            raise ValueError(f"integration_method must be 'rk4' or 'dopri8', got '{integration_method}'")
     
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """
@@ -211,4 +219,50 @@ class HybridDynamicsModel(nn.Module):
         
         # Return final state at t=0.01
         return trajectory[-1]
+    
+    def integrate_dop853(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """
+        DOP853 (DOPRI8) integration for one environment step (0.01 seconds).
+        
+        DOPRI8 is an 8th order Runge-Kutta method with dense output.
+        More accurate than RK4 but slower. Useful for high-accuracy testing.
+        
+        Args:
+            state: (batch_size, 8) initial state s_t
+            action: (batch_size, 3) control input (constant during integration)
+        
+        Returns:
+            state_next: (batch_size, 8) state after 0.01 seconds i.e., s_{t+1}
+        """
+        # Define the ODE: ds/dt = F_p(s,u) + F_a(s,u)
+        def ode_dynamics(t, state_t):
+            return self(state_t, action)
+        
+        # Integration time points: from t=0 to t=0.01
+        t_eval = torch.tensor([0.0, 0.01], dtype=state.dtype, device=state.device)
+        
+        # Integrate using DOPRI8 (8th order, higher accuracy)
+        # rtol and atol set to strict tolerances for better accuracy
+        trajectory = odeint(ode_dynamics, state, t_eval, method='dopri8', rtol=1e-8, atol=1e-9)
+        
+        # Return final state at t=0.01
+        return trajectory[-1]
+    
+    def integrate(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """
+        Integration wrapper that selects method based on configuration.
+        
+        Args:
+            state: (batch_size, 8) initial state s_t
+            action: (batch_size, 3) control input
+        
+        Returns:
+            state_next: (batch_size, 8) state after one time step
+        """
+        if self.integration_method == 'rk4':
+            return self.integrate_rk4(state, action)
+        elif self.integration_method == 'dopri8':
+            return self.integrate_dop853(state, action)
+        else:
+            raise ValueError(f"Unknown integration method: {self.integration_method}")
 

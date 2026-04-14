@@ -266,14 +266,17 @@ def initialize_models(config: Dict, device: torch.device) -> Tuple[PhysicsAugmen
     
     # Hybrid model combines both
     print("\nHybrid Dynamics Model:")
+    integration_method = config.get('integration', {}).get('method', 'rk4')
     hybrid_model = HybridDynamicsModel(
         physics_prior=physics_prior,
         residual_network=residual_network,
         with_prior=True,
-        with_residual=True
+        with_residual=True,
+        integration_method=integration_method
     )
     hybrid_model = hybrid_model.to(device)
     print(f"  ✓ Initialized (ds/dt = F_p + F_a)")
+    print(f"  ✓ Integration method: {integration_method}")
     print(f"  ✓ Model moved to {device}")
     
     return residual_network, hybrid_model

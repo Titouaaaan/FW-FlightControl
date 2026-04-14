@@ -72,10 +72,16 @@ aphynity:
 # ODE INTEGRATION SETTINGS
 # ============================================================================
 integration:
-  dt: 0.01              # Simulation step size (100 Hz environment)
-  method: rk4           # Integration method: rk4 (fastest), dopri5 (more stable but slow)
+  # Simulation step size (100 Hz environment)
+  dt: 0.01
   
-  # For adaptive step solvers (if used)
+  # Integration method for HybridDynamicsModel
+  # Options: 
+  #   'rk4' - 4th order Runge-Kutta (faster, adequate accuracy for training)
+  #   'dopri8' - 8th order (slower, higher accuracy, better for fine-tuned testing)
+  method: rk4
+  
+  # For adaptive step solvers (torchdiffeq odeint parameters)
   rtol: 1.0e-5
   atol: 1.0e-6
 
