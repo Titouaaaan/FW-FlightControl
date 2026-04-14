@@ -20,8 +20,9 @@ import torch
 import torch.nn as nn
 import yaml
 import sys
+import argparse
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
@@ -101,15 +102,47 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
         
         num_steps = len(states)
         
+        # Get sampling strategy from config
+        sampling_cfg = config['data'].get('sampling_strategy', {})
+        use_hierarchical_sampling = sampling_cfg.get('enabled', True)
+        
+        if use_hierarchical_sampling:
+            # Extract thresholds and probabilities
+            early_threshold = sampling_cfg.get('early_steps_threshold', 200)
+            medium_threshold = sampling_cfg.get('medium_steps_threshold', 400)
+            late_threshold = sampling_cfg.get('late_steps_threshold', 600)
+            max_threshold = sampling_cfg.get('max_step_threshold', 600)
+            
+            early_prob = sampling_cfg.get('early_probability', 0.8)
+            medium_prob = sampling_cfg.get('medium_probability', 0.5)
+            late_prob = sampling_cfg.get('late_probability', 0.2)
+            
+            print(f"[Data Loading] Using hierarchical sampling:")
+            print(f"  Early [0-{early_threshold}]: {early_prob*100:.0f}% | "
+                  f"Medium [{early_threshold}-{medium_threshold}]: {medium_prob*100:.0f}% | "
+                  f"Late [{medium_threshold}-{late_threshold}]: {late_prob*100:.0f}% | "
+                  f"Ignore [≥{max_threshold}]")
+        
         # Extract sliding windows of length H
         for start_idx in range(num_steps - horizon):
             start_step = step_ids[start_idx]
             
-            # Bias toward early steps: 70% of samples from step < 500
-            if start_step < 500:
-                include_prob = 0.7
+            # Hierarchical sampling strategy by trajectory phase
+            if use_hierarchical_sampling:
+                # Skip trajectories at or beyond max threshold (stale data)
+                if start_step >= max_threshold:
+                    continue
+                
+                # Assign probability based on which tier the window starts in
+                if start_step < early_threshold:
+                    include_prob = early_prob  # Highest priority: most dynamics
+                elif start_step < medium_threshold:
+                    include_prob = medium_prob  # Medium priority: moderate dynamics
+                else:  # start_step < late_threshold (guaranteed by max_threshold check)
+                    include_prob = late_prob  # Low priority: settled dynamics
             else:
-                include_prob = 0.3
+                # Fallback to uniform sampling if disabled
+                include_prob = 1.0
             
             if np.random.rand() < include_prob:
                 seq_states = states[start_idx:start_idx + horizon]
@@ -126,8 +159,7 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
                     'actions': seq_actions.copy(),
                     'states': seq_next_states.copy(),
                 })
-    
-    print(f"Extracted {len(trajectory_sequences)} trajectory sequences of length {horizon}")
+        print(f"Extracted {len(trajectory_sequences)} trajectory sequences of length {horizon}")
     
     # Simple split: 70% train, 15% val, 15% test
     n_train = int(len(trajectory_sequences) * config['data']['train_fraction'])
@@ -247,6 +279,48 @@ def initialize_models(config: Dict, device: torch.device) -> Tuple[PhysicsAugmen
     return residual_network, hybrid_model
 
 
+def load_checkpoint(checkpoint_path: str, residual_network: PhysicsAugmented, optimizer, scheduler, device: torch.device) -> Dict:
+    """
+    Load a checkpoint and restore training state.
+    
+    Returns:
+        Dictionary with restored state: epoch, lambda_current, train_history, val_history
+    """
+    print(f"\nLoading checkpoint from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Restore network weights
+    residual_network.load_state_dict(checkpoint['residual_state'])
+    print("  ✓ Restored network weights")
+    
+    # Restore optimizer state
+    optimizer.load_state_dict(checkpoint['optimizer_state'])
+    print("  ✓ Restored optimizer state")
+    
+    # Restore scheduler state if present
+    if scheduler is not None and 'scheduler_state' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state'])
+        print("  ✓ Restored scheduler state")
+    
+    # Restore training state
+    start_epoch = checkpoint['epoch'] + 1  # Resume from next epoch
+    lambda_current = checkpoint['lambda']
+    train_history = checkpoint['train_history']
+    val_history = checkpoint['val_history']
+    
+    print(f"  ✓ Resuming from epoch {start_epoch}")
+    print(f"  ✓ Restored λ={lambda_current:.6f}")
+    print(f"  ✓ Training history: {len(train_history['loss_total'])} epochs")
+    print(f"  ✓ Validation history: {len(val_history['loss_total'])} rounds")
+    
+    return {
+        'start_epoch': start_epoch,
+        'lambda_current': lambda_current,
+        'train_history': train_history,
+        'val_history': val_history,
+    }
+
+
 def create_optimizer(residual_network: PhysicsAugmented, config: Dict):
     """
     Create optimizer for residual network parameters.
@@ -287,11 +361,20 @@ def create_optimizer(residual_network: PhysicsAugmented, config: Dict):
     return optimizer, scheduler, min_lr
 
 
-def main():
-    """Main training script entrypoint."""
+def main(resume_checkpoint: Optional[str] = None):
+    """Main training script entrypoint.
+    
+    Args:
+        resume_checkpoint: Path to checkpoint to resume from. If None, starts from scratch.
+    """
     print("\n" + "="*80)
     print("HYBRID PHYSICS-AUGMENTED WORLD MODEL TRAINING")
     print("="*80)
+    
+    if resume_checkpoint:
+        print(f"Resume Mode: {resume_checkpoint}")
+    else:
+        print("Fresh Start Mode")
     
     # Load configuration from the physics directory
     config_path = Path(__file__).parent / 'training_params.yaml'
@@ -308,6 +391,13 @@ def main():
     # Create optimizer (only for residual network; physics prior is frozen)
     optimizer, scheduler, min_lr = create_optimizer(residual_network, config)
     
+    # Load checkpoint if resuming
+    start_epoch = 0
+    resume_state = None
+    if resume_checkpoint:
+        resume_state = load_checkpoint(resume_checkpoint, residual_network, optimizer, scheduler, device)
+        start_epoch = resume_state['start_epoch']
+    
     # Load trajectory data from CSV
     csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_noatmo.csv"
     train_loader, val_loader, test_loader = load_trajectory_data(str(csv_path), config)
@@ -323,16 +413,36 @@ def main():
     val_freq = train_config.get('val_freq', 5)
     checkpoint_freq = train_config.get('checkpoint_freq', 20)
     
-    lambda_current = aphynity_config['lambda_init']
+    # Construct checkpoint directory path
+    checkpoint_subdir = config['logging'].get('checkpoint_subdirectory', 'checkpoints')
+    checkpoint_base_dir = Path(config['logging']['checkpoint_dir']) / checkpoint_subdir
+    print(f"\nCheckpoint directory: {checkpoint_base_dir}")
+    
+    # Use resumed state if available, otherwise use config defaults
+    if resume_state:
+        lambda_current = resume_state['lambda_current']
+    else:
+        lambda_current = aphynity_config['lambda_init']
+    
     tau_2 = aphynity_config['tau_2']
     lambda_min = aphynity_config['lambda_min']
     lambda_max = aphynity_config['lambda_max']
     
-    # Initialize TensorBoard writer with timestamped directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_base = Path(__file__).parent.parent / "logs" / "tensorboard"
-    log_dir = log_base / timestamp
-    log_dir.mkdir(parents=True, exist_ok=True)
+    # Initialize TensorBoard writer
+    # If resuming, append to existing logs; otherwise create new timestamped dir
+    if resume_state:
+        # During resume, we'll continue writing to existing log directory
+        # (or create a new one - for safety, we create new to separate runs)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_base = Path(__file__).parent.parent / "logs" / "tensorboard"
+        log_dir = log_base / timestamp
+        log_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\nNew TensorBoard log directory: {log_dir}")
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_base = Path(__file__).parent.parent / "logs" / "tensorboard"
+        log_dir = log_base / timestamp
+        log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(str(log_dir))
     
     print("\n" + "="*80)
@@ -351,23 +461,25 @@ def main():
     print(f"  • λ step size (τ_2): {tau_2}")
     print(f"  • λ bounds: [{lambda_min}, {lambda_max}]")
     
-    # Training tracking
+    # Training tracking - restored from checkpoint or initialized fresh
     from training_objective import train_aphynity_epoch
     
-    train_history = {
-        'loss_total': [],
-        'loss_trajectory': [],
-        'loss_regularization': [],
-        'lambda_history': [],
-    }
-    val_history = {
-        'loss_total': [],
-        'loss_trajectory': [],
-        'loss_regularization': [],
-    }
-    
-    best_val_loss = float('inf')
-    patience_counter = 0
+    if resume_state:
+        train_history = resume_state['train_history']
+        val_history = resume_state['val_history']
+        print(f"\nResumed training history: {len(train_history['loss_total'])} epochs completed")
+    else:
+        train_history = {
+            'loss_total': [],
+            'loss_trajectory': [],
+            'loss_regularization': [],
+            'lambda_history': [],
+        }
+        val_history = {
+            'loss_total': [],
+            'loss_trajectory': [],
+            'loss_regularization': [],
+        }
     
     # ========================================================================
     # TRAINING LOOP - Following the APHYNITY pseudocode
@@ -375,15 +487,17 @@ def main():
     print("\n" + "="*80)
     print("TRAINING")
     print("="*80)
+    print(f"Training epochs {start_epoch} to {num_epochs-1} (total: {num_epochs - start_epoch})")
     
     # Global step counter for per-batch TensorBoard logging
+    # Offset by number of already-completed epochs if resuming
     global_step = 0
     
-    # Log configuration to TensorBoard on first epoch
+    # Log configuration to TensorBoard only on first epoch (not on resume)
     import yaml
     config_yaml = yaml.dump(config, default_flow_style=False)
     
-    for epoch in tqdm(range(num_epochs), desc="Training", unit="epoch"):
+    for epoch in tqdm(range(start_epoch, num_epochs), desc="Training", unit="epoch"):
         # Log config on first epoch
         if epoch == 0:
             writer.add_text('Config/full_config', config_yaml)
@@ -608,13 +722,6 @@ def main():
             writer.add_scalar('Epoch/val_loss_total', val_metrics['loss_total'], epoch)
             writer.add_scalar('Epoch/val_loss_trajectory', val_metrics['loss_trajectory'], epoch)
             writer.add_scalar('Epoch/val_loss_regularization', val_metrics['loss_regularization'], epoch)
-            
-            # Early stopping check
-            if val_metrics['loss_total'] < best_val_loss:
-                best_val_loss = val_metrics['loss_total']
-                patience_counter = 0
-            else:
-                patience_counter += 1
         
         # ====================================================================
         # Logging
@@ -635,7 +742,7 @@ def main():
         # Checkpointing
         # ====================================================================
         if (epoch + 1) % checkpoint_freq == 0:
-            checkpoint_path = Path(config['logging']['checkpoint_dir']) / f"epoch_{epoch+1}.pt"
+            checkpoint_path = checkpoint_base_dir / f"epoch_{epoch+1}.pt"
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             
             checkpoint_dict = {
@@ -653,20 +760,15 @@ def main():
             
             torch.save(checkpoint_dict, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
-        
-        # Early stopping
-        if patience_counter >= config['regularization'].get('early_stopping_patience', 20):
-            print(f"\nEarly stopping triggered at epoch {epoch+1}")
-            break
     
     print("\n" + "="*80)
     print("TRAINING COMPLETE")
     print("="*80)
     print(f"Final λ: {lambda_current:.4f}")
-    print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Total epochs trained: {len(train_history['loss_total'])}")
     
     # Save final model
-    final_path = Path(config['logging']['checkpoint_dir']) / "final_model.pt"
+    final_path = checkpoint_base_dir / "final_model.pt"
     final_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(hybrid_model.residual_network.state_dict(), final_path)
     print(f"Saved final model to {final_path}")
@@ -679,4 +781,13 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='Train hybrid physics-augmented world model')
+    parser.add_argument(
+        '--resume',
+        type=str,
+        default=None,
+        help='Path to checkpoint to resume from (e.g., fw_flightcontrol/physics/checkpoints/epoch_100.pt)'
+    )
+    args = parser.parse_args()
+    
+    main(resume_checkpoint=args.resume)
