@@ -6,34 +6,63 @@ import sys
 sys.path.insert(0, '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl')
 from pendulum_physics import PendulumPhysics
 from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel
+from fw_flightcontrol.physics.training_objective import HybridDynamicsODE
 from torchdiffeq import odeint
 
 
-def generate_gym_trajectory(env, initial_state, time_steps):
-    trajectory = []
-    state_np = initial_state[0].cpu().numpy()
-    obs, _ = env.reset(seed=None)
-    env.env.state = state_np
-    trajectory.append(torch.tensor(env.env.state.copy(), dtype=torch.float32))
+def generate_gym_trajectory(env, initial_state, num_steps):
+    """
+    Run Gym's Pendulum-v1 natively for num_steps to get ground truth trajectory.
+    """
+    trajectory = [initial_state.clone()]
+    device = initial_state.device
     
-    for step in range(len(time_steps) - 1):
-        action = np.zeros(1)
-        obs, reward, terminated, truncated, info = env.step(action)
-        trajectory.append(torch.tensor(env.env.state.copy(), dtype=torch.float32))
-        if terminated or truncated:
-            break
+    # Reset and set initial condition
+    env.reset()
+    env.unwrapped.state = initial_state[0].cpu().numpy().astype(np.float32)
+    
+    # Run Gym for num_steps
+    for _ in range(num_steps):
+        action = np.array([0.0])  # Zero action
+        obs, _, _, _, _ = env.step(action)
+        state = torch.tensor([env.unwrapped.state.copy()], dtype=torch.float32, device=device)
+        trajectory.append(state)
     
     return torch.stack(trajectory)
 
 
-def generate_prior_trajectory_odeint(physics_prior, initial_state, time_steps, device):
-    dummy_action = torch.zeros(initial_state.shape[0], 1, device=device)
+def generate_prior_trajectory_semiimplicit_euler(physics_prior, initial_state, num_steps, dt, device):
+    """
+    Generate trajectory using semi-implicit Euler (matching Gym's method exactly).
+    Updates velocity first, then position using updated velocity.
     
-    def ode_dynamics(t, state_t):
-        return physics_prior(state_t, dummy_action)
+    This is the key to matching Gym perfectly!
+    """
+    trajectory = [initial_state.clone()]
+    current_state = initial_state.clone()
     
-    trajectory = odeint(ode_dynamics, initial_state, time_steps, method='dopri8', rtol=1e-8, atol=1e-9)
-    return trajectory
+    for step in range(num_steps):
+        # Extract state
+        theta = current_state[:, 0]
+        omega = current_state[:, 1]
+        
+        # Compute derivatives at current state (using physics prior)
+        action = torch.zeros(current_state.shape[0], 1, device=device)
+        derivatives = physics_prior(current_state, action)
+        dtheta_dt = derivatives[:, 0]  
+        domega_dt = derivatives[:, 1]
+        
+        # Semi-implicit Euler: velocity step first
+        omega_new = omega + domega_dt * dt
+        
+        # Then position step using updated velocity
+        theta_new = theta + omega_new * dt
+        
+        # Update state
+        current_state = torch.stack([theta_new, omega_new], dim=1)
+        trajectory.append(current_state)
+    
+    return torch.stack(trajectory)
 
 
 def compute_error(prior_pred, gym_truth):
@@ -53,7 +82,10 @@ def main():
     
     env = gym.make("Pendulum-v1")
     
-    physics_prior = PendulumPhysics(omega0_square=(2 * math.pi / 6) ** 2, alpha=0.2).to(device)
+    # Match Gym's actual dynamics: θ'' = 15*sin(θ) with NO damping
+    # Gym uses: newthdot = thdot + (3*g/(2*l) * sin(th)) * dt
+    # With g=10, l=1: coefficient = 3*10/(2*1) = 15
+    physics_prior = PendulumPhysics(omega0_square=15.0, alpha=0.0).to(device)
     
     initial_states = [
         torch.tensor([[0.5, 0.0]], device=device, dtype=torch.float32),
@@ -61,13 +93,13 @@ def main():
         torch.tensor([[0.0, 2.0]], device=device, dtype=torch.float32),
     ]
     
-    dt = 0.01
-    horizons = [1, 3, 5, 10, 20, 30, 40]
+    dt = 0.05  # Gym Pendulum-v1 dt
+    horizons = [1, 2, 3, 5, 10,20,30,40]  # Steps
     max_steps = max(horizons)
     
     print("=" * 100)
-    print("PENDULUM PHYSICS PRIOR ABLATION TEST (APHYNITY-Style ODE Integration)")
-    print("Approach: Teacher Forcing via odeint() - Prior Only (No Residuals)")
+    print("PENDULUM PHYSICS PRIOR ABLATION TEST (Multi-Step Autoregressive)")
+    print("Approach: APHYNITY-Style Multi-Step ODE Integration (Error Compounding)")
     print("=" * 100)
     
     all_results = {}
@@ -78,11 +110,11 @@ def main():
     for traj_idx, initial_state in enumerate(initial_states):
         print(f"\nTrajectory {traj_idx + 1}: θ₀={initial_state[0, 0]:.4f}, ω₀={initial_state[0, 1]:.4f}")
         
-        time_steps = torch.arange(0, (max_steps + 1) * dt, dt, dtype=torch.float32, device=device)
+        # Generate ground truth from Gym
+        gt_trajectory = generate_gym_trajectory(env, initial_state, max_steps)
         
-        gt_trajectory = generate_gym_trajectory(env, initial_state, time_steps)
-        
-        pred_trajectory = generate_prior_trajectory_odeint(physics_prior, initial_state, time_steps, device)
+        # Generate prediction from our physics prior
+        pred_trajectory = generate_prior_trajectory_semiimplicit_euler(physics_prior, initial_state, max_steps, dt, device)
         
         for horizon in horizons:
             pred_at_h = pred_trajectory[horizon]

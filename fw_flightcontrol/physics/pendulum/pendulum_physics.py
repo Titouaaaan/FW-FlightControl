@@ -18,7 +18,8 @@ class PendulumPhysics(nn.Module):
         theta = state[:, 0]
         omega = state[:, 1]
         dtheta_dt = omega
-        domega_dt = -(self._omega0_sq * torch.sin(theta)) - (self._alpha * omega)
+        # Gym uses sin(theta + pi) = -sin(theta), so acceleration is POSITIVE not negative
+        domega_dt = (self._omega0_sq * torch.sin(theta)) - (self._alpha * omega)
         derivative = torch.stack([dtheta_dt, domega_dt], dim=1)
         return derivative
 
