@@ -153,16 +153,16 @@ class PhysicsPrior(torch.nn.Module):
         l = (self.C_l0 + self.C_l_beta * beta +
              self.C_l_p * (self.b * p) / (2 * Va + 1e-6) +
              self.C_l_r * (self.b * r) / (2 * Va + 1e-6) +
-             self.C_l_delta_a * delta_a) * (q_dyn_b + 1e-6)
+             self.C_l_delta_a * delta_a) / (q_dyn_b + 1e-6)
         
         m = (self.C_m0 + self.C_m_alpha * alpha +
              self.C_m_q * (self.c * q) / (2 * Va + 1e-6) +
-             self.C_m_delta_e * delta_e) * (q_dyn_c + 1e-6)
+             self.C_m_delta_e * delta_e) / (q_dyn_c + 1e-6)
         
         n = (self.C_n0 + self.C_n_beta * beta +
              self.C_n_p * (self.b * p) / (2 * Va + 1e-6) +
              self.C_n_r * (self.b * r) / (2 * Va + 1e-6) +
-             self.C_n_delta_a * delta_a) * (q_dyn_b + 1e-6)
+             self.C_n_delta_a * delta_a) / (q_dyn_b + 1e-6)
         
         # Compute Gamma parameters from inertia tensor
         # These come from inverting the inertia matrix for decoupled angular dynamics

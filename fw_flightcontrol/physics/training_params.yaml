@@ -79,7 +79,7 @@ integration:
   # Options: 
   #   'rk4' - 4th order Runge-Kutta (faster, adequate accuracy for training)
   #   'dopri8' - 8th order (slower, higher accuracy, better for fine-tuned testing)
-  method: rk4
+  method: dopri8
   
   # For adaptive step solvers (torchdiffeq odeint parameters)
   rtol: 1.0e-5
