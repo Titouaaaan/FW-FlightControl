@@ -7,23 +7,65 @@ sys.path.insert(0, '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl')
 from pendulum_physics import PendulumPhysics
 
 
-def generate_gym_trajectory(env, initial_state, num_steps):
+def observation_to_state(obs, previous_theta=None):
     """
-    Run Gym's Pendulum-v1 natively for num_steps to get ground truth trajectory.
-    """
-    trajectory = [initial_state.clone()]
-    device = initial_state.device
+    Decode Gym Pendulum-v1 observation to raw state.
     
-    # Reset and set initial condition
+    Observation: [cos(θ), sin(θ), ω]
+    State: [θ, ω]
+    
+    Handles angle wrapping by tracking previous angle.
+    """
+    cos_theta, sin_theta, omega = obs[0], obs[1], obs[2]
+    theta_wrapped = np.arctan2(sin_theta, cos_theta)  # In [-π, π]
+    
+    # If we have a previous angle, unwrap to maintain continuity
+    if previous_theta is not None:
+        # Find the wrapping offset
+        diff = theta_wrapped - previous_theta
+        # If diff is large, we wrapped
+        if diff > np.pi:
+            theta_wrapped -= 2 * np.pi
+        elif diff < -np.pi:
+            theta_wrapped += 2 * np.pi
+    
+    return np.array([theta_wrapped, omega], dtype=np.float32)
+
+
+def generate_gym_trajectory(env, initial_obs, num_steps):
+    """
+    Run Gym's Pendulum-v1 natively for num_steps, working with observations.
+    Decodes observations to states for comparison with physics prior.
+    Handles angle wrapping via continuous tracking.
+    
+    Args:
+        env: Gym environment
+        initial_obs: Initial observation [cos(θ), sin(θ), ω]
+        num_steps: Number of steps to run
+    
+    Returns:
+        Trajectory of states: (num_steps+1, batch_size, 2)
+    """
+    trajectory = []
+    device = torch.device('cpu')
+    
+    # Decode initial observation to state
+    initial_state = observation_to_state(initial_obs, previous_theta=None)
+    trajectory.append(torch.tensor([initial_state], dtype=torch.float32, device=device))
+    
+    # Reset env and set to initial state
     env.reset()
-    env.unwrapped.state = initial_state[0].cpu().numpy().astype(np.float32)
+    env.unwrapped.state = initial_state.copy()
     
-    # Run Gym for num_steps
+    previous_theta = initial_state[0]  # Track for angle unwrapping
+    
     for _ in range(num_steps):
         action = np.array([0.0])  # Zero action
         obs, _, _, _, _ = env.step(action)
-        state = torch.tensor([env.unwrapped.state.copy()], dtype=torch.float32, device=device)
-        trajectory.append(state)
+        # Decode observation back to state with unwrapping
+        state = observation_to_state(obs, previous_theta=previous_theta)
+        previous_theta = state[0]  # Update for next iteration
+        trajectory.append(torch.tensor([state], dtype=torch.float32, device=device))
     
     return torch.stack(trajectory)
 
@@ -73,6 +115,14 @@ def compute_error(prior_pred, gym_truth):
     return mse_theta, mse_omega, rmse_theta, rmse_omega
 
 
+def state_to_observation(state_np):
+    """
+    Convert raw state [θ, ω] to observation [cos(θ), sin(θ), ω].
+    """
+    theta, omega = state_np[0], state_np[1]
+    return np.array([np.cos(theta), np.sin(theta), omega], dtype=np.float32)
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
@@ -107,10 +157,13 @@ def main():
     for traj_idx, initial_state in enumerate(initial_states):
         print(f"\nTrajectory {traj_idx + 1}: θ₀={initial_state[0, 0]:.4f}, ω₀={initial_state[0, 1]:.4f}")
         
-        # Generate ground truth from Gym
-        gt_trajectory = generate_gym_trajectory(env, initial_state, max_steps)
+        # Convert initial state to observation for gym interface
+        initial_obs = state_to_observation(initial_state[0].cpu().numpy())
         
-        # Generate prediction from our physics prior
+        # Generate ground truth from Gym (using observations, decoding internally to states)
+        gt_trajectory = generate_gym_trajectory(env, initial_obs, max_steps)
+        
+        # Generate prediction from our physics prior (using states directly)
         pred_trajectory = generate_prior_trajectory_semiimplicit_euler(physics_prior, initial_state, max_steps, dt, device)
         
         for horizon in horizons:
