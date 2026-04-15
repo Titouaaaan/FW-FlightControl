@@ -196,6 +196,10 @@ def main():
     print(f"Each horizon step = {DT} seconds")
     print("="*100 + "\n")
     
+    # Collect all step_ids and results organized by (step_id, horizon)
+    results_by_step_horizon = {}  # (step_id, horizon) -> list of RMSE values
+    step_ids_tested = set()
+    
     for traj_id, step_id, row_idx in test_sequences:
         print(f"Trajectory {traj_id:2d}, step_id {step_id:3d}:")
         
@@ -226,6 +230,8 @@ def main():
             if error_data is not None:
                 overall_rmse, overall_mae, per_state_rmse, per_state_mae = error_data
                 print(f"  Horizon {horizon:2d} ({horizon*DT:.3f}s): RMSE={overall_rmse:.6f}, MAE={overall_mae:.6f}")
+                
+                # Track by trajectory ID and horizon (kept for backward compatibility)
                 all_results[horizon].append({
                     'traj_id': traj_id,
                     'step_id': step_id,
@@ -234,11 +240,49 @@ def main():
                     'per_state_rmse': per_state_rmse,
                     'per_state_mae': per_state_mae
                 })
+                
+                # Track by (step_id, horizon) for new summary table
+                key = (step_id, horizon)
+                if key not in results_by_step_horizon:
+                    results_by_step_horizon[key] = []
+                results_by_step_horizon[key].append(overall_rmse)
+                step_ids_tested.add(step_id)
         
         print()
     
     print("="*100)
-    print("SUMMARY - PRIOR ACCURACY AT DIFFERENT HORIZONS")
+    print("SUMMARY - PRIOR ACCURACY BY STEP_ID AND HORIZON")
+    print("="*100 + "\n")
+    
+    print("Format: Mean RMSE (±Std Dev)\n")
+    
+    # Build table
+    step_ids_sorted = sorted(list(step_ids_tested))
+    horizons_sorted = sorted(HORIZONS)
+    
+    # Create header
+    header = "step_id    " + "  ".join([f"H={h:2d}" for h in horizons_sorted])
+    print(header)
+    print("-" * len(header))
+    
+    # Create rows
+    for step_id in step_ids_sorted:
+        row = f"{step_id:6d}     "
+        row_values = []
+        for horizon in horizons_sorted:
+            key = (step_id, horizon)
+            if key in results_by_step_horizon and len(results_by_step_horizon[key]) > 0:
+                rmses = np.array(results_by_step_horizon[key])
+                mean_rmse = np.mean(rmses)
+                std_rmse = np.std(rmses)
+                row_values.append(f"{mean_rmse:.4f}(±{std_rmse:.4f})")
+            else:
+                row_values.append("    N/A       ")
+        row += "  ".join(row_values)
+        print(row)
+    
+    print("\n" + "="*100)
+    print("DETAILED SUMMARY - PRIOR ACCURACY AT DIFFERENT HORIZONS")
     print("="*100 + "\n")
     
     state_names = ['φ (roll)', 'θ (pitch)', 'V_a (speed)', 'p (roll rate)', 
