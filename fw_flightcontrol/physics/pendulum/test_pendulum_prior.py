@@ -5,6 +5,7 @@ import math
 import sys
 sys.path.insert(0, '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl')
 from pendulum_physics import PendulumPhysics
+from torchdiffeq import odeint
 
 
 def observation_to_state(obs, previous_theta=None):
@@ -104,6 +105,36 @@ def generate_prior_trajectory_semiimplicit_euler(physics_prior, initial_state, n
     return torch.stack(trajectory)
 
 
+def generate_prior_trajectory_rk4(physics_prior, initial_state, num_steps, dt, device):
+    """
+    Generate trajectory using RK4 via torchdiffeq.odeint.
+    
+    Creates time points and uses RK4 solver for better accuracy.
+    """
+    batch_size = initial_state.shape[0]
+    
+    # Create ODE function wrapper
+    class PendulumODE(torch.nn.Module):
+        def __init__(self, physics_prior):
+            super().__init__()
+            self.physics_prior = physics_prior
+        
+        def forward(self, t, state):
+            # state shape: (batch_size, 2)
+            action = torch.zeros(state.shape[0], 1, device=state.device)
+            return self.physics_prior(state, action)
+    
+    ode_func = PendulumODE(physics_prior)
+    
+    # Create time integration points
+    t = torch.linspace(0, num_steps * dt, num_steps + 1, device=device)
+    
+    # Solve ODE using RK4
+    trajectory = odeint(ode_func, initial_state, t, method='rk4')
+    
+    return trajectory
+
+
 def compute_error(prior_pred, gym_truth):
     prior_pred = prior_pred.squeeze() if prior_pred.dim() > 1 else prior_pred
     gym_truth = gym_truth.squeeze() if gym_truth.dim() > 1 else gym_truth
@@ -123,9 +154,16 @@ def state_to_observation(state_np):
     return np.array([np.cos(theta), np.sin(theta), omega], dtype=np.float32)
 
 
-def main():
+def main(integration_method='semi_implicit_euler'):
+    """
+    Main test function.
+    
+    Args:
+        integration_method: 'semi_implicit_euler' or 'rk4'
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}\n")
+    print(f"Device: {device}")
+    print(f"Integration method: {integration_method}\n")
     
     env = gym.make("Pendulum-v1")
     
@@ -145,7 +183,7 @@ def main():
     max_steps = max(horizons)
     
     print("=" * 100)
-    print("PENDULUM PHYSICS PRIOR ABLATION TEST (Multi-Step Autoregressive)")
+    print(f"PENDULUM PHYSICS PRIOR TEST - {integration_method.upper()}")
     print("Approach: APHYNITY-Style Multi-Step ODE Integration (Error Compounding)")
     print("=" * 100)
     
@@ -163,8 +201,11 @@ def main():
         # Generate ground truth from Gym (using observations, decoding internally to states)
         gt_trajectory = generate_gym_trajectory(env, initial_obs, max_steps)
         
-        # Generate prediction from our physics prior (using states directly)
-        pred_trajectory = generate_prior_trajectory_semiimplicit_euler(physics_prior, initial_state, max_steps, dt, device)
+        # Generate prediction from our physics prior using selected method
+        if integration_method == 'rk4':
+            pred_trajectory = generate_prior_trajectory_rk4(physics_prior, initial_state, max_steps, dt, device)
+        else:  # semi_implicit_euler
+            pred_trajectory = generate_prior_trajectory_semiimplicit_euler(physics_prior, initial_state, max_steps, dt, device)
         
         for horizon in horizons:
             pred_at_h = pred_trajectory[horizon]
@@ -198,4 +239,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    print("\n" + "="*100)
+    print("RUNNING WITH SEMI-IMPLICIT EULER")
+    print("="*100)
+    main(integration_method='semi_implicit_euler')
+    
+    print("\n\n" + "="*100)
+    print("RUNNING WITH RK4")
+    print("="*100)
+    main(integration_method='rk4')
