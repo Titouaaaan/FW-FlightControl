@@ -5,9 +5,6 @@ import math
 import sys
 sys.path.insert(0, '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl')
 from pendulum_physics import PendulumPhysics
-from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel
-from fw_flightcontrol.physics.training_objective import HybridDynamicsODE
-from torchdiffeq import odeint
 
 
 def generate_gym_trajectory(env, initial_state, num_steps):
