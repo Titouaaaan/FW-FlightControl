@@ -47,7 +47,7 @@ training:
   grad_clip_norm: 1.0
   
   # Validation frequency
-  val_freq: 5           # Validate every N epochs
+  val_freq: 1           # Validate every epoch
   checkpoint_freq: 10   # Save checkpoint every N epochs
 
 
@@ -55,17 +55,19 @@ training:
 # APHYNITY DUAL ASCENT PARAMETERS
 # ============================================================================
 aphynity:
-  # Regularization coefficient (explicit weight on residual norms)
-  tau_1: 0.001            # can be lowered even more i thtink, Weight on regularization term: ||F_a||^2
+  # Learning rate coefficient (handled by Adam optimizer)
+  tau_1: 0.001            # Learning rate for Adam optimizer (official APHYNITY pendulum uses 1e-3)
+                          # Passed to optimizer, NOT applied as gradient scaling
   # Lagrange multiplier initialization and update
-  lambda_init: 1.0     # Initial λ (weighted balance between regularization and trajectory loss)
-  tau_2: 0.001         # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
+  lambda_init: 1.0        # Initial λ (balanced: reg=1.0, trajectory_loss weighted by λ)
+  tau_2: 0.01              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
+                          # Conservative value; can increase to 1.0 after verifying numerical stability
   
   # Lagrange multiplier bounds
   # NOTE: Official APHYNITY has NO upper bound - lambda grows naturally
   # Setting to high value for safety (detects pathological loss explosion only)
-  lambda_max: 1000.0   # Effectively unbounded; grows naturally via dual ascent
-  lambda_min: 0.1      # Prevent numerical issues at very low values
+  lambda_max: 1000.0      # Effectively unbounded; grows naturally via dual ascent
+  lambda_min: 0.1         # Prevent numerical issues at very low values
 
 
 # ============================================================================
@@ -79,7 +81,7 @@ integration:
   # Options: 
   #   'rk4' - 4th order Runge-Kutta (faster, adequate accuracy for training)
   #   'dopri8' - 8th order (slower, higher accuracy, better for fine-tuned testing)
-  method: dopri8
+  method: rk4
   
   # For adaptive step solvers (torchdiffeq odeint parameters)
   rtol: 1.0e-5
@@ -142,5 +144,5 @@ logging:
   
   # Output directories
   checkpoint_dir: ./checkpoints
-  checkpoint_subdirectory: test2    # Subdirectory for this run (e.g., test1, test2, exp_v1)
+  checkpoint_subdirectory: exp_v0.1    # Subdirectory for this run (e.g., test1, test2, exp_v1)
   log_dir: ./logs

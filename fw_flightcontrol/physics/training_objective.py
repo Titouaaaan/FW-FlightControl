@@ -55,7 +55,8 @@ def train_aphynity_epoch(
     device: torch.device = torch.device('cpu'),
     ode_method: str = 'dopri5',
     ode_rtol: float = 1e-4,
-    ode_atol: float = 1e-5
+    ode_atol: float = 1e-5,
+    dt: float = 0.01
 ) -> Dict:
     """
     Train residual network using APHYNITY (Augmented Physics with Newton's method).
@@ -104,80 +105,74 @@ def train_aphynity_epoch(
     optimizer.zero_grad()
     
     # ========================================================================
-    # FORWARD PASS: Unroll H-step trajectory using RK4 integration
+    # FORWARD PASS: Unroll H-step trajectory using specified integration method
     # ========================================================================
     predicted_states = []
     residual_norms = []
     
-    # Create ODE wrapper once - critical for gradient tracking
-    ode_module = HybridDynamicsODE(hybrid_model, device).to(device)
-    
     current_state = initial_states
     
-    for step in range(horizon):
-        action = actions[:, step, :]  # (batch_size, 3)
+    # Use semi-implicit Euler if requested (custom method with gradient support)
+    if ode_method == 'semi_implicit_euler':
+        # Manual semi-implicit Euler loop preserves gradient flow through unrolled loop
+        for step in range(horizon):
+            action = actions[:, step, :]  # (batch_size, 2) for pendulum
+            
+            # Compute residual output at this step for regularization term
+            residual_output = hybrid_model.residual_network(current_state, action)
+            residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
+            residual_norms.append(residual_norm)
+            
+            # Check for NaN/Inf
+            if torch.isnan(residual_norm) or torch.isinf(residual_norm):
+                raise ValueError(f"NaN/Inf in residual norm at step {step}")
+            
+            # Semi-implicit Euler step: update velocity first, then position
+            next_state = hybrid_model.integrate(current_state, action, dt=dt)
+            
+            # Clamp to prevent numerical explosion
+            next_state = next_state.clamp(-100.0, 100.0)
+            
+            # Check for NaN after integration
+            if torch.isnan(next_state).any() or torch.isinf(next_state).any():
+                raise ValueError(f"NaN/Inf after semi-implicit Euler integration at step {step}")
+            
+            predicted_states.append(next_state)
+            current_state = next_state
+    
+    else:
+        # Use torchdiffeq for other ODE methods (RK4, dopri8, etc.)
+        ode_module = HybridDynamicsODE(hybrid_model, device).to(device)
         
-        # DEBUG: Check input state ranges
-        state_max = torch.abs(current_state).max().item()
-        action_max = torch.abs(action).max().item()
-        
-        # Compute residual output at this step for regularization term
-        # These are the corrections F_a(s_k, u_k) that we want to keep small
-        residual_output = hybrid_model.residual_network(current_state, action)
-        residual_max = torch.abs(residual_output).max().item()
-        residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
-        residual_norms.append(residual_norm)
-        
-        # DEBUG: Check physics prior output
-        physics_output = hybrid_model.physics_prior(current_state, action)
-        physics_max = torch.abs(physics_output).max().item()
-        
-        # Check for NaN/Inf in inputs or outputs
-        if torch.isnan(residual_norm) or torch.isinf(residual_norm):
-            print(f"\n{'='*80}")
-            print(f"NaN/Inf detected at step {step}")
-            print(f"  Input state range: [{current_state.min():.4e}, {current_state.max():.4e}]")
-            print(f"  Input action range: [{action.min():.4e}, {action.max():.4e}]")
-            print(f"  Physics output range: [{physics_output.min():.4e}, {physics_output.max():.4e}]")
-            print(f"  Residual output range: [{residual_output.min():.4e}, {residual_output.max():.4e}]")
-            print(f"  Physics max magnitude: {physics_max:.4e}")
-            print(f"  Residual max magnitude: {residual_max:.4e}")
-            print(f"  Residual norm: {residual_norm}")
-            print(f"{'='*80}\n")
-            raise ValueError(f"NaN/Inf in residual norm at step {step}")
-        
-        # Integrate one simulation step: s_{k+1} = s_k + ∫[s_k, 0.01] (F_p + F_a) dt
-        # Set the action for this step
-        ode_module.set_action(action)
-        
-        # Time points for integration
-        t_eval = torch.tensor([0.0, 0.01], dtype=current_state.dtype, device=device)
-        
-        # Integrate using RK4 method with the wrapper module
-        solution = odeint(ode_module, current_state, t_eval,
-                         method=ode_method, rtol=ode_rtol, atol=ode_atol)
-        next_state = solution[-1]  # Extract final state at t=0.01
-        
-        # DEBUG: Check integration output before clamping
-        next_state_max = torch.abs(next_state).max().item()
-        
-        # Clamp state values to prevent numerical explosion
-        # Expected ranges based on flight dynamics (angles in rad ~[-pi, pi], 
-        # angular rates ~[-10, 10], airspeed ~[0, 50] m/s)
-        next_state = next_state.clamp(-100.0, 100.0)
-        
-        # Check for NaN in integrated state
-        if torch.isnan(next_state).any() or torch.isinf(next_state).any():
-            print(f"\n{'='*80}")
-            print(f"NaN/Inf detected after integration at step {step}")
-            print(f"  Pre-clamp state range: [{solution[-1].min():.4e}, {solution[-1].max():.4e}]")
-            print(f"  Post-clamp state range: [{next_state.min():.4e}, {next_state.max():.4e}]")
-            print(f"  Pre-clamp max magnitude: {next_state_max:.4e}")
-            print(f"{'='*80}\n")
-            raise ValueError(f"NaN/Inf in integration at step {step}")
-        
-        predicted_states.append(next_state)
-        current_state = next_state
+        for step in range(horizon):
+            action = actions[:, step, :]  # (batch_size, 3)
+            
+            # Compute residual output at this step for regularization term
+            residual_output = hybrid_model.residual_network(current_state, action)
+            residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
+            residual_norms.append(residual_norm)
+            
+            # Check for NaN/Inf
+            if torch.isnan(residual_norm) or torch.isinf(residual_norm):
+                raise ValueError(f"NaN/Inf in residual norm at step {step}")
+            
+            # Integrate one simulation step using torchdiffeq
+            ode_module.set_action(action)
+            t_eval = torch.tensor([0.0, 0.01], dtype=current_state.dtype, device=device)
+            
+            solution = odeint(ode_module, current_state, t_eval,
+                             method=ode_method, rtol=ode_rtol, atol=ode_atol)
+            next_state = solution[-1]
+            
+            # Clamp to prevent numerical explosion
+            next_state = next_state.clamp(-100.0, 100.0)
+            
+            # Check for NaN after integration
+            if torch.isnan(next_state).any() or torch.isinf(next_state).any():
+                raise ValueError(f"NaN/Inf after {ode_method} integration at step {step}")
+            
+            predicted_states.append(next_state)
+            current_state = next_state
     
     # Stack all predicted states
     predicted_trajectory = torch.stack(predicted_states, dim=1)  # (batch_size, H, 8)
@@ -256,13 +251,8 @@ def train_aphynity_epoch(
     grad_norm_after_clipping = sum(grad_norms_after) / len(grad_norms_after) if grad_norms_after else 0.0
     grad_max_after_clipping = max(grad_norms_after) if grad_norms_after else 0.0
     
-    # Scale gradients by tau_1 as per APHYNITY paper: τ₁∇[λⱼLtraj(θⱼ) + ‖Fₐ‖]
-    # This regularizes parameter update step size (not loss weighting)
-    for param in hybrid_model.residual_network.parameters():
-        if param.grad is not None:
-            param.grad.mul_(tau_1)
-    
     # Update residual network parameters
+    # Note: tau_1 is handled by Adam optimizer as learning rate, NOT applied here
     optimizer.step()
     
     # ========================================================================

@@ -335,15 +335,19 @@ def create_optimizer(residual_network: PhysicsAugmented, config: Dict):
         tuple: (optimizer, scheduler, min_lr) if scheduler enabled
                (optimizer, None, None) if scheduler disabled
     """
+    aphynity_config = config['aphynity']
     train_config = config['training']
     
-    # Adam optimizer with configured learning rate
+    # Adam optimizer with tau_1 as learning rate (official APHYNITY approach)
+    # tau_1 is NOT a gradient scaling factor, it's the learning rate for Adam
+    learning_rate = aphynity_config['tau_1']
     optimizer = torch.optim.Adam(
         residual_network.parameters(),
-        lr=train_config['learning_rate']
+        lr=learning_rate,
+        betas=(0.9, 0.999)  # Standard betas from official APHYNITY
     )
     
-    print(f"Created Adam optimizer with lr={train_config['learning_rate']}")
+    print(f"Created Adam optimizer with lr={learning_rate} (from aphynity.tau_1)")
     
     # Create scheduler if enabled in config
     scheduler = None
@@ -572,7 +576,8 @@ def main(resume_checkpoint: Optional[str] = None):
                 device=device,
                 ode_method=config['integration']['method'],
                 ode_rtol=config['integration']['rtol'],
-                ode_atol=config['integration']['atol']
+                ode_atol=config['integration']['atol'],
+                dt=config['integration']['dt']
             )
             
             # Accumulate metrics for epoch-level statistics
