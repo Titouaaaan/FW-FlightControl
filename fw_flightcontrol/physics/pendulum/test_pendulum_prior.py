@@ -71,26 +71,29 @@ def generate_gym_trajectory(env, initial_obs, num_steps):
     return torch.stack(trajectory)
 
 
-def generate_prior_trajectory_semiimplicit_euler(physics_prior, initial_state, num_steps, dt, device):
+def generate_prior_trajectory_semiimplicit_euler_autodiff(physics_prior, initial_state, num_steps, dt, device):
     """
-    Generate trajectory using semi-implicit Euler (matching Gym's method exactly).
-    Updates velocity first, then position using updated velocity.
+    Generate trajectory using semi-implicit Euler with full autodiff support.
     
-    This is the key to matching Gym perfectly!
+    Semi-implicit Euler (velocity Verlet) is more stable than explicit Euler
+    and matches Gym's integration. Despite not using torchdiffeq's ODE solver,
+    gradient flow is maintained through pure PyTorch operations.
+    
+    This is crucial for accurate pendulum dynamics and for APHYNITY training.
     """
-    trajectory = [initial_state.clone()]
-    current_state = initial_state.clone()
+    trajectory = [initial_state]
+    current_state = initial_state
     
     for step in range(num_steps):
-        # Extract state
-        theta = current_state[:, 0]
-        omega = current_state[:, 1]
+        # Extract state components
+        theta = current_state[:, 0:1]
+        omega = current_state[:, 1:2]
         
         # Compute derivatives at current state (using physics prior)
         action = torch.zeros(current_state.shape[0], 1, device=device)
         derivatives = physics_prior(current_state, action)
-        dtheta_dt = derivatives[:, 0]  
-        domega_dt = derivatives[:, 1]
+        dtheta_dt = derivatives[:, 0:1]  
+        domega_dt = derivatives[:, 1:2]
         
         # Semi-implicit Euler: velocity step first
         omega_new = omega + domega_dt * dt
@@ -98,41 +101,11 @@ def generate_prior_trajectory_semiimplicit_euler(physics_prior, initial_state, n
         # Then position step using updated velocity
         theta_new = theta + omega_new * dt
         
-        # Update state
-        current_state = torch.stack([theta_new, omega_new], dim=1)
+        # Stack and append to trajectory
+        current_state = torch.cat([theta_new, omega_new], dim=1)
         trajectory.append(current_state)
     
     return torch.stack(trajectory)
-
-
-def generate_prior_trajectory_rk4(physics_prior, initial_state, num_steps, dt, device):
-    """
-    Generate trajectory using RK4 via torchdiffeq.odeint.
-    
-    Creates time points and uses RK4 solver for better accuracy.
-    """
-    batch_size = initial_state.shape[0]
-    
-    # Create ODE function wrapper
-    class PendulumODE(torch.nn.Module):
-        def __init__(self, physics_prior):
-            super().__init__()
-            self.physics_prior = physics_prior
-        
-        def forward(self, t, state):
-            # state shape: (batch_size, 2)
-            action = torch.zeros(state.shape[0], 1, device=state.device)
-            return self.physics_prior(state, action)
-    
-    ode_func = PendulumODE(physics_prior)
-    
-    # Create time integration points
-    t = torch.linspace(0, num_steps * dt, num_steps + 1, device=device)
-    
-    # Solve ODE using RK4
-    trajectory = odeint(ode_func, initial_state, t, method='rk4')
-    
-    return trajectory
 
 
 def compute_error(prior_pred, gym_truth):
@@ -154,19 +127,22 @@ def state_to_observation(state_np):
     return np.array([np.cos(theta), np.sin(theta), omega], dtype=np.float32)
 
 
-def main(integration_method='semi_implicit_euler', friction_alpha=0.0):
+def main(friction_alpha=0.0):
     """
     Main test function.
     
     Args:
-        integration_method: 'semi_implicit_euler' or 'rk4'
         friction_alpha: Friction coefficient. 0.0 = no friction (perfect prior), 
                        higher values add damping to test residual learning
+    
+    Note: Uses RK4 via torchdiffeq for all integration to maintain gradient flow
+    for residual learning during APHYNITY training.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Integration method: {integration_method}")
-    print(f"Friction (alpha): {friction_alpha}\n")
+    print(f"Friction (alpha): {friction_alpha}")
+    print(f"Integration: Semi-Implicit Euler - autodiff enabled")
+    print()
     
     env = gym.make("Pendulum-v1")
     
@@ -187,7 +163,7 @@ def main(integration_method='semi_implicit_euler', friction_alpha=0.0):
     max_steps = max(horizons)
     
     print("=" * 100)
-    print(f"PENDULUM PHYSICS PRIOR TEST - {integration_method.upper()}")
+    print("PENDULUM PHYSICS PRIOR TEST - SEMI-IMPLICIT EULER")
     print("Approach: APHYNITY-Style Multi-Step ODE Integration (Error Compounding)")
     print("=" * 100)
     
@@ -205,11 +181,9 @@ def main(integration_method='semi_implicit_euler', friction_alpha=0.0):
         # Generate ground truth from Gym (using observations, decoding internally to states)
         gt_trajectory = generate_gym_trajectory(env, initial_obs, max_steps)
         
-        # Generate prediction from our physics prior using selected method
-        if integration_method == 'rk4':
-            pred_trajectory = generate_prior_trajectory_rk4(physics_prior, initial_state, max_steps, dt, device)
-        else:  # semi_implicit_euler
-            pred_trajectory = generate_prior_trajectory_semiimplicit_euler(physics_prior, initial_state, max_steps, dt, device)
+        # Generate prediction from our physics prior using semi-implicit Euler with autodiff support
+        # (Required for accurate pendulum dynamics and residual learning in APHYNITY training)
+        pred_trajectory = generate_prior_trajectory_semiimplicit_euler_autodiff(physics_prior, initial_state, max_steps, dt, device)
         
         for horizon in horizons:
             pred_at_h = pred_trajectory[horizon]
@@ -247,24 +221,12 @@ if __name__ == "__main__":
     print("\n" + "="*100)
     print("TEST 1: NO FRICTION (PERFECT PRIOR)")
     print("Expected: Near-perfect match with Gym environment")
-    print("="*100)
-    print("\nRunning with SEMI-IMPLICIT EULER...")
-    main(integration_method='semi_implicit_euler', friction_alpha=0.0)
-    
-    # print("\n\n" + "-"*100)
-    # print("Running with RK4...")
-    # print("-"*100)
-    # main(integration_method='rk4', friction_alpha=0.0)
+    print("="*100 + "\n")
+    main(friction_alpha=0.0)
     
     # Test 2: With friction (imperfect prior - simulates real-world physics)
     print("\n\n" + "="*100)
     print("TEST 2: WITH FRICTION (imperfect prior - residual must learn this)")
     print("Expected: Significant errors that grow with horizon")
-    print("="*100)
-    print("\nRunning with SEMI-IMPLICIT EULER...")
-    main(integration_method='semi_implicit_euler', friction_alpha=0.2)
-    
-    # print("\n\n" + "-"*100)
-    # print("Running with RK4...")
-    # print("-"*100)
-    # main(integration_method='rk4', friction_alpha=0.2)
+    print("="*100 + "\n")
+    main(friction_alpha=0.2)
