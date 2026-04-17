@@ -26,6 +26,7 @@ from tqdm import tqdm
 from pathlib import Path
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
+import yaml
 
 sys.path.insert(0, '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl')
 
@@ -43,6 +44,7 @@ def generate_trajectories(
     num_trajectories=100,
     max_horizon=40,
     friction_alpha=0.2,
+    dt=0.05,
     device='cpu'
 ):
     """
@@ -52,6 +54,7 @@ def generate_trajectories(
         num_trajectories: Number of trajectories to generate
         max_horizon: Maximum steps per trajectory
         friction_alpha: Friction coefficient (0.2 for significant damping)
+        dt: Integration step size
         device: torch device
     
     Returns:
@@ -61,7 +64,6 @@ def generate_trajectories(
     physics_prior = PendulumPhysics(omega0_square=15.0, alpha=friction_alpha).to(device)
     
     trajectories = []
-    dt = 0.05
     
     print(f"\nGenerating {num_trajectories} trajectories with friction (alpha={friction_alpha})...")
     
@@ -275,6 +277,7 @@ def train_epoch(
     tau_2,
     writer,
     global_step,
+    config,
     horizon=30
 ):
     """
@@ -306,7 +309,8 @@ def train_epoch(
             device=device,
             ode_method='semi_implicit_euler',  # Symplectic integrator for pendulum
             ode_rtol=1e-4,
-            ode_atol=1e-5
+            ode_atol=1e-5,
+            dt=config['integration']['dt']
         )
         
         # Accumulate epoch metrics
@@ -345,7 +349,8 @@ def validate(
     device,
     writer,
     epoch,
-    horizon=30
+    horizon=30,
+    dt=0.05
 ):
     """Validate on held-out trajectories."""
     hybrid_model.eval()
@@ -377,7 +382,7 @@ def validate(
             residual_norms.append(residual_norm)
             
             # Step forward with semi-implicit Euler
-            next_state = hybrid_model.integrate(current_state, action, dt=0.05)
+            next_state = hybrid_model.integrate(current_state, action, dt=dt)
             predicted_states.append(next_state)
             current_state = next_state
         
@@ -415,17 +420,27 @@ def validate(
 def main():
     """Main training script."""
     
-    # Configuration
+    # Load configuration from YAML
+    config_path = Path(__file__).parent / 'pendulum_params.yaml'
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Extract hyperparameters
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     
-    # Hyperparameters
-    num_trajectories = 800  # Increased significantly for better generalization and data diversity
-    horizon = 15  # Shorter horizon reduces multi-step error compounding
-    batch_size = 32
-    num_epochs = 75
-    learning_rate = 1e-3
-    friction_alpha = 0.2  # Friction that residual must learn
+    # Extract from config
+    num_trajectories = config['environment']['num_trajectories']
+    friction_alpha = config['environment']['friction_coefficient']
+    horizon = config['training']['horizon']
+    batch_size = config['training']['batch_size']
+    num_epochs = config['training']['num_epochs']
+    learning_rate = config['training']['learning_rate']
+    
+    # APHYNITY hyperparameters
+    tau_1 = config['aphynity']['tau_1']
+    tau_2 = config['aphynity']['tau_2']
+    lambda_init = config['aphynity']['lambda_init']
     
     print("\n" + "="*80)
     print("PENDULUM RESIDUAL LEARNING - APHYNITY STYLE")
@@ -436,6 +451,7 @@ def main():
         num_trajectories=num_trajectories,
         max_horizon=horizon + 20,  # Generate longer trajectories than needed for better sequence extraction
         friction_alpha=friction_alpha,
+        dt=config['integration']['dt'],
         device=device
     )
     
@@ -470,17 +486,15 @@ def main():
     hybrid_model = HybridDynamicsModel(
         physics_prior=physics_prior,
         residual_network=residual_network,
-        with_prior=True,
+        with_prior=False,
         with_residual=True,
         integration_method='semi_implicit_euler'  # Use symplectic integrator for pendulum
     ).to(device)
     print(f"\nHybrid Model: ds/dt = F_prior + F_residual")
-    print(f"  Integration: Semi-implicit Euler (dt=0.05s)")
+    print(f"  Integration: Semi-implicit Euler (dt={config['integration']['dt']}s)")
     
-    # APHYNITY hyperparameters (from official repo for pendulum)
-    tau_1 = 1e-3  # Learning rate for optimizer (NOT gradient scaling!)
-    tau_2 = 1.0  # Large lambda step size (official APHYNITY uses 1.0 for pendulum)
-    lambda_init = 1.0  # Initial Lagrange multiplier
+    # APHYNITY hyperparameters loaded from config
+    # (tau_1, tau_2, lambda_init already loaded above)
     
     # Optimizer (only for residual network; physics prior is frozen)
     # Use tau_1 as learning rate (official APHYNITY approach)
@@ -489,7 +503,7 @@ def main():
     
     # TensorBoard logger
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = Path(__file__).parent / "logs" / "tensorboard" / f"pendulum_residual_{timestamp}"
+    log_dir = Path(__file__).parent / "logs" / "tensorboard" / f"pendulum_residual_no_prior_{timestamp}"
     log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(str(log_dir))
     print(f"\nTensorBoard logs: {log_dir}")
@@ -507,8 +521,8 @@ def main():
 - Epochs: {num_epochs}
 - Batch size: {batch_size}
 - Learning rate: {learning_rate}
-- Horizon: {horizon} steps (~{horizon*0.05:.2f}s)
-- Integration: Semi-implicit Euler (dt=0.05s)
+- Horizon: {horizon} steps (~{horizon*config['integration']['dt']:.2f}s)
+- Integration: Semi-implicit Euler (dt={config['integration']['dt']}s)
 
 ## Architecture
 - State dim: 2 (theta, omega)
@@ -517,7 +531,7 @@ def main():
 - Total params: {num_params:,}
 
 ## APHYNITY Parameters
-- tau_1 (gradient scaling): {tau_1}
+- tau_1 (learning rate): {tau_1}
 - tau_2 (lambda step size): {tau_2}
 - lambda_init: {lambda_init}
 
@@ -557,7 +571,7 @@ def main():
             hybrid_model, residual_network,
             train_loader, optimizer,
             device, lambda_current, tau_1, tau_2,
-            writer, global_step,
+            writer, global_step, config,
             horizon=horizon
         )
         
@@ -577,7 +591,8 @@ def main():
         val_metrics = validate(
             hybrid_model, val_loader,
             device, writer, epoch,
-            horizon=horizon
+            horizon=horizon,
+            dt=config['integration']['dt']
         )
         
         # Record validation history

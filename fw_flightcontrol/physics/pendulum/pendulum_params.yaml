@@ -1,0 +1,125 @@
+# Training parameters for pendulum residual learning with APHYNITY
+# This config controls all aspects of pendulum friction learning
+
+# ============================================================================
+# ENVIRONMENT
+# ============================================================================
+environment:
+  # Gym Pendulum-v1 with additional friction damping
+  friction_coefficient: 0.2  # Damping alpha that residual learns
+  num_trajectories: 800      # Number of trajectories to generate
+  max_horizon_generation: 40 # Max steps for trajectory generation
+
+# ============================================================================
+# NETWORK ARCHITECTURE
+# ============================================================================
+network:
+  # State and action dimensions
+  state_dim: 2         # [theta, omega]
+  action_dim: 1        # [torque]
+  
+  # Residual network hidden layers
+  hidden_dims: [64, 64]
+  activation: relu
+  use_batch_norm: false
+  
+  # Weight initialization
+  init_mean: 0.0
+  init_std: 0.005
+
+# ============================================================================
+# TRAINING HYPERPARAMETERS
+# ============================================================================
+training:
+  # Trajectory prediction horizon (number of simulation steps)
+  # Each step is 0.05 seconds, so horizon=15 means 0.75 seconds prediction
+  horizon: 15
+  
+  # Batch parameters
+  batch_size: 32
+  num_epochs: 75
+  
+  # Learning rate
+  learning_rate: 0.001
+  optimizer: adam
+  
+  # Learning rate scheduler (optional)
+  scheduler:
+    enabled: true
+    type: 'steplr'
+    step_size: 20
+    gamma: 0.5
+    min_lr: 0.00001
+  
+  # Gradient clipping for stability
+  grad_clip_norm: 1.0
+  
+  # Validation frequency
+  val_freq: 1
+  checkpoint_freq: 10
+
+# ============================================================================
+# APHYNITY DUAL ASCENT PARAMETERS
+# ============================================================================
+aphynity:
+  # Learning rate coefficient (handled by Adam optimizer)
+  tau_1: 0.001            # Learning rate for Adam optimizer (official APHYNITY: 1e-3)
+                          # Passed to optimizer, NOT applied as gradient scaling
+  # Lagrange multiplier initialization and update
+  lambda_init: 1.0        # Initial λ (balanced: reg=1.0, trajectory_loss weighted by λ)
+  tau_2: 1.0              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
+                          # Use 1.0 for faster lambda adaptation (official APHYNITY pendulum)
+  
+  # Lagrange multiplier bounds
+  lambda_max: 1000.0      # Upper bound for safety (detects pathological loss explosion)
+  lambda_min: 0.1         # Prevent numerical issues at very low values
+
+# ============================================================================
+# ODE INTEGRATION SETTINGS
+# ============================================================================
+integration:
+  # Simulation step size
+  dt: 0.05
+  
+  # Integration method for hybrid dynamics
+  # Pendulum uses semi-implicit Euler (symplectic integrator for energy conservation)
+  method: semi_implicit_euler
+  
+  # For adaptive step solvers (if applicable)
+  rtol: 1.0e-4
+  atol: 1.0e-5
+
+# ============================================================================
+# DATA HANDLING
+# ============================================================================
+data:
+  # Train/val split for trajectories
+  train_fraction: 0.8
+  val_fraction: 0.2
+  
+  # Data normalization
+  normalize: false
+
+# ============================================================================
+# REGULARIZATION
+# ============================================================================
+regularization:
+  # Weight decay (L2)
+  weight_decay: 0.0
+  
+  # Early stopping (not used for pendulum, but available)
+  early_stopping_patience: 20
+  early_stopping_metric: val_loss
+
+# ============================================================================
+# LOGGING AND CHECKPOINTING
+# ============================================================================
+logging:
+  verbose: true
+  log_freq: 10
+  tensorboard: true
+  
+  # Output directories
+  checkpoint_dir: ./checkpoints
+  checkpoint_subdirectory: pendulum_tests
+  log_dir: ./logs
