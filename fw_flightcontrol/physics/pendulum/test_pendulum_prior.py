@@ -154,23 +154,27 @@ def state_to_observation(state_np):
     return np.array([np.cos(theta), np.sin(theta), omega], dtype=np.float32)
 
 
-def main(integration_method='semi_implicit_euler'):
+def main(integration_method='semi_implicit_euler', friction_alpha=0.0):
     """
     Main test function.
     
     Args:
         integration_method: 'semi_implicit_euler' or 'rk4'
+        friction_alpha: Friction coefficient. 0.0 = no friction (perfect prior), 
+                       higher values add damping to test residual learning
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Integration method: {integration_method}\n")
+    print(f"Integration method: {integration_method}")
+    print(f"Friction (alpha): {friction_alpha}\n")
     
     env = gym.make("Pendulum-v1")
     
-    # Match Gym's actual dynamics: θ'' = 15*sin(θ) with NO damping
+    # Match Gym's actual dynamics: θ'' = 15*sin(θ) + friction term
     # Gym uses: newthdot = thdot + (3*g/(2*l) * sin(th)) * dt
     # With g=10, l=1: coefficient = 3*10/(2*1) = 15
-    physics_prior = PendulumPhysics(omega0_square=15.0, alpha=0.0).to(device)
+    # Friction is applied as: -alpha * omega
+    physics_prior = PendulumPhysics(omega0_square=15.0, alpha=friction_alpha).to(device)
     
     initial_states = [
         torch.tensor([[0.5, 0.0]], device=device, dtype=torch.float32),
@@ -239,12 +243,28 @@ def main(integration_method='semi_implicit_euler'):
 
 
 if __name__ == "__main__":
+    # Test 1: No friction (perfect prior - should match Gym exactly)
     print("\n" + "="*100)
-    print("RUNNING WITH SEMI-IMPLICIT EULER")
+    print("TEST 1: NO FRICTION (PERFECT PRIOR)")
+    print("Expected: Near-perfect match with Gym environment")
     print("="*100)
-    main(integration_method='semi_implicit_euler')
+    print("\nRunning with SEMI-IMPLICIT EULER...")
+    main(integration_method='semi_implicit_euler', friction_alpha=0.0)
     
+    # print("\n\n" + "-"*100)
+    # print("Running with RK4...")
+    # print("-"*100)
+    # main(integration_method='rk4', friction_alpha=0.0)
+    
+    # Test 2: With friction (imperfect prior - simulates real-world physics)
     print("\n\n" + "="*100)
-    print("RUNNING WITH RK4")
+    print("TEST 2: WITH FRICTION (imperfect prior - residual must learn this)")
+    print("Expected: Significant errors that grow with horizon")
     print("="*100)
-    main(integration_method='rk4')
+    print("\nRunning with SEMI-IMPLICIT EULER...")
+    main(integration_method='semi_implicit_euler', friction_alpha=0.2)
+    
+    # print("\n\n" + "-"*100)
+    # print("Running with RK4...")
+    # print("-"*100)
+    # main(integration_method='rk4', friction_alpha=0.2)
