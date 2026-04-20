@@ -10,7 +10,7 @@ network:
   action_dim: 3         # [delta_a, delta_e, throttle]
   
   # Residual network hidden layers
-  hidden_dims: [200,200]
+  hidden_dims: [64,64]
   activation: relu      # Options: relu, tanh, elu
   use_batch_norm: false
   
@@ -44,7 +44,7 @@ training:
     min_lr: 0.0001        # Floor - don't go below this
   
   # Gradient clipping for stability
-  grad_clip_norm: 1.0
+  grad_clip_norm: 3.0
   
   # Validation frequency
   val_freq: 1           # Validate every epoch
@@ -60,7 +60,7 @@ aphynity:
                           # Passed to optimizer, NOT applied as gradient scaling
   # Lagrange multiplier initialization and update
   lambda_init: 1.0        # Initial λ (balanced: reg=1.0, trajectory_loss weighted by λ)
-  tau_2: 0.01              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
+  tau_2: 0.001              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
                           # Conservative value; can increase to 1.0 after verifying numerical stability
   
   # Lagrange multiplier bounds

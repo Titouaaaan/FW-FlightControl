@@ -67,7 +67,7 @@ aphynity:
                           # Passed to optimizer, NOT applied as gradient scaling
   # Lagrange multiplier initialization and update
   lambda_init: 1.0        # Initial λ (balanced: reg=1.0, trajectory_loss weighted by λ)
-  tau_2: 1.0              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
+  tau_2: 0.1              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
                           # Use 1.0 for faster lambda adaptation (official APHYNITY pendulum)
   
   # Lagrange multiplier bounds
