@@ -62,9 +62,12 @@ def extract_trajectory_sequence(df, start_row_idx, max_horizon):
     if start_row_idx + max_horizon >= len(df):
         return None
     
-    state_cols = [f's_t_{i}' for i in range(STATE_DIMS)]
+    # State indices: [0-5] = [roll, pitch, Va, p, q, r], [8-9] = [alpha, beta]
+    # Skip [6-7] which are control errors (roll_err, pitch_err), not aerodynamic angles
+    state_indices = [0, 1, 2, 3, 4, 5, 8, 9]
+    state_cols = [f's_t_{i}' for i in state_indices]
     action_cols = [f'a_t_{i}' for i in range(ACTION_DIMS)]
-    next_state_cols = [f's_t+1_{i}' for i in range(STATE_DIMS)]
+    next_state_cols = [f's_t+1_{i}' for i in state_indices]
     
     states = []
     actions = []
@@ -74,9 +77,19 @@ def extract_trajectory_sequence(df, start_row_idx, max_horizon):
         idx = start_row_idx + i
         row = df.iloc[idx]
         
-        state = torch.tensor([row[col] for col in state_cols], dtype=torch.float32)
+        # Extract state with correct indices and apply unit conversions
+        state_vals = [row[col] for col in state_cols]
+        # Convert airspeed from km/h to m/s (index 2 in the 8-state vector)
+        state_vals[2] = state_vals[2] / 3.6
+        state = torch.tensor(state_vals, dtype=torch.float32)
+        
+        # Extract actions (already normalized [-1, 1] from PID controller)
         action = torch.tensor([row[col] for col in action_cols], dtype=torch.float32)
-        next_state = torch.tensor([row[col] for col in next_state_cols], dtype=torch.float32)
+        
+        # Extract next state with same corrections
+        next_state_vals = [row[col] for col in next_state_cols]
+        next_state_vals[2] = next_state_vals[2] / 3.6
+        next_state = torch.tensor(next_state_vals, dtype=torch.float32)
         
         states.append(state)
         actions.append(action)
@@ -123,8 +136,9 @@ def generate_prior_prediction_odeint(physics_prior, initial_state, actions, time
         def ode_dynamics(t, state_t):
             return physics_prior(state_t, action_t)
         
+        # Use RK4 for faster integration while maintaining reasonable accuracy
         step_trajectory = odeint(ode_dynamics, current_state, t_span, 
-                                method='dopri8', rtol=1e-8, atol=1e-9)
+                                method='rk4')
         
         # step_trajectory is (2, batch_size, STATE_DIMS), take final state
         current_state = step_trajectory[-1]

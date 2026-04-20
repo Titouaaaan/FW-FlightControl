@@ -74,15 +74,20 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     normalize = config['data']['normalize']
     batch_size = config['training']['batch_size']
     
-    # Define column names (CSV has s_t_0 through s_t_13, but we use first 8)
-    state_cols = [f's_t_{i}' for i in range(state_dim)]
+    # Define column names: State indices [0-5] + [8-9] (skip [6-7] which are control errors)
+    # CSV has 14 states: [0-5]=kinematics, [6-7]=errors, [8-9]=aerodynamic angles, [10-13]=commands/integrals
+    state_indices = [0, 1, 2, 3, 4, 5, 8, 9]
+    state_cols = [f's_t_{i}' for i in state_indices]
     action_cols = [f'a_t_{i}' for i in range(action_dim)]
-    next_state_cols = [f's_t+1_{i}' for i in range(state_dim)]
+    next_state_cols = [f's_t+1_{i}' for i in state_indices]
     
     # Compute state normalization statistics (on full dataset)
     if normalize:
-        state_mean = df[state_cols].mean().values
-        state_std = df[state_cols].std().values + 1e-8
+        # Extract raw data with unit conversions
+        raw_states = df[state_cols].values.copy()
+        raw_states[:, 2] = raw_states[:, 2] / 3.6  # Convert airspeed km/h → m/s
+        state_mean = raw_states.mean(axis=0)
+        state_std = raw_states.std(axis=0) + 1e-8
         print(f"State normalization: mean={state_mean[:3]}..., std={state_std[:3]}...")
     else:
         state_mean = np.zeros(state_dim)
@@ -95,9 +100,13 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
         group = group.sort_values('step_id').reset_index(drop=True)
         
         # Extract numpy arrays for this trajectory
-        states = group[state_cols].values
+        states = group[state_cols].values.copy()
         actions = group[action_cols].values
-        next_states = group[next_state_cols].values
+        next_states = group[next_state_cols].values.copy()
+        
+        # Apply unit conversions: airspeed from km/h to m/s (index 2 in state vector)
+        states[:, 2] = states[:, 2] / 3.6
+        next_states[:, 2] = next_states[:, 2] / 3.6
         step_ids = group['step_id'].values
         
         num_steps = len(states)
