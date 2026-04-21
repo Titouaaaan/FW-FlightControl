@@ -10,7 +10,7 @@ network:
   action_dim: 3         # [delta_a, delta_e, throttle]
   
   # Residual network hidden layers
-  hidden_dims: [64,64]
+  hidden_dims: [128,128]
   activation: relu      # Options: relu, tanh, elu
   use_batch_norm: false
   
@@ -60,7 +60,7 @@ aphynity:
                           # Passed to optimizer, NOT applied as gradient scaling
   # Lagrange multiplier initialization and update
   lambda_init: 1.0        # Initial λ (balanced: reg=1.0, trajectory_loss weighted by λ)
-  tau_2: 0.001              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
+  tau_2: 0.1              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
                           # Conservative value; can increase to 1.0 after verifying numerical stability
   
   # Lagrange multiplier bounds
@@ -144,5 +144,5 @@ logging:
   
   # Output directories
   checkpoint_dir: ./checkpoints
-  checkpoint_subdirectory: exp_v0.1    # Subdirectory for this run (e.g., test1, test2, exp_v1)
+  checkpoint_subdirectory: exp_v0.2    # Subdirectory for this run (e.g., test1, test2, exp_v1)
   log_dir: ./logs
