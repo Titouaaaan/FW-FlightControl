@@ -163,8 +163,9 @@ def compute_error_at_horizon(pred_traj, gt_traj, horizon_idx):
     per_state_sq_error = (pred_state - gt_state) ** 2
     per_state_abs_error = torch.abs(pred_state - gt_state)
     
-    per_state_rmse = torch.sqrt(per_state_sq_error).cpu().numpy()
-    per_state_mae = per_state_abs_error.cpu().numpy()
+    # Return squared errors (not sqrt!) so RMSE can be computed properly via sqrt(mean(squared_errors))
+    per_state_rmse = per_state_sq_error.cpu().numpy()  # Squared error for each state
+    per_state_mae = per_state_abs_error.cpu().numpy()  # Absolute error for each state
     
     # Overall errors
     overall_mse = per_state_sq_error.mean().item()
@@ -316,12 +317,13 @@ def main():
             print(f"  Overall MAE:  Mean={np.mean(maes):.6f}")
             print(f"\n  Per-State Errors (RMSE):")
             
-            # Compute mean and max across all test indices for each state variable
+            # Compute mean and std across all test indices for each state variable
             if len(per_state_rmses.shape) == 2 and per_state_rmses.shape[1] == 8:
                 for state_idx, state_name in enumerate(state_names):
-                    state_rmses = per_state_rmses[:, state_idx]
-                    state_maes = per_state_maes[:, state_idx]
-                    print(f"    [{state_idx}] {state_name:20s}: RMSE={np.mean(state_rmses):.6f} (±{np.std(state_rmses):.6f}), MAE={np.mean(state_maes):.6f}")
+                    state_abs_errors = per_state_maes[:, state_idx]  # Absolute errors accumulated
+                    state_mae = np.mean(state_abs_errors)  # Proper MAE: mean(absolute_errors)
+                    state_mae_std = np.std(state_abs_errors)  # Std of absolute errors
+                    print(f"    [{state_idx}] {state_name:20s}: MAE={state_mae:.6f} (±{state_mae_std:.6f})")
             else:
                 print(f"  WARNING: Unexpected shape for per_state errors: {per_state_rmses.shape}")
         else:
