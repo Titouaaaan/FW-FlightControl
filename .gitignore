@@ -21,6 +21,8 @@ fw_flightcontrol/eval/waypoint_tracking/outputs/trajectories/*
 !fw_flightcontrol/eval/waypoint_tracking/outputs/metrics/*.py
 /fw_flightcontrol/physics/checkpoints
 
+fw_flightcontrol/physics/plots
+
 # Exceptions
 !fw_flightcontrol/eval/outputs/icinco/
 
