@@ -10,7 +10,7 @@ network:
   action_dim: 3         # [delta_a, delta_e, throttle]
   
   # Residual network hidden layers
-  hidden_dims: [128,128]
+  hidden_dims: [256,256]
   activation: relu      # Options: relu, tanh, elu
   use_batch_norm: false
   
@@ -144,5 +144,5 @@ logging:
   
   # Output directories
   checkpoint_dir: ./checkpoints
-  checkpoint_subdirectory: exp_v0.2    # Subdirectory for this run (e.g., test1, test2, exp_v1)
+  checkpoint_subdirectory: exp_v0.3    # Subdirectory for this run (e.g., test1, test2, exp_v1)
   log_dir: ./logs
