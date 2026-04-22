@@ -31,8 +31,8 @@ plt.rcParams['legend.fontsize'] = 10
 # ============================================================================
 # Get the script directory and navigate to data folder
 SCRIPT_DIR = Path(__file__).parent
-CSV_FILE = SCRIPT_DIR.parent / 'data' / 'updated_trajectory_data_noatmo.csv'
-OUTPUT_DIR = SCRIPT_DIR.parent / 'data' / 'analysis_outputs'
+CSV_FILE = SCRIPT_DIR.parent.parent / 'data' / 'updated_trajectory_data_progressive_noatmo.csv'
+OUTPUT_DIR = SCRIPT_DIR.parent.parent / 'data' / 'new_analysis_outputs'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # State dimension names and units
@@ -316,7 +316,7 @@ def analyze_state_transitions(df, trajectories):
 # VISUALIZATION: STATE EVOLUTION OVER TIME
 # ============================================================================
 def plot_state_evolution(trajectories):
-    """Plot state evolution grouped by target angles."""
+    """Plot state evolution for all trajectories."""
     print("\n" + "="*80)
     print("GENERATING VISUALIZATION: State Evolution Over Time")
     print("="*80)
@@ -326,44 +326,27 @@ def plot_state_evolution(trajectories):
     fig, axes = plt.subplots(4, 2, figsize=(16, 12))
     axes = axes.flatten()
     
-    # Group by target angles
-    roll_targets = sorted(set(traj['target_roll'].iloc[0] for traj in trajectories.values()))
-    pitch_targets = sorted(set(traj['target_pitch'].iloc[0] for traj in trajectories.values()))
-    
-    # Color map for roll targets, line styles for pitch targets
-    roll_colors = plt.cm.tab10(np.linspace(0, 1, min(len(roll_targets), 10)))
-    pitch_styles = ['-', '--', '-.', ':'] * 5
+    # Color map for trajectories
+    colors = plt.cm.tab10(np.linspace(0, 1, len(trajectories)))
     
     for state_idx, (ax, state_col) in enumerate(zip(axes, state_cols)):
-        for traj_id, traj in trajectories.items():
+        for (traj_id, traj), color in zip(trajectories.items(), colors):
             states = traj[state_col].values
-            target_roll = traj['target_roll'].iloc[0]
-            target_pitch = traj['target_pitch'].iloc[0]
-            
-            roll_idx = roll_targets.index(target_roll)
-            pitch_idx = pitch_targets.index(target_pitch)
-            
-            color = roll_colors[roll_idx % len(roll_colors)]
-            linestyle = pitch_styles[pitch_idx]
-            
-            ax.plot(states, alpha=0.6, linewidth=1.2, color=color, linestyle=linestyle)
+            ax.plot(states, alpha=0.7, linewidth=1.2, color=color, label=f'Trajectory {traj_id}')
         
         ax.set_xlabel('Time Step')
         ax.set_ylabel(STATE_NAMES[state_idx])
         ax.set_title(f'State {state_idx}: {STATE_NAMES[state_idx]}')
         ax.grid(True, alpha=0.3)
     
-    # Create compact legend at bottom
-    legend_elements = [plt.Line2D([0], [0], color=roll_colors[i % len(roll_colors)], linewidth=2,
-                                 label=f'Roll: {roll_targets[i]:.0f}°')
-                      for i in range(len(roll_targets))]
-    legend_elements += [plt.Line2D([0], [0], color='gray', linewidth=2, linestyle=pitch_styles[i],
-                                  label=f'Pitch: {pitch_targets[i]:.0f}°')
-                       for i in range(len(pitch_targets))]
+    # Create legend at bottom center outside plot
+    legend_elements = [plt.Line2D([0], [0], color=colors[i], linewidth=2,
+                                 label=f'Trajectory {i+1}')
+                      for i in range(len(trajectories))]
+    fig.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.01),
+              ncol=len(trajectories), fontsize=10)
     
-    fig.legend(handles=legend_elements, loc='lower center', bbox_to_anchor=(0.5, -0.02), 
-              ncol=min(8, len(legend_elements)), fontsize=9)
-    
+    fig.suptitle('State Evolution Over Time', fontsize=14, fontweight='bold', y=0.995)
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / 'state_evolution_over_time.png', dpi=300, bbox_inches='tight')
     print(f"✓ Saved: state_evolution_over_time.png")
@@ -374,13 +357,13 @@ def plot_state_evolution(trajectories):
 # VISUALIZATION: ACTION DISTRIBUTIONS
 # ============================================================================
 def plot_action_distributions(df, trajectories):
-    """Plot action distributions across all trajectories and per roll target."""
+    """Plot action distributions across all trajectories and per trajectory."""
     print("\nGENERATING VISUALIZATION: Action Distributions")
     
     action_cols = [f'a_t_{i}' for i in range(3)]
-    roll_targets = sorted(set(traj['target_roll'].iloc[0] for traj in trajectories.values()))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(trajectories)))
     
-    # Overall distribution + per-roll distribution
+    # Overall distribution + per-trajectory distribution
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     
     for ax_idx, (action_col, action_name) in enumerate(zip(action_cols, ACTION_NAMES)):
@@ -392,23 +375,25 @@ def plot_action_distributions(df, trajectories):
         ax.set_title(f'{action_name} - Overall Distribution')
         ax.grid(True, alpha=0.3, axis='y')
         
-        # Row 2: By roll target
+        # Row 2: By trajectory
         ax = axes[1, ax_idx]
-        colors = plt.cm.tab10(np.linspace(0, 1, len(roll_targets)))
-        for roll_idx, roll_target in enumerate(roll_targets):
-            traj_list = [traj for traj in trajectories.values() 
-                        if traj['target_roll'].iloc[0] == roll_target]
-            if traj_list:
-                combined_data = np.concatenate([traj[action_col].values for traj in traj_list])
-                ax.hist(combined_data, bins=30, alpha=0.5, label=f'Roll: {roll_target:.0f}°',
-                       edgecolor='black', linewidth=0.5, color=colors[roll_idx])
+        for (traj_id, traj), color in zip(trajectories.items(), colors):
+            ax.hist(traj[action_col].values, bins=30, alpha=0.5, label=f'Traj {traj_id}',
+                   edgecolor='black', linewidth=0.5, color=color)
         
         ax.set_xlabel(f'{action_name} Value')
         ax.set_ylabel('Frequency')
-        ax.set_title(f'{action_name} - Grouped by Roll Target')
-        ax.legend(fontsize=8, ncol=2)
+        ax.set_title(f'{action_name} - Per Trajectory')
         ax.grid(True, alpha=0.3, axis='y')
     
+    # Create legend at bottom center outside plot
+    legend_elements = [plt.Line2D([0], [0], color=colors[i], linewidth=2,
+                                 label=f'Trajectory {i+1}')
+                      for i in range(len(trajectories))]
+    fig.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.05),
+              ncol=len(trajectories), fontsize=10)
+    
+    fig.suptitle('Distribution of Control Actions', fontsize=14, fontweight='bold', y=0.995)
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / 'action_distributions.png', dpi=300, bbox_inches='tight')
     print(f"✓ Saved: action_distributions.png")
@@ -419,47 +404,30 @@ def plot_action_distributions(df, trajectories):
 # VISUALIZATION: REWARD OVER TIME
 # ============================================================================
 def plot_reward_evolution(trajectories):
-    """Plot reward evolution grouped by target angles."""
+    """Plot reward evolution for all trajectories."""
     print("\nGENERATING VISUALIZATION: Reward Evolution")
     
-    roll_targets = sorted(set(traj['target_roll'].iloc[0] for traj in trajectories.values()))
-    pitch_targets = sorted(set(traj['target_pitch'].iloc[0] for traj in trajectories.values()))
-    
     fig, ax = plt.subplots(figsize=(12, 6))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(trajectories)))
     
-    # Color by roll, linestyle by pitch
-    roll_colors = plt.cm.tab10(np.linspace(0, 1, len(roll_targets)))
-    pitch_styles = ['-', '--', '-.', ':'] * 5
-    
-    for traj_id, traj in trajectories.items():
-        target_roll = traj['target_roll'].iloc[0]
-        target_pitch = traj['target_pitch'].iloc[0]
-        
-        roll_idx = roll_targets.index(target_roll)
-        pitch_idx = pitch_targets.index(target_pitch)
-        
-        color = roll_colors[roll_idx]
-        linestyle = pitch_styles[pitch_idx]
-        
+    for (traj_id, traj), color in zip(trajectories.items(), colors):
         # Compute cumulative reward
         cumulative_reward = np.cumsum(traj['reward'].values)
-        
-        ax.plot(cumulative_reward, linewidth=1.5, alpha=0.7, color=color, linestyle=linestyle)
+        ax.plot(cumulative_reward, linewidth=1.5, alpha=0.7, color=color, label=f'Trajectory {traj_id}')
     
     ax.set_xlabel('Time Step')
     ax.set_ylabel('Cumulative Reward')
-    ax.set_title('Cumulative Reward Evolution (colored by roll target, styled by pitch target)')
+    ax.set_title('Cumulative Reward Evolution')
     ax.grid(True, alpha=0.3)
     
-    # Legend
-    legend_elements = [plt.Line2D([0], [0], color=roll_colors[i], linewidth=2,
-                                 label=f'Roll: {roll_targets[i]:.0f}°')
-                      for i in range(len(roll_targets))]
-    legend_elements += [plt.Line2D([0], [0], color='gray', linewidth=2, linestyle=pitch_styles[i],
-                                  label=f'Pitch: {pitch_targets[i]:.0f}°')
-                       for i in range(len(pitch_targets))]
-    ax.legend(handles=legend_elements, loc='best', fontsize=9, ncol=2)
+    # Create legend at bottom center outside plot
+    legend_elements = [plt.Line2D([0], [0], color=colors[i], linewidth=2,
+                                 label=f'Trajectory {i+1}')
+                      for i in range(len(trajectories))]
+    fig.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.1),
+              ncol=len(trajectories), fontsize=10)
     
+    fig.suptitle('Cumulative Reward Evolution Over Trajectory', fontsize=14, fontweight='bold', y=0.995)
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / 'reward_evolution.png', dpi=300, bbox_inches='tight')
     print(f"✓ Saved: reward_evolution.png")
@@ -470,44 +438,35 @@ def plot_reward_evolution(trajectories):
 # VISUALIZATION: TRACKING ERROR OVER TIME
 # ============================================================================
 def plot_tracking_errors(trajectories):
-    """Plot roll and pitch tracking errors grouped by target angles."""
+    """Plot roll and pitch tracking errors over time."""
     print("\nGENERATING VISUALIZATION: Tracking Errors Over Time")
-    
-    roll_targets = sorted(set(traj['target_roll'].iloc[0] for traj in trajectories.values()))
-    pitch_targets = sorted(set(traj['target_pitch'].iloc[0] for traj in trajectories.values()))
     
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     
-    roll_colors = plt.cm.tab10(np.linspace(0, 1, len(roll_targets)))
-    pitch_styles = ['-', '--', '-.', ':'] * 5
+    colors = plt.cm.tab10(np.linspace(0, 1, len(trajectories)))
     
-    for traj_id, traj in trajectories.items():
-        target_roll = np.deg2rad(traj['target_roll'].iloc[0])
-        target_pitch = np.deg2rad(traj['target_pitch'].iloc[0])
-        
+    for idx, (traj_id, traj) in enumerate(trajectories.items()):
+        # For progressive targets, compute error at each step using current target
         roll_angles = traj['s_t_0'].values
         pitch_angles = traj['s_t_1'].values
+        target_roll_deg = traj['target_roll'].values
+        target_pitch_deg = traj['target_pitch'].values
         
-        roll_error = np.abs(roll_angles - target_roll)
-        pitch_error = np.abs(pitch_angles - target_pitch)
+        # Convert to radians for computation
+        roll_angles_deg = np.rad2deg(roll_angles)
+        pitch_angles_deg = np.rad2deg(pitch_angles)
         
-        roll_error_deg = np.rad2deg(roll_error)
-        pitch_error_deg = np.rad2deg(pitch_error)
+        roll_error_deg = np.abs(roll_angles_deg - target_roll_deg)
+        pitch_error_deg = np.abs(pitch_angles_deg - target_pitch_deg)
         
-        # Use rounding to handle floating point precision issues
-        target_roll_deg = round(traj['target_roll'].iloc[0])
-        target_pitch_deg = round(traj['target_pitch'].iloc[0])
-        roll_idx = roll_targets.index(target_roll_deg)
-        pitch_idx = pitch_targets.index(target_pitch_deg)
-        
-        color = roll_colors[roll_idx]
-        linestyle = pitch_styles[pitch_idx]
+        color = colors[idx]
+        label = f'Trajectory {traj_id}'
         
         # Roll error
-        axes[0].plot(roll_error_deg, linewidth=1.2, alpha=0.6, color=color, linestyle=linestyle)
+        axes[0].plot(roll_error_deg, linewidth=1.2, alpha=0.7, color=color, label=label)
         
         # Pitch error
-        axes[1].plot(pitch_error_deg, linewidth=1.2, alpha=0.6, color=color, linestyle=linestyle)
+        axes[1].plot(pitch_error_deg, linewidth=1.2, alpha=0.7, color=color, label=label)
     
     axes[0].set_xlabel('Time Step')
     axes[0].set_ylabel('Absolute Error (degrees)')
@@ -519,16 +478,14 @@ def plot_tracking_errors(trajectories):
     axes[1].set_title('Pitch Angle Tracking Error')
     axes[1].grid(True, alpha=0.3)
     
-    # Legend
-    legend_elements = [plt.Line2D([0], [0], color=roll_colors[i], linewidth=2,
-                                 label=f'Roll: {roll_targets[i]:.0f}°')
-                      for i in range(len(roll_targets))]
-    legend_elements += [plt.Line2D([0], [0], color='gray', linewidth=2, linestyle=pitch_styles[i],
-                                  label=f'Pitch: {pitch_targets[i]:.0f}°')
-                       for i in range(len(pitch_targets))]
-    fig.legend(handles=legend_elements, loc='lower center', bbox_to_anchor=(0.5, -0.02),
-              ncol=min(8, len(legend_elements)), fontsize=9)
+    # Create legend at bottom center outside plot
+    legend_elements = [plt.Line2D([0], [0], color=colors[i], linewidth=2,
+                                 label=f'Trajectory {i+1}')
+                      for i in range(len(trajectories))]
+    fig.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.1),
+              ncol=len(trajectories), fontsize=10)
     
+    fig.suptitle('Attitude Control Tracking Errors', fontsize=14, fontweight='bold', y=0.995)
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / 'tracking_errors_over_time.png', dpi=300, bbox_inches='tight')
     print(f"✓ Saved: tracking_errors_over_time.png")
@@ -616,53 +573,36 @@ def plot_transition_magnitudes(df):
 # VISUALIZATION: ROLLOUT STABILITY (CVaR analysis)
 # ============================================================================
 def plot_rollout_stability(trajectories):
-    """Analyze and plot trajectory stability grouped by target angles."""
+    """Analyze and plot trajectory stability for all trajectories."""
     print("\nGENERATING VISUALIZATION: Rollout Stability Analysis")
     
     state_cols = [f's_t_{i}' for i in range(8)]
-    roll_targets = sorted(set(traj['target_roll'].iloc[0] for traj in trajectories.values()))
-    pitch_targets = sorted(set(traj['target_pitch'].iloc[0] for traj in trajectories.values()))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(trajectories)))
     
     fig, axes = plt.subplots(2, 4, figsize=(16, 8))
     axes = axes.flatten()
     
-    roll_colors = plt.cm.tab10(np.linspace(0, 1, len(roll_targets)))
-    pitch_styles = ['-', '--', '-.', ':'] * 5
-    
     for state_idx, (ax, state_col) in enumerate(zip(axes, state_cols)):
-        for traj_id, traj in trajectories.items():
+        for (traj_id, traj), color in zip(trajectories.items(), colors):
             states = traj[state_col].values
-            
             # Compute rolling standard deviation over windows of 20 steps
             window = 20
             rolling_std = pd.Series(states).rolling(window=window).std().values
-            
-            target_roll = traj['target_roll'].iloc[0]
-            target_pitch = traj['target_pitch'].iloc[0]
-            
-            roll_idx = roll_targets.index(target_roll)
-            pitch_idx = pitch_targets.index(target_pitch)
-            
-            color = roll_colors[roll_idx]
-            linestyle = pitch_styles[pitch_idx]
-            
-            ax.plot(rolling_std, linewidth=1.2, alpha=0.6, color=color, linestyle=linestyle)
+            ax.plot(rolling_std, linewidth=1.2, alpha=0.7, color=color, label=f'Trajectory {traj_id}')
         
         ax.set_xlabel('Time Step')
         ax.set_ylabel('Rolling Std Dev (window=20)')
         ax.set_title(f'{STATE_NAMES[state_idx]} - Stability')
         ax.grid(True, alpha=0.3)
     
-    # Legend
-    legend_elements = [plt.Line2D([0], [0], color=roll_colors[i], linewidth=2,
-                                 label=f'Roll: {roll_targets[i]:.0f}°')
-                      for i in range(len(roll_targets))]
-    legend_elements += [plt.Line2D([0], [0], color='gray', linewidth=2, linestyle=pitch_styles[i],
-                                  label=f'Pitch: {pitch_targets[i]:.0f}°')
-                       for i in range(len(pitch_targets))]
-    fig.legend(handles=legend_elements, loc='lower center', bbox_to_anchor=(0.5, -0.02),
-              ncol=min(8, len(legend_elements)), fontsize=9)
+    # Create legend at bottom center outside plot
+    legend_elements = [plt.Line2D([0], [0], color=colors[i], linewidth=2,
+                                 label=f'Trajectory {i+1}')
+                      for i in range(len(trajectories))]
+    fig.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.03),
+              ncol=len(trajectories), fontsize=10)
     
+    fig.suptitle('Flight State Stability Analysis', fontsize=14, fontweight='bold', y=0.995)
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / 'rollout_stability.png', dpi=300, bbox_inches='tight')
     print(f"✓ Saved: rollout_stability.png")
