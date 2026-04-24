@@ -101,22 +101,6 @@ data:
   normalize: false
   normalize_method: standard  # Options: standard (z-score), minmax
   
-  # Hierarchical sampling strategy based on trajectory step
-  # Rationale: Most dynamics happen early (0-200), medium change (200-400),
-  # low change (400-600), ignore beyond 600 (settled/stale data)
-  sampling_strategy:
-    enabled: true
-    # Step ranges for sampling tiers
-    early_steps_threshold: 200      # Range: [0, 200]
-    medium_steps_threshold: 400     # Range: [200, 400]
-    late_steps_threshold: 600       # Range: [400, 600]
-    max_step_threshold: 600         # Ignore windows starting at step >= this
-    
-    # Sampling probabilities for each tier
-    early_probability: 0.8          # High priority: most dynamics
-    medium_probability: 0.5         # Medium priority: moderate dynamics
-    late_probability: 0.2           # Low priority: settled dynamics
-  
   # Sequence sampling
   random_seed: 42
   shuffle: true
@@ -144,5 +128,5 @@ logging:
   
   # Output directories
   checkpoint_dir: ./checkpoints
-  checkpoint_subdirectory: exp_v0.3    # Subdirectory for this run (e.g., test1, test2, exp_v1)
+  checkpoint_subdirectory: exp_v0.4    # Subdirectory for this run (e.g., test1, test2, exp_v1)
   log_dir: ./logs

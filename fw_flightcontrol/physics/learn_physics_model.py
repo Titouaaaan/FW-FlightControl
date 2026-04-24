@@ -94,7 +94,8 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
         state_std = np.ones(state_dim)
     
     # Extract sequences from each trajectory
-    trajectory_sequences = []
+    trajectory_sequences_by_traj = {}  # Track sequences per trajectory for proper splitting
+    trajectory_sequences = []  # Flat list for backward compatibility
     
     for traj_id, group in df.groupby('trajectory_id'):
         group = group.sort_values('step_id').reset_index(drop=True)
@@ -107,78 +108,56 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
         # Apply unit conversions: airspeed from km/h to m/s (index 2 in state vector)
         states[:, 2] = states[:, 2] / 3.6
         next_states[:, 2] = next_states[:, 2] / 3.6
-        step_ids = group['step_id'].values
         
         num_steps = len(states)
+        traj_sequences = []  # Sequences from this trajectory
         
-        # Get sampling strategy from config
-        sampling_cfg = config['data'].get('sampling_strategy', {})
-        use_hierarchical_sampling = sampling_cfg.get('enabled', True)
-        
-        if use_hierarchical_sampling:
-            # Extract thresholds and probabilities
-            early_threshold = sampling_cfg.get('early_steps_threshold', 200)
-            medium_threshold = sampling_cfg.get('medium_steps_threshold', 400)
-            late_threshold = sampling_cfg.get('late_steps_threshold', 600)
-            max_threshold = sampling_cfg.get('max_step_threshold', 600)
-            
-            early_prob = sampling_cfg.get('early_probability', 0.8)
-            medium_prob = sampling_cfg.get('medium_probability', 0.5)
-            late_prob = sampling_cfg.get('late_probability', 0.2)
-            
-            print(f"[Data Loading] Using hierarchical sampling:")
-            print(f"  Early [0-{early_threshold}]: {early_prob*100:.0f}% | "
-                  f"Medium [{early_threshold}-{medium_threshold}]: {medium_prob*100:.0f}% | "
-                  f"Late [{medium_threshold}-{late_threshold}]: {late_prob*100:.0f}% | "
-                  f"Ignore [≥{max_threshold}]")
-        
-        # Extract sliding windows of length H
+        # Extract ALL sliding windows of length H (no step-based filtering)
+        # With progressive targets, all steps are dynamically interesting
         for start_idx in range(num_steps - horizon):
-            start_step = step_ids[start_idx]
+            seq_states = states[start_idx:start_idx + horizon]
+            seq_actions = actions[start_idx:start_idx + horizon]
+            seq_next_states = next_states[start_idx:start_idx + horizon]
             
-            # Hierarchical sampling strategy by trajectory phase
-            if use_hierarchical_sampling:
-                # Skip trajectories at or beyond max threshold (stale data)
-                if start_step >= max_threshold:
-                    continue
-                
-                # Assign probability based on which tier the window starts in
-                if start_step < early_threshold:
-                    include_prob = early_prob  # Highest priority: most dynamics
-                elif start_step < medium_threshold:
-                    include_prob = medium_prob  # Medium priority: moderate dynamics
-                else:  # start_step < late_threshold (guaranteed by max_threshold check)
-                    include_prob = late_prob  # Low priority: settled dynamics
-            else:
-                # Fallback to uniform sampling if disabled
-                include_prob = 1.0
+            # Normalize if configured
+            if normalize:
+                seq_states = (seq_states - state_mean) / state_std
+                seq_next_states = (seq_next_states - state_mean) / state_std
             
-            if np.random.rand() < include_prob:
-                seq_states = states[start_idx:start_idx + horizon]
-                seq_actions = actions[start_idx:start_idx + horizon]
-                seq_next_states = next_states[start_idx:start_idx + horizon]
-                
-                # Normalize if configured
-                if normalize:
-                    seq_states = (seq_states - state_mean) / state_std
-                    seq_next_states = (seq_next_states - state_mean) / state_std
-                
-                trajectory_sequences.append({
-                    'initial_state': seq_states[0].copy(),
-                    'actions': seq_actions.copy(),
-                    'states': seq_next_states.copy(),
-                })
-        print(f"Extracted {len(trajectory_sequences)} trajectory sequences of length {horizon}")
+            seq_dict = {
+                'initial_state': seq_states[0].copy(),
+                'actions': seq_actions.copy(),
+                'states': seq_next_states.copy(),
+            }
+            trajectory_sequences.append(seq_dict)
+            traj_sequences.append(seq_dict)
+        
+        trajectory_sequences_by_traj[traj_id] = traj_sequences
+        print(f"Trajectory {traj_id}: Extracted {len(traj_sequences)} sliding windows of length {horizon}")
     
-    # Simple split: 70% train, 15% val, 15% test
-    n_train = int(len(trajectory_sequences) * config['data']['train_fraction'])
-    n_val = int(len(trajectory_sequences) * config['data']['val_fraction'])
+    # Train/val/test split: 70% train, 15% val, 15% test
+    # Perform split at trajectory level to keep sequences from same trajectory together
+    trajectories = sorted(list(df['trajectory_id'].unique()))
+    np.random.shuffle(trajectories)  # Shuffle trajectory order for random split
     
-    train_seqs = trajectory_sequences[:n_train]
-    val_seqs = trajectory_sequences[n_train:n_train + n_val]
-    test_seqs = trajectory_sequences[n_train + n_val:]
+    n_traj_train = int(len(trajectories) * config['data']['train_fraction'])
+    n_traj_val = int(len(trajectories) * config['data']['val_fraction'])
     
-    print(f"Split: {len(train_seqs)} train, {len(val_seqs)} val, {len(test_seqs)} test")
+    train_traj_ids = set(trajectories[:n_traj_train])
+    val_traj_ids = set(trajectories[n_traj_train:n_traj_train + n_traj_val])
+    test_traj_ids = set(trajectories[n_traj_train + n_traj_val:])
+    
+    # Split sequences by trajectory membership
+    train_seqs = [seq for traj_id, seq_list in trajectory_sequences_by_traj.items() 
+                  if traj_id in train_traj_ids for seq in seq_list]
+    val_seqs = [seq for traj_id, seq_list in trajectory_sequences_by_traj.items() 
+                if traj_id in val_traj_ids for seq in seq_list]
+    test_seqs = [seq for traj_id, seq_list in trajectory_sequences_by_traj.items() 
+                 if traj_id in test_traj_ids for seq in seq_list]
+    
+    print(f"\nTrain/Val/Test split (at trajectory level):")
+    print(f"  Trajectories: {len(train_traj_ids)} train, {len(val_traj_ids)} val, {len(test_traj_ids)} test")
+    print(f"  Sequences: {len(train_seqs)} train, {len(val_seqs)} val, {len(test_seqs)} test")
     
     # Create dataset class that batches sequences into tensors
     class TrajectoryDataset(torch.utils.data.Dataset):
