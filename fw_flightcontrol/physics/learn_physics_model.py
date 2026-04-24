@@ -394,7 +394,7 @@ def main(resume_checkpoint: Optional[str] = None):
         start_epoch = resume_state['start_epoch']
     
     # Load trajectory data from CSV
-    csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_noatmo.csv"
+    csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_progressive_noatmo.csv"
     train_loader, val_loader, test_loader = load_trajectory_data(str(csv_path), config)
     
     # Extract training hyperparameters

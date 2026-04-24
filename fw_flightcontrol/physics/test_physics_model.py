@@ -391,7 +391,7 @@ def main():
     print(f"  Device     : {device}")
 
     # Load data
-    csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_noatmo.csv"
+    csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_progressive_noatmo.csv"
     train_loader, val_loader, test_loader = load_trajectory_data(str(csv_path), config)
 
     loader_map = {'train': train_loader, 'val': val_loader, 'test': test_loader}

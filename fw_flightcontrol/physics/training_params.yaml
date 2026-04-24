@@ -128,5 +128,5 @@ logging:
   
   # Output directories
   checkpoint_dir: ./checkpoints
-  checkpoint_subdirectory: exp_v0.4    # Subdirectory for this run (e.g., test1, test2, exp_v1)
+  checkpoint_subdirectory: exp_v0.5    # Subdirectory for this run (e.g., test1, test2, exp_v1)
   log_dir: ./logs
