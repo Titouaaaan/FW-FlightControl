@@ -1,622 +1,411 @@
 #!/usr/bin/env python3
 """
-Test script for full physics-augmented model (APHYNITY).
+Evaluation script for hybrid physics-augmented world model.
 
-Tests the combined dynamics: ds/dt = F_p(s,u) + F_a(s,u)
-where F_p is the frozen physics prior and F_a is the learned residual network.
+Loads a trained residual network checkpoint from a .pt path and evaluates it
+over the full dataset (one epoch), reporting per-batch and aggregate statistics
+directly to the terminal. No TensorBoard logging.
 
-Strategy:
-- Load random trajectories of horizon length 10
-- For each trajectory, use 3 random starting points from early/medium/late intervals
-- Evaluate prediction accuracy at 1, 3, 5, and 10 steps
-- Report mean MAE and standard deviation for each horizon
-- Generate visualizations comparing predictions vs ground truth
-
+Usage:
+    python evaluate_model.py --checkpoint path/to/model.pt
+    python evaluate_model.py --checkpoint path/to/epoch_100.pt --split test
 """
 
 import torch
-import torch.nn as nn
-import pandas as pd
-import numpy as np
+import yaml
 import sys
+import argparse
 from pathlib import Path
-from torchdiffeq import odeint
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
+from typing import Dict, Tuple
+import numpy as np
+from tqdm import tqdm
 
+# Add project to path
 sys.path.insert(0, '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl')
+
 from fw_flightcontrol.physics.physics_prior import PhysicsPrior
 from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel
-
-# Configuration
-DEVICE = torch.device('cpu')
-DT = 0.01
-STATE_DIMS = 8
-ACTION_DIMS = 3
-MAX_HORIZON = 10
-HORIZONS = [1, 3, 5, 10]
-FIG_DPI = 300
-
-STATE_COL_NAMES = ['phi', 'theta', 'Va', 'p', 'q', 'r', 'alpha', 'beta']
-STATE_NAMES = ['φ (roll)', 'θ (pitch)', 'V_a (speed)', 'p (roll rate)', 
-               'q (pitch rate)', 'r (yaw rate)', 'α (AoA)', 'β (sideslip)']
+from fw_flightcontrol.physics.training_objective import HybridDynamicsODE
 
 
-def load_trajectory_data(csv_path):
-    """Load trajectory data from CSV."""
+def load_config(config_path: str) -> Dict:
+    """Load training configuration from YAML file."""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
+
+
+def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
+    """
+    Load trajectory data from CSV and prepare train/val/test splits.
+    Identical logic to the training script.
+    """
+    import pandas as pd
+
+    print(f"\nLoading data from {csv_path}...")
     df = pd.read_csv(csv_path)
-    return df
+    print(f"Loaded {len(df)} transitions from {df['trajectory_id'].nunique()} trajectories")
 
+    horizon   = config['training']['horizon']
+    state_dim = config['network']['state_dim']
+    action_dim = config['network']['action_dim']
+    normalize  = config['data']['normalize']
+    batch_size = config['training']['batch_size']
 
-def get_random_test_sequences(df, num_trajectories=10, num_points_per_traj=3):
-    """
-    Extract random test sequences from trajectories using stratified sampling.
-    
-    For each trajectory, sample 3 starting points from:
-    - Early interval:  step_id ~6
-    - Medium interval: step_id ~100
-    - Late interval:   step_id ~300
-    
-    Args:
-        df: DataFrame with trajectory data
-        num_trajectories: Number of trajectories to sample (0 to num_trajectories-1)
-        num_points_per_traj: Number of starting points per trajectory (typically 3)
-    
-    Returns:
-        List of (trajectory_id, step_id, start_row_idx) tuples
-    """
-    test_sequences = []
-    
-    # Define intervals with some randomness
-    interval_points = [
-        (0, 20, "early"),      # Early: steps 0-20, target ~6
-        (80, 120, "medium"),   # Medium: steps 80-120, target ~100
-        (280, 320, "late")     # Late: steps 280-320, target ~300
-    ]
-    
-    for traj_id in range(num_trajectories):
-        traj_df = df[df['trajectory_id'] == traj_id]
-        
-        if len(traj_df) < MAX_HORIZON + 20:  # Need enough data
-            continue
-        
-        traj_start_rows = traj_df.index.tolist()
-        
-        for min_step, max_step, interval_name in interval_points:
-            # Sample a random step in this interval
-            available_steps = traj_df[
-                (traj_df['step_id'] >= min_step) & 
-                (traj_df['step_id'] <= max_step)
-            ]
-            
-            if len(available_steps) > 0:
-                # Pick one random row from this interval
-                chosen_row_idx = available_steps.sample(n=1).index[0]
-                chosen_step_id = df.loc[chosen_row_idx, 'step_id']
-                test_sequences.append((traj_id, chosen_step_id, chosen_row_idx))
-    
-    return test_sequences
-
-
-def extract_trajectory_sequence(df, start_row_idx, max_horizon):
-    """
-    Extract a trajectory sequence of max_horizon steps starting from start_row_idx.
-    
-    State indices: [0-5,8-9] (skip [6-7] which are control errors, not aerodynamic angles)
-    """
-    if start_row_idx + max_horizon >= len(df):
-        return None
-    
-    state_indices = [0, 1, 2, 3, 4, 5, 8, 9]
-    state_cols = [f's_t_{i}' for i in state_indices]
-    action_cols = [f'a_t_{i}' for i in range(ACTION_DIMS)]
+    state_indices   = [0, 1, 2, 3, 4, 5, 8, 9]
+    state_cols      = [f's_t_{i}' for i in state_indices]
+    action_cols     = [f'a_t_{i}' for i in range(action_dim)]
     next_state_cols = [f's_t+1_{i}' for i in state_indices]
-    
-    states = []
-    actions = []
-    next_states = []
-    
-    for i in range(max_horizon):
-        idx = start_row_idx + i
-        row = df.iloc[idx]
-        
-        # Extract state with correct indices and apply unit conversions
-        state_vals = [row[col] for col in state_cols]
-        # Convert airspeed from km/h to m/s (index 2 in the 8-state vector)
-        state_vals[2] = state_vals[2] / 3.6
-        state = torch.tensor(state_vals, dtype=torch.float32)
-        
-        # Extract actions (already normalized [-1, 1] from PID controller)
-        action = torch.tensor([row[col] for col in action_cols], dtype=torch.float32)
-        
-        # Extract next state with same corrections
-        next_state_vals = [row[col] for col in next_state_cols]
-        next_state_vals[2] = next_state_vals[2] / 3.6
-        next_state = torch.tensor(next_state_vals, dtype=torch.float32)
-        
-        states.append(state)
-        actions.append(action)
-        next_states.append(next_state)
-    
-    return states, actions, next_states
+
+    if normalize:
+        raw_states = df[state_cols].values.copy()
+        raw_states[:, 2] = raw_states[:, 2] / 3.6
+        state_mean = raw_states.mean(axis=0)
+        state_std  = raw_states.std(axis=0) + 1e-8
+        print(f"State normalization: mean={state_mean[:3]}..., std={state_std[:3]}...")
+    else:
+        state_mean = np.zeros(state_dim)
+        state_std  = np.ones(state_dim)
+
+    trajectory_sequences_by_traj = {}
+
+    for traj_id, group in df.groupby('trajectory_id'):
+        group = group.sort_values('step_id').reset_index(drop=True)
+
+        states      = group[state_cols].values.copy()
+        actions     = group[action_cols].values
+        next_states = group[next_state_cols].values.copy()
+
+        states[:, 2]      = states[:, 2] / 3.6
+        next_states[:, 2] = next_states[:, 2] / 3.6
+
+        num_steps    = len(states)
+        traj_sequences = []
+
+        for start_idx in range(num_steps - horizon):
+            seq_states      = states[start_idx:start_idx + horizon]
+            seq_actions     = actions[start_idx:start_idx + horizon]
+            seq_next_states = next_states[start_idx:start_idx + horizon]
+
+            if normalize:
+                seq_states      = (seq_states - state_mean) / state_std
+                seq_next_states = (seq_next_states - state_mean) / state_std
+
+            traj_sequences.append({
+                'initial_state': seq_states[0].copy(),
+                'actions':       seq_actions.copy(),
+                'states':        seq_next_states.copy(),
+            })
+
+        trajectory_sequences_by_traj[traj_id] = traj_sequences
+
+    trajectories = sorted(list(df['trajectory_id'].unique()))
+    np.random.seed(42)  # Fixed seed for reproducible splits
+    np.random.shuffle(trajectories)
+
+    n_traj_train = int(len(trajectories) * config['data']['train_fraction'])
+    n_traj_val   = int(len(trajectories) * config['data']['val_fraction'])
+
+    train_traj_ids = set(trajectories[:n_traj_train])
+    val_traj_ids   = set(trajectories[n_traj_train:n_traj_train + n_traj_val])
+    test_traj_ids  = set(trajectories[n_traj_train + n_traj_val:])
+
+    def build_seqs(traj_ids):
+        return [seq
+                for traj_id, seq_list in trajectory_sequences_by_traj.items()
+                if traj_id in traj_ids
+                for seq in seq_list]
+
+    train_seqs = build_seqs(train_traj_ids)
+    val_seqs   = build_seqs(val_traj_ids)
+    test_seqs  = build_seqs(test_traj_ids)
+
+    print(f"\nTrain/Val/Test split (trajectory-level):")
+    print(f"  Trajectories: {len(train_traj_ids)} train | {len(val_traj_ids)} val | {len(test_traj_ids)} test")
+    print(f"  Sequences:    {len(train_seqs)} train | {len(val_seqs)} val | {len(test_seqs)} test")
+
+    class TrajectoryDataset(torch.utils.data.Dataset):
+        def __init__(self, sequences):
+            self.sequences = sequences
+
+        def __len__(self):
+            return len(self.sequences)
+
+        def __getitem__(self, idx):
+            seq = self.sequences[idx]
+            return {
+                'initial_states': torch.tensor(seq['initial_state'], dtype=torch.float32),
+                'actions':        torch.tensor(seq['actions'],        dtype=torch.float32),
+                'states':         torch.tensor(seq['states'],         dtype=torch.float32),
+            }
+
+        @staticmethod
+        def collate_fn(batch):
+            return {
+                'initial_states': torch.stack([b['initial_states'] for b in batch]),
+                'actions':        torch.stack([b['actions']        for b in batch]),
+                'states':         torch.stack([b['states']         for b in batch]),
+            }
+
+    def make_loader(seqs, shuffle=False):
+        ds = TrajectoryDataset(seqs)
+        return torch.utils.data.DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=0,
+            collate_fn=TrajectoryDataset.collate_fn,
+        )
+
+    return make_loader(train_seqs), make_loader(val_seqs), make_loader(test_seqs)
 
 
-def generate_ground_truth_trajectory(states_sequence, num_steps):
-    """Create ground truth trajectory from states."""
-    trajectory = []
-    for i in range(num_steps):
-        trajectory.append(states_sequence[i])
-    return torch.stack(trajectory)
-
-
-def generate_hybrid_prediction_odeint(hybrid_model, initial_state, actions, time_steps, device):
+def initialize_models(config: Dict, checkpoint_path: str, device: torch.device) -> HybridDynamicsModel:
     """
-    Generate trajectory using ODE integration with the hybrid model.
-    
-    Args:
-        hybrid_model: HybridDynamicsModel instance
-        initial_state: Starting state (batch_size, STATE_DIMS)
-        actions: List of action vectors, one per time step
-        time_steps: Time points for integration
-        device: Device to use
-    
-    Returns:
-        Trajectory: (time_steps, batch_size, STATE_DIMS)
+    Build the hybrid model and load residual network weights from checkpoint.
+    The checkpoint may be a full training checkpoint (dict) or a bare state_dict.
     """
-    trajectory = [initial_state]
-    current_state = initial_state.clone()
-    
-    # Integrate step by step with actual actions
-    for i in range(len(actions)):
-        # Current action for this step (expand to batch dimension if needed)
-        action_t = actions[i].unsqueeze(0) if actions[i].dim() == 1 else actions[i]
-        
-        # Time interval for this step
-        t_start = time_steps[i]
-        t_end = time_steps[i + 1]
-        t_span = torch.stack([t_start, t_end])
-        
-        # Integrate with constant action
-        def ode_dynamics(t, state_t):
-            return hybrid_model(state_t, action_t)
-        
-        # Use RK4 for integration
-        step_trajectory = odeint(ode_dynamics, current_state, t_span, method='rk4')
-        
-        # step_trajectory is (2, batch_size, STATE_DIMS), take final state
-        current_state = step_trajectory[-1]
-        trajectory.append(current_state)
-    
-    return torch.stack(trajectory)
+    print("\n" + "="*60)
+    print("INITIALIZING MODEL")
+    print("="*60)
 
+    physics_prior = PhysicsPrior()
+    print("  ✓ Physics prior loaded (frozen)")
 
-def compute_error_at_horizon(pred_traj, gt_traj, horizon_idx):
-    """
-    Compute RMSE and MAE at a specific horizon index.
-    
-    Args:
-        pred_traj: Predicted trajectory
-        gt_traj: Ground truth trajectory
-        horizon_idx: Index of the horizon to evaluate
-    
-    Returns:
-        (overall_rmse, overall_mae, per_state_rmse, per_state_mae, gt_state_values)
-    """
-    if horizon_idx >= len(pred_traj) or horizon_idx >= len(gt_traj):
-        return None
-    
-    pred_state = pred_traj[horizon_idx]  # shape: [batch_size, 8] or [8]
-    gt_state = gt_traj[horizon_idx]      # shape: [batch_size, 8] or [8]
-    
-    # Squeeze batch dimension if present
-    if pred_state.dim() > 1:
-        pred_state = pred_state.squeeze(0)
-        gt_state = gt_state.squeeze(0)
-    
-    # Per-state errors
-    per_state_sq_error = (pred_state - gt_state) ** 2
-    per_state_abs_error = torch.abs(pred_state - gt_state)
-    
-    per_state_rmse = per_state_sq_error.cpu().numpy()
-    per_state_mae = per_state_abs_error.cpu().numpy()
-    
-    # Ground truth values
-    gt_values = gt_state.cpu().numpy()
-    
-    # Overall errors
-    overall_mse = per_state_sq_error.mean().item()
-    overall_rmse = np.sqrt(overall_mse)
-    overall_mae = per_state_abs_error.mean().item()
-    
-    return overall_rmse, overall_mae, per_state_rmse, per_state_mae, gt_values
-
-
-def load_hybrid_model(physics_prior_path, residual_checkpoint_path, device):
-    """
-    Load the hybrid model (physics prior + trained residual network).
-    
-    Args:
-        physics_prior_path: Path to aero_coefficients.yaml
-        residual_checkpoint_path: Path to epoch_800.pt checkpoint
-        device: Device to load model to
-    
-    Returns:
-        HybridDynamicsModel instance
-    """
-    # Load physics prior (frozen)
-    print("Loading physics prior...")
-    physics_prior = PhysicsPrior(config_path=physics_prior_path)
-    physics_prior = physics_prior.to(device)
-    physics_prior.eval()
-    
-    # Create residual network
-    print("Initializing residual network...")
+    net_config = config['network']
     residual_network = PhysicsAugmented(
-        state_dim=STATE_DIMS,
-        action_dim=ACTION_DIMS,
-        hidden_dims=[128, 128],
-        activation='relu',
-        use_batch_norm=False
+        state_dim=net_config['state_dim'],
+        action_dim=net_config['action_dim'],
+        hidden_dims=net_config['hidden_dims'],
+        activation=net_config['activation'],
+        use_batch_norm=net_config['use_batch_norm'],
     )
-    
-    # Load trained residual network weights
-    print(f"Loading residual network checkpoint from {residual_checkpoint_path}...")
-    checkpoint = torch.load(residual_checkpoint_path, map_location=device)
-    residual_network.load_state_dict(checkpoint['residual_state'])
-    residual_network = residual_network.to(device)
-    residual_network.eval()
-    
-    # Create hybrid model
+
+    # Load checkpoint — handle both full training checkpoints and bare state dicts
+    print(f"\n  Loading weights from: {checkpoint_path}")
+    raw = torch.load(checkpoint_path, map_location=device)
+
+    if isinstance(raw, dict) and 'residual_state' in raw:
+        # Full training checkpoint saved by train_hybrid_model.py
+        residual_network.load_state_dict(raw['residual_state'])
+        saved_epoch = raw.get('epoch', '?')
+        saved_lambda = raw.get('lambda', '?')
+        print(f"  ✓ Loaded from training checkpoint (epoch={saved_epoch}, λ={saved_lambda})")
+    else:
+        # Bare state dict saved by final_model.pt logic
+        residual_network.load_state_dict(raw)
+        print("  ✓ Loaded bare state dict (final_model.pt format)")
+
+    num_params = sum(p.numel() for p in residual_network.parameters())
+    print(f"  ✓ Residual network: {num_params:,} parameters")
+
+    integration_method = config.get('integration', {}).get('method', 'rk4')
     hybrid_model = HybridDynamicsModel(
         physics_prior=physics_prior,
         residual_network=residual_network,
         with_prior=True,
         with_residual=True,
-        integration_method='rk4'
+        integration_method=integration_method,
     )
     hybrid_model = hybrid_model.to(device)
     hybrid_model.eval()
-    
-    # Freeze all parameters for inference only
-    for param in hybrid_model.parameters():
-        param.requires_grad = False
-    
-    print("✓ Hybrid model loaded and frozen for inference\n")
-    
+
+    print(f"  ✓ Hybrid model ready on {device}")
     return hybrid_model
 
 
-def plot_trajectory_predictions(all_results, plots_dir):
+@torch.no_grad()
+def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: torch.device,
+             split_name: str = "eval") -> Dict:
     """
-    Create visualization comparing predicted vs ground truth trajectories.
-    Shows all 8 state dimensions for the first test sequence at full horizon.
+    Run one evaluation epoch over the given DataLoader.
+    Prints per-batch statistics and a final summary (including per-state accuracy) to the terminal.
     """
-    if not all_results[MAX_HORIZON]:
-        print("⚠ No results available for trajectory plotting")
-        return
-    
-    # Get the first result which has the full trajectory info
-    first_result = all_results[MAX_HORIZON][0]
-    
-    # Create figure with 8 subplots (one per state)
-    fig, axes = plt.subplots(4, 2, figsize=(14, 12))
-    fig.suptitle('APHYNITY Hybrid Model: Predicted vs Ground Truth Trajectories (Full 10-Step Horizon)', 
-                 fontsize=14, fontweight='bold')
-    
-    axes_flat = axes.flatten()
-    
-    # We'll use per_state_mae and gt_values from the first result to visualize
-    # Note: These are aggregated across all samples, so we'll show average behavior
-    
-    for state_idx in range(STATE_DIMS):
-        ax = axes_flat[state_idx]
-        ax.set_title(f'{STATE_NAMES[state_idx]}', fontsize=11, fontweight='bold')
-        ax.set_xlabel('Horizon Step')
-        ax.set_ylabel('State Value')
-        ax.grid(True, alpha=0.3)
-    
-    # Add a note about data aggregation
-    fig.text(0.5, 0.02, 'Note: Visualization shows example trajectory. Full statistics reported in terminal output.', 
-             ha='center', fontsize=10, style='italic')
-    
-    plt.tight_layout()
-    save_path = plots_dir / 'aphynity_trajectory_comparison.png'
-    plt.savefig(save_path, dpi=FIG_DPI, bbox_inches='tight')
-    plt.close()
-    
-    print(f"✓ Saved trajectory comparison plot: {save_path.name}")
+    from torchdiffeq import odeint
 
+    horizon    = config['training']['horizon']
+    ode_method = config['integration']['method']
+    ode_rtol   = config['integration']['rtol']
+    ode_atol   = config['integration']['atol']
+    dt         = config['integration']['dt']
+    lambda_val = config['aphynity'].get('lambda_init', 1.0)
+    state_dim  = config['network']['state_dim']
 
-def plot_mae_vs_horizon(all_results, plots_dir):
-    """
-    Create plot showing how relative error grows with prediction horizon for each state.
-    Uses percentage error (MAE / abs(ground_truth)) for fair comparison across scales.
-    """
-    fig, ax = plt.subplots(figsize=(12, 7))
-    
-    state_relative_errors_by_horizon = {h: [] for h in HORIZONS}
-    
-    # Collect per-state relative error for each horizon
-    for horizon in HORIZONS:
-        if all_results[horizon]:
-            per_state_maes = np.array([r['per_state_mae'] for r in all_results[horizon]])
-            gt_values_list = np.array([r['gt_values'] for r in all_results[horizon]])
-            
-            # Compute relative error: (MAE / |mean(ground_truth)|) * 100
-            mean_gt_per_state = np.mean(np.abs(gt_values_list), axis=0)  # (8,)
-            mean_mae_per_state = np.mean(per_state_maes, axis=0)  # (8,)
-            
-            # Avoid division by zero
-            relative_error = np.zeros(STATE_DIMS)
-            for i in range(STATE_DIMS):
-                if mean_gt_per_state[i] > 1e-6:
-                    relative_error[i] = (mean_mae_per_state[i] / mean_gt_per_state[i]) * 100
-                else:
-                    relative_error[i] = np.inf  # Undefined for near-zero values
-            
-            state_relative_errors_by_horizon[horizon] = relative_error
-    
-    # Plot one line per state
-    colors = plt.cm.tab10(np.linspace(0, 1, STATE_DIMS))
-    
-    for state_idx in range(STATE_DIMS):
-        errors = [state_relative_errors_by_horizon[h][state_idx] if h in state_relative_errors_by_horizon and len(state_relative_errors_by_horizon[h]) > 0 else None 
-                for h in HORIZONS]
-        
-        # Filter out None and inf values
-        valid_horizons = [HORIZONS[i] for i in range(len(HORIZONS)) if errors[i] is not None and errors[i] != np.inf]
-        valid_errors = [e for e in errors if e is not None and e != np.inf]
-        
-        if valid_errors:
-            ax.plot(valid_horizons, valid_errors, marker='o', linewidth=2.5, markersize=8,
-                   label=STATE_NAMES[state_idx], color=colors[state_idx])
-    
-    ax.set_xlabel('Prediction Horizon (steps)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Relative Error (%)', fontsize=12, fontweight='bold')
-    ax.set_title('APHYNITY: Prediction Error Growth Over Horizon (Relative %)', fontsize=13, fontweight='bold')
-    ax.set_xticks(HORIZONS)
-    ax.grid(True, alpha=0.3, linestyle='--')
-    ax.legend(loc='best', fontsize=10, framealpha=0.95)
-    
-    plt.tight_layout()
-    save_path = plots_dir / 'aphynity_relative_error_vs_horizon.png'
-    plt.savefig(save_path, dpi=FIG_DPI, bbox_inches='tight')
-    plt.close()
-    
-    print(f"✓ Saved relative error vs horizon plot: {save_path.name}")
+    # Human-readable names for the 8 state components
+    # State indices kept from CSV: [0,1,2,3,4,5,8,9]
+    STATE_NAMES = [
+        "roll  (s0) [rad]",
+        "pitch (s1) [rad]",
+        "Va    (s2) [m/s]",
+        "p     (s3) [rad/s]",
+        "q     (s4) [rad/s]",
+        "r     (s5) [rad/s]",
+        "AoA   (s8) [rad]",
+        "AoS   (s9) [rad]",
+    ]
 
+    print(f"\n{'='*60}")
+    print(f"EVALUATION  [{split_name.upper()}]  —  {len(loader)} batches")
+    print(f"{'='*60}")
+    print(f"{'Batch':>6}  {'L_traj':>10}  {'L_reg':>10}  {'L_total':>10}  {'RunAvg_traj':>12}")
+    print("-" * 56)
 
-def plot_error_heatmap(all_results, plots_dir):
-    """
-    Create heatmap showing relative error (%) for each state at each horizon.
-    Uses percentage error (MAE / |ground_truth|) for fair comparison across scales.
-    """
-    # Build matrix: rows=states, cols=horizons
-    relative_error_matrix = np.zeros((STATE_DIMS, len(HORIZONS)))
-    
-    for h_idx, horizon in enumerate(HORIZONS):
-        if all_results[horizon]:
-            per_state_maes = np.array([r['per_state_mae'] for r in all_results[horizon]])
-            gt_values_list = np.array([r['gt_values'] for r in all_results[horizon]])
-            
-            # Compute relative error
-            mean_gt_per_state = np.mean(np.abs(gt_values_list), axis=0)  # (8,)
-            mean_mae_per_state = np.mean(per_state_maes, axis=0)  # (8,)
-            
-            for i in range(STATE_DIMS):
-                if mean_gt_per_state[i] > 1e-6:
-                    relative_error_matrix[i, h_idx] = (mean_mae_per_state[i] / mean_gt_per_state[i]) * 100
-                else:
-                    relative_error_matrix[i, h_idx] = np.nan
-    
-    # Create heatmap
-    fig, ax = plt.subplots(figsize=(10, 8))
-    
-    im = ax.imshow(relative_error_matrix, cmap='RdYlGn_r', aspect='auto', vmin=0, vmax=50)
-    
-    # Set ticks and labels
-    ax.set_xticks(np.arange(len(HORIZONS)))
-    ax.set_yticks(np.arange(STATE_DIMS))
-    ax.set_xticklabels([f'H={h}' for h in HORIZONS])
-    ax.set_yticklabels(STATE_NAMES)
-    
-    # Add text annotations with % symbol
-    for i in range(STATE_DIMS):
-        for j in range(len(HORIZONS)):
-            if not np.isnan(relative_error_matrix[i, j]):
-                text = ax.text(j, i, f'{relative_error_matrix[i, j]:.1f}%',
-                              ha="center", va="center", color="black", fontsize=10, fontweight='bold')
-    
-    ax.set_title('APHYNITY: Prediction Error Heatmap (Relative % Error)\nStates × Horizons', 
-                fontsize=13, fontweight='bold', pad=20)
-    ax.set_xlabel('Prediction Horizon', fontsize=12, fontweight='bold')
-    ax.set_ylabel('State Variables', fontsize=12, fontweight='bold')
-    
-    # Add colorbar
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label('Relative Error (%)', fontsize=11, fontweight='bold')
-    
-    plt.tight_layout()
-    save_path = plots_dir / 'aphynity_relative_error_heatmap.png'
-    plt.savefig(save_path, dpi=FIG_DPI, bbox_inches='tight')
-    plt.close()
-    
-    print(f"✓ Saved relative error heatmap plot: {save_path.name}")
+    all_traj_losses  = []
+    all_reg_losses   = []
+    all_total_losses = []
+
+    # Accumulators for per-state errors across all batches and steps
+    # Shape tracked: (N_samples, H, state_dim) — we keep running sums for efficiency
+    per_state_abs_err_sum  = np.zeros(state_dim)   # for MAE
+    per_state_sq_err_sum   = np.zeros(state_dim)   # for RMSE
+    per_state_abs_gt_sum   = np.zeros(state_dim)   # mean |ground truth| for relative error
+    per_state_count        = 0                      # total (samples × steps)
+
+    for batch_idx, batch_data in enumerate(loader):
+        batch_initial = batch_data['initial_states'].to(device)
+        batch_actions = batch_data['actions'].to(device)
+        batch_states  = batch_data['states'].to(device)
+
+        predicted_states = []
+        residual_norms   = []
+        current_state    = batch_initial
+
+        ode_module = HybridDynamicsODE(hybrid_model, device).to(device)
+
+        for step in range(horizon):
+            action = batch_actions[:, step, :]
+
+            residual_output = hybrid_model.residual_network(current_state, action)
+            residual_norm   = torch.norm(residual_output, p=2, dim=1).mean()
+            residual_norms.append(residual_norm)
+
+            ode_module.set_action(action)
+            t_eval   = torch.tensor([0.0, dt], dtype=current_state.dtype, device=device)
+            solution = odeint(ode_module, current_state, t_eval,
+                              method=ode_method, rtol=ode_rtol, atol=ode_atol)
+            next_state = solution[-1].clamp(-100.0, 100.0)
+            predicted_states.append(next_state)
+            current_state = next_state
+
+        predicted_trajectory = torch.stack(predicted_states, dim=1)  # (B, H, state_dim)
+        prediction_error     = predicted_trajectory - batch_states    # (B, H, state_dim)
+
+        # --- Global trajectory loss (L2 norm across state dim, mean over B and H) ---
+        traj_loss  = torch.norm(prediction_error, p=2, dim=2).mean().item()
+        reg_loss   = torch.stack(residual_norms).mean().item()
+        total_loss = reg_loss + lambda_val * traj_loss
+
+        all_traj_losses.append(traj_loss)
+        all_reg_losses.append(reg_loss)
+        all_total_losses.append(total_loss)
+
+        # --- Per-state error accumulation (over B and H jointly) ---
+        err_np   = prediction_error.cpu().numpy()        # (B, H, state_dim)
+        gt_np    = batch_states.cpu().numpy()            # (B, H, state_dim)
+        err_flat = err_np.reshape(-1, state_dim)         # (B*H, state_dim)
+        gt_flat  = gt_np.reshape(-1, state_dim)          # (B*H, state_dim)
+        per_state_abs_err_sum += np.abs(err_flat).sum(axis=0)
+        per_state_sq_err_sum  += (err_flat ** 2).sum(axis=0)
+        per_state_abs_gt_sum  += np.abs(gt_flat).sum(axis=0)
+        per_state_count       += err_flat.shape[0]
+
+        running_avg_traj = np.mean(all_traj_losses)
+        print(f"{batch_idx+1:>6}  {traj_loss:>10.4f}  {reg_loss:>10.4f}  {total_loss:>10.4f}  {running_avg_traj:>12.4f}")
+
+    print("-" * 56)
+
+    # -------------------------------------------------------------------------
+    # Global summary
+    # -------------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print(f"SUMMARY  [{split_name.upper()}]")
+    print(f"{'='*60}")
+    print(f"  Batches evaluated   : {len(all_traj_losses)}")
+    print(f"  Avg trajectory loss : {np.mean(all_traj_losses):.6f}  (±{np.std(all_traj_losses):.6f})")
+    print(f"  Avg regularization  : {np.mean(all_reg_losses):.6f}  (±{np.std(all_reg_losses):.6f})")
+    print(f"  Avg total loss      : {np.mean(all_total_losses):.6f}  (±{np.std(all_total_losses):.6f})")
+    print(f"  Min trajectory loss : {np.min(all_traj_losses):.6f}")
+    print(f"  Max trajectory loss : {np.max(all_traj_losses):.6f}")
+
+    # -------------------------------------------------------------------------
+    # Per-state accuracy table
+    # -------------------------------------------------------------------------
+    per_state_mae      = per_state_abs_err_sum / per_state_count
+    per_state_rmse     = np.sqrt(per_state_sq_err_sum / per_state_count)
+    per_state_mean_mag = per_state_abs_gt_sum / per_state_count          # mean |gt| per state
+    # Relative error: MAE expressed as % of the mean observed magnitude.
+    # Where the mean magnitude is very small (< 1e-6), mark as undefined.
+    per_state_rel_err  = np.where(
+        per_state_mean_mag > 1e-6,
+        100.0 * per_state_mae / per_state_mean_mag,
+        np.nan,
+    )
+
+    print(f"\n{'='*72}")
+    print(f"PER-STATE ACCURACY  [{split_name.upper()}]")
+    print(f"  (averaged over all {per_state_count} predictions = batches × horizon)")
+    print(f"  Relative error = MAE / mean(|ground truth|) — how large the error is")
+    print(f"  compared to the typical magnitude of that state variable.")
+    print(f"{'='*72}")
+    header = f"  {'State':<22}  {'MAE':>10}  {'RMSE':>10}  {'Mean |gt|':>10}  {'Rel err %':>10}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for i, name in enumerate(STATE_NAMES):
+        rel_str = f"{per_state_rel_err[i]:>9.2f}%" if not np.isnan(per_state_rel_err[i]) else "       N/A"
+        print(f"  {name:<22}  {per_state_mae[i]:>10.6f}  {per_state_rmse[i]:>10.6f}"
+              f"  {per_state_mean_mag[i]:>10.4f}  {rel_str}")
+    print(f"{'='*72}\n")
+
+    return {
+        'mean_traj_loss':    np.mean(all_traj_losses),
+        'std_traj_loss':     np.std(all_traj_losses),
+        'mean_reg_loss':     np.mean(all_reg_losses),
+        'mean_total_loss':   np.mean(all_total_losses),
+        'per_state_mae':     per_state_mae,
+        'per_state_rmse':    per_state_rmse,
+        'per_state_mean_mag': per_state_mean_mag,
+        'per_state_rel_err': per_state_rel_err,
+    }
 
 
 def main():
-    print("\n" + "="*100)
-    print("APHYNITY HYBRID MODEL TEST (Physics Prior + Learned Residual Network)")
-    print("Approach: Multi-step prediction with ODE integration")
-    print("="*100 + "\n")
-    
-    # Paths
-    csv_path = Path('/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl/fw_flightcontrol/data/updated_trajectory_data_noatmo.csv')
-    physics_prior_path = '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl/fw_flightcontrol/physics/aero_coefficients.yaml'
-    residual_checkpoint_path = '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl/fw_flightcontrol/physics/checkpoints/exp_v0.2/epoch_800.pt'
-    
-    # Validate paths
-    if not csv_path.exists():
-        print(f"Error: {csv_path} not found!")
-        return
-    if not Path(residual_checkpoint_path).exists():
-        print(f"Error: {residual_checkpoint_path} not found!")
-        return
-    
-    print(f"Loading trajectory data from {csv_path}...")
-    df = load_trajectory_data(csv_path)
-    print(f"Dataset size: {len(df)} transitions\n")
-    
-    # Load hybrid model
-    hybrid_model = load_hybrid_model(physics_prior_path, residual_checkpoint_path, DEVICE)
-    
-    # Generate random test sequences
-    test_sequences = get_random_test_sequences(df, num_trajectories=10, num_points_per_traj=3)
-    
-    print("="*100)
-    print(f"Testing Hybrid Model on Random Trajectories")
-    print(f"Total test sequences: {len(test_sequences)}")
-    print(f"Max horizon: {MAX_HORIZON} steps")
-    print(f"Horizons to evaluate: {HORIZONS}")
-    print(f"Each step = {DT} seconds")
-    print("="*100 + "\n")
-    
-    # Collect results organized by horizon
-    all_results = {h: [] for h in HORIZONS}
-    
-    for test_idx, (traj_id, step_id, row_idx) in enumerate(test_sequences, 1):
-        trajectory_data = extract_trajectory_sequence(df, row_idx, MAX_HORIZON)
-        
-        if trajectory_data is None:
-            print(f"✗ Sequence {test_idx}: Traj {traj_id}, step {step_id} - not enough data")
-            continue
-        
-        states_seq, actions_seq, next_states_seq = trajectory_data
-        
-        initial_state = states_seq[0].to(DEVICE)
-        
-        # Generate time points for integration
-        time_steps = torch.arange(0, (MAX_HORIZON + 1) * DT, DT, dtype=torch.float32, device=DEVICE)
-        
-        # Ground truth trajectory (initial state + predicted next states)
-        gt_trajectory = generate_ground_truth_trajectory(
-            [s.to(DEVICE) for s in states_seq] + [next_states_seq[-1].to(DEVICE)],
-            MAX_HORIZON + 1
-        )
-        
-        # Generate hybrid model predictions
-        with torch.no_grad():
-            pred_trajectory = generate_hybrid_prediction_odeint(
-                hybrid_model, initial_state.unsqueeze(0), actions_seq, time_steps, DEVICE
-            )
-        
-        # Evaluate at different horizons
-        print(f"[{test_idx:2d}] Trajectory {traj_id:2d}, step_id {step_id:3d}:")
-        
-        for horizon in HORIZONS:
-            error_data = compute_error_at_horizon(pred_trajectory, gt_trajectory, horizon)
-            
-            if error_data is not None:
-                overall_rmse, overall_mae, per_state_rmse, per_state_mae, gt_values = error_data
-                print(f"        H={horizon:2d} ({horizon*DT:.3f}s): RMSE={overall_rmse:.6f}, MAE={overall_mae:.6f}")
-                
-                all_results[horizon].append({
-                    'traj_id': traj_id,
-                    'step_id': step_id,
-                    'rmse': overall_rmse,
-                    'mae': overall_mae,
-                    'per_state_rmse': per_state_rmse,
-                    'per_state_mae': per_state_mae,
-                    'gt_values': gt_values
-                })
-        
-        print()
-    
-    # Print summary statistics
-    print("\n" + "="*100)
-    print("SUMMARY - HYBRID MODEL ACCURACY AT DIFFERENT HORIZONS")
-    print("="*100 + "\n")
-    
-    print(f"{'Horizon':<12} {'Steps':<10} {'Time':<10} {'Mean MAE':<15} {'Std Dev':<15} {'Min':<12} {'Max':<12}")
-    print("-" * 100)
-    
-    summary_data = {}
-    for horizon in HORIZONS:
-        if all_results[horizon]:
-            maes = np.array([r['mae'] for r in all_results[horizon]])
-            mean_mae = np.mean(maes)
-            std_mae = np.std(maes)
-            min_mae = np.min(maes)
-            max_mae = np.max(maes)
-            
-            summary_data[horizon] = {
-                'mean': mean_mae,
-                'std': std_mae,
-                'min': min_mae,
-                'max': max_mae,
-                'count': len(maes)
-            }
-            
-            print(f"{f'H={horizon}':<12} {horizon:<10} {horizon*DT:<10.3f}s {mean_mae:<15.6f} {std_mae:<15.6f} {min_mae:<12.6f} {max_mae:<12.6f}")
-        else:
-            print(f"{f'H={horizon}':<12} {horizon:<10} {horizon*DT:<10.3f}s {'N/A':<15} {'N/A':<15} {'N/A':<12} {'N/A':<12}")
-    
-    # Per-state error analysis
-    print("\n" + "="*100)
-    print("PER-STATE ERROR ANALYSIS (Absolute MAE + Relative % Error)")
-    print("="*100 + "\n")
-    
-    for horizon in HORIZONS:
-        if all_results[horizon]:
-            print(f"Horizon {horizon} ({horizon*DT:.3f}s):")
-            print(f"{'':30} {'Typical Magnitude':<20} {'MAE (Abs)':<20} {'Error (%)':<15}")
-            print("-" * 100)
-            
-            per_state_maes = np.array([r['per_state_mae'] for r in all_results[horizon]])
-            gt_values_list = np.array([r['gt_values'] for r in all_results[horizon]])
-            
-            if len(per_state_maes.shape) == 2 and per_state_maes.shape[1] == STATE_DIMS:
-                for state_idx, state_name in enumerate(STATE_NAMES):
-                    state_maes = per_state_maes[:, state_idx]
-                    state_gt_values = gt_values_list[:, state_idx]
-                    
-                    mean_mae = np.mean(state_maes)
-                    std_mae = np.std(state_maes)
-                    
-                    # Use mean of absolute values for typical magnitude (not mean which could be near zero)
-                    typical_magnitude = np.mean(np.abs(state_gt_values))
-                    typical_magnitude_std = np.std(np.abs(state_gt_values))
-                    
-                    # Compute relative error properly
-                    if typical_magnitude > 1e-6:
-                        relative_error = (mean_mae / typical_magnitude) * 100
-                    else:
-                        relative_error = np.inf
-                    
-                    mag_str = f"{typical_magnitude:.6f} (±{typical_magnitude_std:.6f})"
-                    mae_str = f"{mean_mae:.6f} (±{std_mae:.6f})"
-                    error_str = f"{relative_error:.2f}%" if relative_error != np.inf else "N/A"
-                    
-                    print(f"  [{state_idx}] {state_name:20s} {mag_str:<20} {mae_str:<20} {error_str:<15}")
-            print()
-    
-    # Generate visualization plots
-    print("\n" + "="*100)
-    print("GENERATING VISUALIZATIONS")
-    print("="*100 + "\n")
-    
-    plots_dir = Path('/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl/fw_flightcontrol/physics/plots/uav_env')
-    plots_dir.mkdir(parents=True, exist_ok=True)
-    
-    plot_mae_vs_horizon(all_results, plots_dir)
-    plot_error_heatmap(all_results, plots_dir)
-    
-    print(f"\n✓ All plots saved to: {plots_dir}\n")
-    
-    print("="*100)
-    print("Test complete!")
-    print("="*100 + "\n")
+    parser = argparse.ArgumentParser(description='Evaluate a trained hybrid physics-augmented world model')
+    parser.add_argument('--checkpoint', type=str, required=True,
+                        help='Path to .pt checkpoint (training checkpoint or final_model.pt)')
+    parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'],
+                        help='Which data split to evaluate on (default: test)')
+    args = parser.parse_args()
 
+    print("\n" + "="*60)
+    print("HYBRID PHYSICS-AUGMENTED MODEL — EVALUATION")
+    print("="*60)
+    print(f"  Checkpoint : {args.checkpoint}")
+    print(f"  Split      : {args.split}")
 
+    # Load config from the physics directory (same as training script)
+    config_path = Path(__file__).parent / 'training_params.yaml'
+    print(f"  Config     : {config_path}")
+    config = load_config(str(config_path))
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"  Device     : {device}")
+
+    # Load data
+    csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_noatmo.csv"
+    train_loader, val_loader, test_loader = load_trajectory_data(str(csv_path), config)
+
+    loader_map = {'train': train_loader, 'val': val_loader, 'test': test_loader}
+    target_loader = loader_map[args.split]
+
+    # Build model and load weights
+    hybrid_model = initialize_models(config, args.checkpoint, device)
+
+    # Run evaluation
+    evaluate(hybrid_model, target_loader, config, device, split_name=args.split)
+
+'''
+run script like this for exmaple:
+ python test_physics_model.py --checkpoint checkpoints/exp_v0.4/epoch_520.pt
+'''
 if __name__ == '__main__':
     main()
