@@ -107,6 +107,44 @@ data:
 
 
 # ============================================================================
+# STATE BOUNDS FOR NORMALIZATION
+# ============================================================================
+# Bounds used for min-max normalization: normalized = 2*(value - min)/(max - min) - 1
+# State order: [roll, pitch, airspeed_mps, p, q, r, alpha, beta]
+# Note: Airspeed bounds are in m/s (after conversion from km/h in CSV)
+state_bounds:
+  # Attitude angles [rad]
+  roll_min: -3.14159265
+  roll_max: 3.14159265
+  
+  pitch_min: -3.14159265
+  pitch_max: 3.14159265
+  
+  # Airspeed [m/s] - bounds after conversion from km/h
+  # Environment: [0, 400 km/h] → [0, 111.1 m/s]
+  airspeed_mps_min: 0.0
+  airspeed_mps_max: 111.1
+  
+  # Angular rates [rad/s] - from environment (jsbsim_properties.py)
+  p_min: -35.0
+  p_max: 35.0
+  
+  q_min: -35.0
+  q_max: 35.0
+  
+  r_min: -35.0
+  r_max: 35.0
+  
+  # Aerodynamic angles [rad] - compromise between environment (unbounded) and empirical data
+  # Symmetric bounds: approximately ±20° = ±0.349 rad
+  alpha_min: -0.35
+  alpha_max: 0.35
+  
+  beta_min: -0.35
+  beta_max: 0.35
+
+
+# ============================================================================
 # REGULARIZATION
 # ============================================================================
 regularization:
@@ -128,5 +166,5 @@ logging:
   
   # Output directories
   checkpoint_dir: ./checkpoints
-  checkpoint_subdirectory: exp_v0.5    # Subdirectory for this run (e.g., test1, test2, exp_v1)
+  checkpoint_subdirectory: exp_v0.6    # Subdirectory for this run (e.g., test1, test2, exp_v1)
   log_dir: ./logs

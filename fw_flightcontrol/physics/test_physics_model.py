@@ -261,6 +261,12 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
     per_state_abs_gt_sum   = np.zeros(state_dim)   # mean |ground truth| for relative error
     per_state_count        = 0                      # total (samples × steps)
 
+    # For per-horizon error: store lists of errors and gts for each horizon step
+    horizon_steps = [1, 3, 5, 10]
+    horizon_steps = [h for h in horizon_steps if h <= horizon]
+    per_horizon_err = {h: [] for h in horizon_steps}
+    per_horizon_gt = {h: [] for h in horizon_steps}
+
     for batch_idx, batch_data in enumerate(loader):
         batch_initial = batch_data['initial_states'].to(device)
         batch_actions = batch_data['actions'].to(device)
@@ -299,6 +305,7 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
         all_reg_losses.append(reg_loss)
         all_total_losses.append(total_loss)
 
+
         # --- Per-state error accumulation (over B and H jointly) ---
         err_np   = prediction_error.cpu().numpy()        # (B, H, state_dim)
         gt_np    = batch_states.cpu().numpy()            # (B, H, state_dim)
@@ -308,6 +315,12 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
         per_state_sq_err_sum  += (err_flat ** 2).sum(axis=0)
         per_state_abs_gt_sum  += np.abs(gt_flat).sum(axis=0)
         per_state_count       += err_flat.shape[0]
+
+        # --- Per-horizon error accumulation ---
+        for h in horizon_steps:
+            if h-1 < err_np.shape[1]:
+                per_horizon_err[h].append(err_np[:, h-1, :])  # (B, state_dim)
+                per_horizon_gt[h].append(gt_np[:, h-1, :])
 
         running_avg_traj = np.mean(all_traj_losses)
         print(f"{batch_idx+1:>6}  {traj_loss:>10.4f}  {reg_loss:>10.4f}  {total_loss:>10.4f}  {running_avg_traj:>12.4f}")
@@ -327,8 +340,9 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
     print(f"  Min trajectory loss : {np.min(all_traj_losses):.6f}")
     print(f"  Max trajectory loss : {np.max(all_traj_losses):.6f}")
 
+
     # -------------------------------------------------------------------------
-    # Per-state accuracy table
+    # Per-state accuracy table (with per-horizon rel err)
     # -------------------------------------------------------------------------
     per_state_mae      = per_state_abs_err_sum / per_state_count
     per_state_rmse     = np.sqrt(per_state_sq_err_sum / per_state_count)
@@ -341,19 +355,39 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
         np.nan,
     )
 
+    # Compute per-horizon relative errors
+    per_horizon_rel_err = {}
+    for h in horizon_steps:
+        if per_horizon_err[h]:
+            err_h = np.concatenate(per_horizon_err[h], axis=0)  # (N, state_dim)
+            gt_h  = np.concatenate(per_horizon_gt[h], axis=0)
+            mae_h = np.abs(err_h).mean(axis=0)
+            mean_mag_h = np.abs(gt_h).mean(axis=0)
+            rel_err_h = np.where(mean_mag_h > 1e-6, 100.0 * mae_h / mean_mag_h, np.nan)
+            per_horizon_rel_err[h] = rel_err_h
+        else:
+            per_horizon_rel_err[h] = np.full(state_dim, np.nan)
+
     print(f"\n{'='*72}")
     print(f"PER-STATE ACCURACY  [{split_name.upper()}]")
     print(f"  (averaged over all {per_state_count} predictions = batches × horizon)")
     print(f"  Relative error = MAE / mean(|ground truth|) — how large the error is")
     print(f"  compared to the typical magnitude of that state variable.")
     print(f"{'='*72}")
+    # Table header
     header = f"  {'State':<22}  {'MAE':>10}  {'RMSE':>10}  {'Mean |gt|':>10}  {'Rel err %':>10}"
+    for h in horizon_steps:
+        header += f"  [h={h}]%"
     print(header)
     print("  " + "-" * (len(header) - 2))
     for i, name in enumerate(STATE_NAMES):
         rel_str = f"{per_state_rel_err[i]:>9.2f}%" if not np.isnan(per_state_rel_err[i]) else "       N/A"
-        print(f"  {name:<22}  {per_state_mae[i]:>10.6f}  {per_state_rmse[i]:>10.6f}"
-              f"  {per_state_mean_mag[i]:>10.4f}  {rel_str}")
+        row = f"  {name:<22}  {per_state_mae[i]:>10.6f}  {per_state_rmse[i]:>10.6f}  {per_state_mean_mag[i]:>10.4f}  {rel_str}"
+        for h in horizon_steps:
+            rel_h = per_horizon_rel_err[h][i]
+            rel_h_str = f"{rel_h:>8.2f}%" if not np.isnan(rel_h) else "    N/A"
+            row += f"  {rel_h_str}"
+        print(row)
     print(f"{'='*72}\n")
 
     return {
@@ -405,7 +439,7 @@ def main():
 
 '''
 run script like this for exmaple:
- python test_physics_model.py --checkpoint checkpoints/exp_v0.4/epoch_520.pt
+ python test_physics_model.py --checkpoint checkpoints/exp_v0.5/final_model.pt
 '''
 if __name__ == '__main__':
     main()
