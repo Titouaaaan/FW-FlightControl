@@ -23,6 +23,8 @@ fw_flightcontrol/eval/waypoint_tracking/outputs/trajectories/*
 
 fw_flightcontrol/physics/plots
 
+fw_flightcontrol/data/updated_trajectory_data_noatmo.csv
+
 # Exceptions
 !fw_flightcontrol/eval/outputs/icinco/
 
