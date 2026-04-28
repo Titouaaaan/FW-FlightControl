@@ -11,12 +11,8 @@ network:
   
   # Residual network hidden layers
   hidden_dims: [256,256]
-  activation: relu      # Options: relu, tanh, elu
+  activation: relu
   use_batch_norm: false
-  
-  # Weight initialization
-  init_mean: 0.0
-  init_std: 0.005       # Very small initialization to prevent early gradient explosion
 
 
 # ============================================================================
@@ -31,9 +27,7 @@ training:
   batch_size: 25
   num_epochs: 1000
   
-  # Learning rate and optimizer
-  learning_rate: 0.001
-  optimizer: adam
+  # Actual learning rate is set via aphynity.tau_1 (passed to Adam optimizer)
   
   # Learning rate scheduler (optional)
   scheduler:
@@ -97,9 +91,10 @@ data:
   val_fraction: 0.15
   test_fraction: 0.15
   
-  # Data normalization (disabled - physics prior works in raw physical units)
-  normalize: false
-  normalize_method: standard  # Options: standard (z-score), minmax
+  # Data normalization (physics prior always works in raw space; this controls residual network)
+  # false: residual learns in raw space, combines directly with physics prior
+  # true: residual learns in normalized [-1,1] space, derivatives denormalized before combining
+  normalize: true
   
   # Sequence sampling
   random_seed: 42

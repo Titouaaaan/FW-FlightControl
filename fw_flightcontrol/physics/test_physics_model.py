@@ -28,6 +28,75 @@ from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridD
 from fw_flightcontrol.physics.training_objective import HybridDynamicsODE
 
 
+# ============================================================================
+# NORMALIZATION UTILITIES (copied from learn_physics_model.py)
+# ============================================================================
+def extract_bounds_from_config(config: Dict) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extract state bounds from config and return as min/max arrays.
+    
+    Returns:
+        (min_bounds, max_bounds): numpy arrays of shape (state_dim,)
+        Order: [roll, pitch, airspeed_mps, p, q, r, alpha, beta]
+    """
+    bounds = config['state_bounds']
+    
+    min_bounds = np.array([
+        bounds['roll_min'],
+        bounds['pitch_min'],
+        bounds['airspeed_mps_min'],
+        bounds['p_min'],
+        bounds['q_min'],
+        bounds['r_min'],
+        bounds['alpha_min'],
+        bounds['beta_min'],
+    ], dtype=np.float32)
+    
+    max_bounds = np.array([
+        bounds['roll_max'],
+        bounds['pitch_max'],
+        bounds['airspeed_mps_max'],
+        bounds['p_max'],
+        bounds['q_max'],
+        bounds['r_max'],
+        bounds['alpha_max'],
+        bounds['beta_max'],
+    ], dtype=np.float32)
+    
+    return min_bounds, max_bounds
+
+
+def compute_denorm_factors(min_bounds: np.ndarray, max_bounds: np.ndarray) -> np.ndarray:
+    """
+    Compute denormalization factors for derivatives.
+    
+    For a state normalized to [-1, 1] as: s_norm = 2*(s_raw - min)/(max-min) - 1
+    The derivative scaling is: ds_norm/dt = 2/(max-min) * ds_raw/dt
+    To denormalize: ds_raw/dt = (max-min)/2 * ds_norm/dt
+    
+    Returns:
+        denorm_factors: array of shape (state_dim,) with (max-min)/2 for each state
+    """
+    return (max_bounds - min_bounds) / 2.0
+
+
+def normalize_state(state: np.ndarray, min_bounds: np.ndarray, max_bounds: np.ndarray) -> np.ndarray:
+    """
+    Normalize state from raw values to [-1, 1] range.
+    
+    Formula: normalized = 2 * (value - min) / (max - min) - 1
+    
+    Args:
+        state: raw state values, shape (..., state_dim)
+        min_bounds: minimum bounds, shape (state_dim,)
+        max_bounds: maximum bounds, shape (state_dim,)
+    
+    Returns:
+        normalized state in [-1, 1] range
+    """
+    return 2.0 * (state - min_bounds) / (max_bounds - min_bounds) - 1.0
+
+
 def load_config(config_path: str) -> Dict:
     """Load training configuration from YAML file."""
     with open(config_path, 'r') as f:
@@ -57,15 +126,14 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     action_cols     = [f'a_t_{i}' for i in range(action_dim)]
     next_state_cols = [f's_t+1_{i}' for i in state_indices]
 
-    if normalize:
-        raw_states = df[state_cols].values.copy()
-        raw_states[:, 2] = raw_states[:, 2] / 3.6
-        state_mean = raw_states.mean(axis=0)
-        state_std  = raw_states.std(axis=0) + 1e-8
-        print(f"State normalization: mean={state_mean[:3]}..., std={state_std[:3]}...")
-    else:
-        state_mean = np.zeros(state_dim)
-        state_std  = np.ones(state_dim)
+    # Extract bounds for normalization (from config)
+    min_bounds, max_bounds = extract_bounds_from_config(config)
+    denorm_factors = compute_denorm_factors(min_bounds, max_bounds)
+    
+    print(f"\nState bounds loaded from config:")
+    print(f"  Min: {min_bounds}")
+    print(f"  Max: {max_bounds}")
+    print(f"  Denorm factors: {denorm_factors}")
 
     trajectory_sequences_by_traj = {}
 
@@ -87,9 +155,10 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
             seq_actions     = actions[start_idx:start_idx + horizon]
             seq_next_states = next_states[start_idx:start_idx + horizon]
 
+            # Normalize if configured (bounds-based min-max to [-1, 1])
             if normalize:
-                seq_states      = (seq_states - state_mean) / state_std
-                seq_next_states = (seq_next_states - state_mean) / state_std
+                seq_states      = normalize_state(seq_states, min_bounds, max_bounds)
+                seq_next_states = normalize_state(seq_next_states, min_bounds, max_bounds)
 
             traj_sequences.append({
                 'initial_state': seq_states[0].copy(),
@@ -100,7 +169,8 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
         trajectory_sequences_by_traj[traj_id] = traj_sequences
 
     trajectories = sorted(list(df['trajectory_id'].unique()))
-    np.random.seed(42)  # Fixed seed for reproducible splits
+    random_seed = config['data'].get('random_seed', 42)
+    np.random.seed(random_seed)
     np.random.shuffle(trajectories)
 
     n_traj_train = int(len(trajectories) * config['data']['train_fraction'])
@@ -157,7 +227,7 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
             collate_fn=TrajectoryDataset.collate_fn,
         )
 
-    return make_loader(train_seqs), make_loader(val_seqs), make_loader(test_seqs)
+    return make_loader(train_seqs), make_loader(val_seqs), make_loader(test_seqs), denorm_factors, min_bounds
 
 
 def initialize_models(config: Dict, checkpoint_path: str, device: torch.device) -> HybridDynamicsModel:
@@ -216,11 +286,8 @@ def initialize_models(config: Dict, checkpoint_path: str, device: torch.device) 
 
 @torch.no_grad()
 def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: torch.device,
-             split_name: str = "eval") -> Dict:
-    """
-    Run one evaluation epoch over the given DataLoader.
-    Prints per-batch statistics and a final summary (including per-state accuracy) to the terminal.
-    """
+             split_name: str = "eval", denorm_factors: torch.Tensor = None, min_bounds: torch.Tensor = None) -> Dict:
+    """Evaluate model on a dataset split, computing compounded errors."""
     from torchdiffeq import odeint
 
     horizon    = config['training']['horizon']
@@ -276,13 +343,20 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
         residual_norms   = []
         current_state    = batch_initial
 
-        ode_module = HybridDynamicsODE(hybrid_model, device).to(device)
+        ode_module = HybridDynamicsODE(hybrid_model, device, denorm_factors=denorm_factors, min_bounds=min_bounds).to(device)
 
         for step in range(horizon):
             action = batch_actions[:, step, :]
 
             residual_output = hybrid_model.residual_network(current_state, action)
-            residual_norm   = torch.norm(residual_output, p=2, dim=1).mean()
+            
+            # Denormalize residual to raw space before penalizing (if using normalization)
+            # This ensures regularization penalty is consistent with trajectory loss (both in raw space)
+            if config['data']['normalize']:
+                residual_output_raw = residual_output * denorm_factors
+                residual_norm = torch.norm(residual_output_raw, p=2, dim=1).mean()
+            else:
+                residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
             residual_norms.append(residual_norm)
 
             ode_module.set_action(action)
@@ -294,9 +368,18 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
             current_state = next_state
 
         predicted_trajectory = torch.stack(predicted_states, dim=1)  # (B, H, state_dim)
-        prediction_error     = predicted_trajectory - batch_states    # (B, H, state_dim)
+        
+        # Denormalize predictions and ground truth to raw space (same as training)
+        if config['data']['normalize']:
+            predicted_trajectory_raw = (predicted_trajectory + 1.0) * denorm_factors + min_bounds
+            batch_states_raw = (batch_states + 1.0) * denorm_factors + min_bounds
+        else:
+            predicted_trajectory_raw = predicted_trajectory
+            batch_states_raw = batch_states
+        
+        prediction_error = predicted_trajectory_raw - batch_states_raw
 
-        # --- Global trajectory loss (L2 norm across state dim, mean over B and H) ---
+        # --- Compounded trajectory loss (what training optimizes) ---
         traj_loss  = torch.norm(prediction_error, p=2, dim=2).mean().item()
         reg_loss   = torch.stack(residual_norms).mean().item()
         total_loss = reg_loss + lambda_val * traj_loss
@@ -305,10 +388,9 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
         all_reg_losses.append(reg_loss)
         all_total_losses.append(total_loss)
 
-
-        # --- Per-state error accumulation (over B and H jointly) ---
+        # --- Per-state error accumulation (compounded errors from full trajectory) ---
         err_np   = prediction_error.cpu().numpy()        # (B, H, state_dim)
-        gt_np    = batch_states.cpu().numpy()            # (B, H, state_dim)
+        gt_np    = batch_states_raw.cpu().numpy()        # (B, H, state_dim) now in raw space
         err_flat = err_np.reshape(-1, state_dim)         # (B*H, state_dim)
         gt_flat  = gt_np.reshape(-1, state_dim)          # (B*H, state_dim)
         per_state_abs_err_sum += np.abs(err_flat).sum(axis=0)
@@ -316,7 +398,7 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
         per_state_abs_gt_sum  += np.abs(gt_flat).sum(axis=0)
         per_state_count       += err_flat.shape[0]
 
-        # --- Per-horizon error accumulation ---
+        # --- Per-horizon compounded error accumulation ---
         for h in horizon_steps:
             if h-1 < err_np.shape[1]:
                 per_horizon_err[h].append(err_np[:, h-1, :])  # (B, state_dim)
@@ -370,9 +452,9 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
 
     print(f"\n{'='*72}")
     print(f"PER-STATE ACCURACY  [{split_name.upper()}]")
+    print(f"  COMPOUNDED ERRORS: Predictions use previous predictions (how loss is computed)")
     print(f"  (averaged over all {per_state_count} predictions = batches × horizon)")
-    print(f"  Relative error = MAE / mean(|ground truth|) — how large the error is")
-    print(f"  compared to the typical magnitude of that state variable.")
+    print(f"  Relative error = MAE / mean(|ground truth|)")
     print(f"{'='*72}")
     # Table header
     header = f"  {'State':<22}  {'MAE':>10}  {'RMSE':>10}  {'Mean |gt|':>10}  {'Rel err %':>10}"
@@ -426,7 +508,9 @@ def main():
 
     # Load data
     csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_progressive_noatmo.csv"
-    train_loader, val_loader, test_loader = load_trajectory_data(str(csv_path), config)
+    train_loader, val_loader, test_loader, denorm_factors, min_bounds = load_trajectory_data(str(csv_path), config)
+    denorm_factors_torch = torch.tensor(denorm_factors, dtype=torch.float32, device=device)
+    min_bounds_torch = torch.tensor(min_bounds, dtype=torch.float32, device=device)
 
     loader_map = {'train': train_loader, 'val': val_loader, 'test': test_loader}
     target_loader = loader_map[args.split]
@@ -435,11 +519,13 @@ def main():
     hybrid_model = initialize_models(config, args.checkpoint, device)
 
     # Run evaluation
-    evaluate(hybrid_model, target_loader, config, device, split_name=args.split)
+    evaluate(hybrid_model, target_loader, config, device, split_name=args.split, 
+             denorm_factors=denorm_factors_torch if config['data']['normalize'] else None,
+             min_bounds=min_bounds_torch if config['data']['normalize'] else None)
 
 '''
 run script like this for exmaple:
- python test_physics_model.py --checkpoint checkpoints/exp_v0.5/final_model.pt
+ python test_physics_model.py --checkpoint checkpoints/exp_v0.6/epoch_10.pt
 '''
 if __name__ == '__main__':
     main()

@@ -37,6 +37,91 @@ from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridD
 from fw_flightcontrol.physics.training_objective import train_aphynity_epoch, HybridDynamicsODE
 
 
+# ============================================================================
+# NORMALIZATION UTILITIES
+# ============================================================================
+def extract_bounds_from_config(config: Dict) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extract state bounds from config and return as min/max arrays.
+    
+    Returns:
+        (min_bounds, max_bounds): numpy arrays of shape (state_dim,)
+        Order: [roll, pitch, airspeed_mps, p, q, r, alpha, beta]
+    """
+    bounds = config['state_bounds']
+    
+    min_bounds = np.array([
+        bounds['roll_min'],
+        bounds['pitch_min'],
+        bounds['airspeed_mps_min'],
+        bounds['p_min'],
+        bounds['q_min'],
+        bounds['r_min'],
+        bounds['alpha_min'],
+        bounds['beta_min'],
+    ], dtype=np.float32)
+    
+    max_bounds = np.array([
+        bounds['roll_max'],
+        bounds['pitch_max'],
+        bounds['airspeed_mps_max'],
+        bounds['p_max'],
+        bounds['q_max'],
+        bounds['r_max'],
+        bounds['alpha_max'],
+        bounds['beta_max'],
+    ], dtype=np.float32)
+    
+    return min_bounds, max_bounds
+
+
+def compute_denorm_factors(min_bounds: np.ndarray, max_bounds: np.ndarray) -> np.ndarray:
+    """
+    Compute denormalization factors for derivatives.
+    
+    For a state normalized to [-1, 1] as: s_norm = 2*(s_raw - min)/(max-min) - 1
+    The derivative scaling is: ds_norm/dt = 2/(max-min) * ds_raw/dt
+    To denormalize: ds_raw/dt = (max-min)/2 * ds_norm/dt
+    
+    Returns:
+        denorm_factors: array of shape (state_dim,) with (max-min)/2 for each state
+    """
+    return (max_bounds - min_bounds) / 2.0
+
+
+def normalize_state(state: np.ndarray, min_bounds: np.ndarray, max_bounds: np.ndarray) -> np.ndarray:
+    """
+    Normalize state from raw values to [-1, 1] range.
+    
+    Formula: normalized = 2 * (value - min) / (max - min) - 1
+    
+    Args:
+        state: raw state values, shape (..., state_dim)
+        min_bounds: minimum bounds, shape (state_dim,)
+        max_bounds: maximum bounds, shape (state_dim,)
+    
+    Returns:
+        normalized state in [-1, 1] range
+    """
+    return 2.0 * (state - min_bounds) / (max_bounds - min_bounds) - 1.0
+
+
+def denormalize_derivative(derivative: np.ndarray, denorm_factors: np.ndarray) -> np.ndarray:
+    """
+    Denormalize derivative from normalized space to raw space.
+    
+    Converts ds_norm/dt (change in normalized state) to ds_raw/dt.
+    
+    Args:
+        derivative: normalized derivative, shape (..., state_dim)
+        denorm_factors: (max-min)/2 for each state, shape (state_dim,)
+    
+    Returns:
+        raw derivative in same units as raw state changes
+    """
+    return derivative * denorm_factors
+
+
 def load_config(config_path: str) -> Dict:
     """Load training configuration from YAML file."""
     with open(config_path, 'r') as f:
@@ -45,19 +130,7 @@ def load_config(config_path: str) -> Dict:
 
 
 def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
-    """
-    Load trajectory data from CSV and prepare training/validation/test sets.
-    
-    Data loading strategy:
-    - Read CSV and group by trajectory_id
-    - Extract H-step sequences from each trajectory
-    - Bias sampling toward early steps (step < 500) where most action happens
-    - Normalize states if configured
-    - Split into train/val/test sets
-    
-    Returns:
-        Tuple of (train_loader, val_loader, test_loader) ready for training
-    """
+    """Load trajectory data from CSV and prepare training/validation/test sets."""
     
     import pandas as pd
     import numpy as np
@@ -81,21 +154,18 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     action_cols = [f'a_t_{i}' for i in range(action_dim)]
     next_state_cols = [f's_t+1_{i}' for i in state_indices]
     
-    # Compute state normalization statistics (on full dataset)
-    if normalize:
-        # Extract raw data with unit conversions
-        raw_states = df[state_cols].values.copy()
-        raw_states[:, 2] = raw_states[:, 2] / 3.6  # Convert airspeed km/h → m/s
-        state_mean = raw_states.mean(axis=0)
-        state_std = raw_states.std(axis=0) + 1e-8
-        print(f"State normalization: mean={state_mean[:3]}..., std={state_std[:3]}...")
-    else:
-        state_mean = np.zeros(state_dim)
-        state_std = np.ones(state_dim)
+    # Extract bounds for normalization (from config)
+    min_bounds, max_bounds = extract_bounds_from_config(config)
+    denorm_factors = compute_denorm_factors(min_bounds, max_bounds)
+    
+    print(f"\nState bounds loaded from config:")
+    print(f"  Min: {min_bounds}")
+    print(f"  Max: {max_bounds}")
+    print(f"  Denorm factors: {denorm_factors}")
+    
     
     # Extract sequences from each trajectory
-    trajectory_sequences_by_traj = {}  # Track sequences per trajectory for proper splitting
-    trajectory_sequences = []  # Flat list for backward compatibility
+    trajectory_sequences_by_traj = {}
     
     for traj_id, group in df.groupby('trajectory_id'):
         group = group.sort_values('step_id').reset_index(drop=True)
@@ -110,35 +180,29 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
         next_states[:, 2] = next_states[:, 2] / 3.6
         
         num_steps = len(states)
-        traj_sequences = []  # Sequences from this trajectory
+        traj_sequences = []
         
-        # Extract ALL sliding windows of length H (no step-based filtering)
-        # With progressive targets, all steps are dynamically interesting
         for start_idx in range(num_steps - horizon):
             seq_states = states[start_idx:start_idx + horizon]
             seq_actions = actions[start_idx:start_idx + horizon]
             seq_next_states = next_states[start_idx:start_idx + horizon]
             
-            # Normalize if configured
             if normalize:
-                seq_states = (seq_states - state_mean) / state_std
-                seq_next_states = (seq_next_states - state_mean) / state_std
+                seq_states = normalize_state(seq_states, min_bounds, max_bounds)
+                seq_next_states = normalize_state(seq_next_states, min_bounds, max_bounds)
             
-            seq_dict = {
+            traj_sequences.append({
                 'initial_state': seq_states[0].copy(),
                 'actions': seq_actions.copy(),
                 'states': seq_next_states.copy(),
-            }
-            trajectory_sequences.append(seq_dict)
-            traj_sequences.append(seq_dict)
+            })
         
         trajectory_sequences_by_traj[traj_id] = traj_sequences
-        print(f"Trajectory {traj_id}: Extracted {len(traj_sequences)} sliding windows of length {horizon}")
     
-    # Train/val/test split: 70% train, 15% val, 15% test
-    # Perform split at trajectory level to keep sequences from same trajectory together
     trajectories = sorted(list(df['trajectory_id'].unique()))
-    np.random.shuffle(trajectories)  # Shuffle trajectory order for random split
+    random_seed = config['data'].get('random_seed', 42)
+    np.random.seed(random_seed)
+    np.random.shuffle(trajectories)
     
     n_traj_train = int(len(trajectories) * config['data']['train_fraction'])
     n_traj_val = int(len(trajectories) * config['data']['val_fraction'])
@@ -213,7 +277,7 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
         collate_fn=TrajectoryDataset._collate_fn
     )
     
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader, test_loader, denorm_factors, min_bounds
 
 
 def initialize_models(config: Dict, device: torch.device) -> Tuple[PhysicsAugmented, HybridDynamicsModel]:
@@ -395,7 +459,9 @@ def main(resume_checkpoint: Optional[str] = None):
     
     # Load trajectory data from CSV
     csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_progressive_noatmo.csv"
-    train_loader, val_loader, test_loader = load_trajectory_data(str(csv_path), config)
+    train_loader, val_loader, test_loader, denorm_factors, min_bounds = load_trajectory_data(str(csv_path), config)
+    denorm_factors_torch = torch.tensor(denorm_factors, dtype=torch.float32, device=device)
+    min_bounds_torch = torch.tensor(min_bounds, dtype=torch.float32, device=device)
     
     # Extract training hyperparameters
     train_config = config['training']
@@ -447,7 +513,7 @@ def main(resume_checkpoint: Optional[str] = None):
     print("\nTraining Loop:")
     print(f"  • Epochs: {num_epochs}")
     print(f"  • Batch size: {batch_size}")
-    print(f"  • Learning rate: {train_config['learning_rate']}")
+    print(f"  • Learning rate: {aphynity_config['tau_1']}")
     print(f"  • Grad clipping: {train_config['grad_clip_norm']}")
     
     print("\nAPHYNITY Objective:")
@@ -502,9 +568,8 @@ def main(resume_checkpoint: Optional[str] = None):
 ## Training Hyperparameters
 
 **Learning:**
-- Learning Rate: {train_config['learning_rate']}
-- Init Std Dev: {train_config.get('init_std', 0.001)}
-- Optimizer: {train_config.get('optimizer', 'adam')}
+- Learning Rate: {aphynity_config['tau_1']} (from aphynity.tau_1)
+- Optimizer: Adam
 - Gradient Clip Norm: {train_config.get('grad_clip_norm', 1.0)}
 
 **Scheduling:**
@@ -565,7 +630,9 @@ def main(resume_checkpoint: Optional[str] = None):
                 ode_method=config['integration']['method'],
                 ode_rtol=config['integration']['rtol'],
                 ode_atol=config['integration']['atol'],
-                dt=config['integration']['dt']
+                dt=config['integration']['dt'],
+                denorm_factors=denorm_factors_torch if config['data']['normalize'] else None,
+                min_bounds=min_bounds_torch if config['data']['normalize'] else None
             )
             
             # Accumulate metrics for epoch-level statistics
@@ -669,7 +736,9 @@ def main(resume_checkpoint: Optional[str] = None):
                     current_state = batch_initial
                     
                     # Create ODE wrapper once per batch
-                    ode_module = HybridDynamicsODE(hybrid_model, device).to(device)
+                    ode_module = HybridDynamicsODE(hybrid_model, device, 
+                                                  denorm_factors=denorm_factors_torch if config['data']['normalize'] else None,
+                                                  min_bounds=min_bounds_torch if config['data']['normalize'] else None).to(device)
                     
                     for step in range(horizon):
                         action = batch_actions[:, step, :]
@@ -690,7 +759,17 @@ def main(resume_checkpoint: Optional[str] = None):
                         current_state = next_state
                     
                     predicted_trajectory = torch.stack(predicted_states, dim=1)
-                    prediction_error = predicted_trajectory - batch_states
+                    
+                    # Denormalize predictions and ground truth to raw space (same as training)
+                    # This ensures validation loss is computed in raw physical space
+                    if config['data']['normalize']:
+                        predicted_trajectory_raw = (predicted_trajectory + 1.0) * denorm_factors_torch + min_bounds_torch
+                        batch_states_raw = (batch_states + 1.0) * denorm_factors_torch + min_bounds_torch
+                    else:
+                        predicted_trajectory_raw = predicted_trajectory
+                        batch_states_raw = batch_states
+                    
+                    prediction_error = predicted_trajectory_raw - batch_states_raw
                     trajectory_loss = torch.norm(prediction_error, p=2, dim=2).mean()
                     regularization_loss = torch.stack(residual_norms).mean()
                     

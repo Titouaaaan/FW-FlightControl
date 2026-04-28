@@ -25,24 +25,88 @@ class HybridDynamicsODE(nn.Module):
     This module wraps the hybrid model (physics prior + residual network)
     to provide proper gradient flow through ODE integration.
     
+    When training with normalized states:
+    - Physics prior ALWAYS operates on raw physical units (denormalize state first)
+    - Residual network operates on normalized states
+    - Combined derivatives are in raw space (for ODE integration)
+    
     Important: Create this once per epoch, not per step, to maintain
     consistent gradient tracking through the computation graph.
     """
-    def __init__(self, hybrid_model: nn.Module, device: torch.device = torch.device('cpu')):
+    def __init__(self, hybrid_model: nn.Module, device: torch.device = torch.device('cpu'),
+                 denorm_factors: torch.Tensor = None, min_bounds: torch.Tensor = None):
         super().__init__()
         self.model = hybrid_model
         self.device = device
         self.current_action = None
+        # Denormalization factors for residual output: (max - min) / 2 per state
+        self.denorm_factors = denorm_factors
+        # Minimum bounds for state denormalization: needed to convert [-1,1] states back to raw
+        self.min_bounds = min_bounds
     
     def set_action(self, action: torch.Tensor):
-        """Set the action for the next integration step."""
         self.current_action = action
     
+    def _denormalize_state(self, state_norm: torch.Tensor) -> torch.Tensor:
+        """Convert normalized state from [-1, 1] back to raw physical units.
+        
+        If normalized = 2*(raw - min)/(max - min) - 1, then:
+        raw = (normalized + 1) * (max - min) / 2 + min
+            = (normalized + 1) * denorm_factors + min_bounds
+        
+        Note: ODE integration can produce states slightly outside [-1, 1] due to 
+        intermediate steps. We clamp to [-1, 1] to keep denormalized values in valid range.
+        """
+        # Clamp normalized state to [-1, 1] to prevent out-of-bounds denormalization
+        state_norm_clamped = torch.clamp(state_norm, -1.0, 1.0)
+        
+        state_raw = (state_norm_clamped + 1.0) * self.denorm_factors + self.min_bounds
+        
+        return state_raw
+    
     def forward(self, t: torch.Tensor, state_t: torch.Tensor) -> torch.Tensor:
-        """Compute state derivative: ds/dt = F_p(s, u) + F_a(s, u)."""
+        """Compute state derivative: ds/dt = F_p(s_raw, u) + F_a(s_norm, u).
+        
+        CRITICAL: state_t is in normalized space ([-1, 1]) if normalize=true.
+        odeint expects ds/dt to be in the SAME space as state_t.
+        
+        When normalize=true:
+        - state_t comes in normalized [-1, 1]
+        - Denormalize to raw space to call physics prior
+        - Get ds_raw/dt from both prior and residual (combine in raw space)
+        - Convert ds_raw/dt back to ds_norm/dt for ODE integration
+        - Return ds_norm/dt so ODE can compute: s_norm(t+dt) = s_norm(t) + ds_norm/dt * dt
+        """
         if self.current_action is None:
             raise RuntimeError("Action not set before forward pass")
-        return self.model(state_t, self.current_action)
+        
+        # When no normalization, state is raw, return raw derivatives
+        if self.denorm_factors is None:
+            hybrid_deriv = self.model(state_t, self.current_action)
+            return hybrid_deriv
+        
+        # When using normalization: state_t is normalized, must return normalized derivatives
+        # Denormalize state from [-1, 1] to raw physical units for physics prior
+        state_raw = self._denormalize_state(state_t)
+        
+        # Physics prior operates on raw states (expects physical units)
+        prior_deriv = self.model.physics_prior(state_raw, self.current_action)
+        
+        # Residual network operates on normalized states
+        residual_output = self.model.residual_network(state_t, self.current_action)
+        
+        # Denormalize residual output: multiply by (max - min) / 2 to convert to raw space
+        residual_output_denorm = residual_output * self.denorm_factors
+        
+        # Combine derivatives in raw space
+        hybrid_deriv_raw = prior_deriv + residual_output_denorm
+        
+        # Convert back to normalized space for ODE integration
+        # If s_norm = 2*(s_raw - min)/(max - min) - 1, then
+        # ds_norm/dt = 2/(max - min) * ds_raw/dt = ds_raw/dt / denorm_factors
+        hybrid_deriv_norm = hybrid_deriv_raw / self.denorm_factors
+        
+        return hybrid_deriv_norm
 
 
 def train_aphynity_epoch(
@@ -56,7 +120,9 @@ def train_aphynity_epoch(
     ode_method: str = 'dopri5',
     ode_rtol: float = 1e-4,
     ode_atol: float = 1e-5,
-    dt: float = 0.01
+    dt: float = 0.01,
+    denorm_factors: torch.Tensor = None,
+    min_bounds: torch.Tensor = None
 ) -> Dict:
     """
     Train residual network using APHYNITY (Augmented Physics with Newton's method).
@@ -97,11 +163,7 @@ def train_aphynity_epoch(
     
     batch_size = initial_states.shape[0]
     horizon = actions.shape[1]
-    
-    # Ensure model is on correct device (handles GPU/CPU)
     hybrid_model = hybrid_model.to(device)
-    
-    # Clear gradients from previous iteration
     optimizer.zero_grad()
     
     # ========================================================================
@@ -120,7 +182,14 @@ def train_aphynity_epoch(
             
             # Compute residual output at this step for regularization term
             residual_output = hybrid_model.residual_network(current_state, action)
-            residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
+            
+            # Denormalize residual to raw space before penalizing (if using normalization)
+            # This ensures regularization penalty is consistent with trajectory loss (both in raw space)
+            if denorm_factors is not None:
+                residual_output_raw = residual_output * denorm_factors
+                residual_norm = torch.norm(residual_output_raw, p=2, dim=1).mean()
+            else:
+                residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
             residual_norms.append(residual_norm)
             
             # Check for NaN/Inf
@@ -142,14 +211,21 @@ def train_aphynity_epoch(
     
     else:
         # Use torchdiffeq for other ODE methods (RK4, dopri8, etc.)
-        ode_module = HybridDynamicsODE(hybrid_model, device).to(device)
+        ode_module = HybridDynamicsODE(hybrid_model, device, denorm_factors=denorm_factors, min_bounds=min_bounds).to(device)
         
         for step in range(horizon):
             action = actions[:, step, :]  # (batch_size, 3)
             
             # Compute residual output at this step for regularization term
             residual_output = hybrid_model.residual_network(current_state, action)
-            residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
+            
+            # Denormalize residual to raw space before penalizing (if using normalization)
+            # This ensures regularization penalty is consistent with trajectory loss (both in raw space)
+            if denorm_factors is not None:
+                residual_output_raw = residual_output * denorm_factors
+                residual_norm = torch.norm(residual_output_raw, p=2, dim=1).mean()
+            else:
+                residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
             residual_norms.append(residual_norm)
             
             # Check for NaN/Inf
@@ -181,9 +257,20 @@ def train_aphynity_epoch(
     # LOSS COMPUTATION
     # ========================================================================
     
-    # Trajectory loss: multi-step prediction error across all steps
+    # Denormalize predictions and ground truth to raw space if using normalization
+    # This ensures loss is computed in raw (physical) space for meaningful values
+    if denorm_factors is not None:
+        # predicted_trajectory and ground_truth_states are in normalized space
+        # Denormalize: raw = (normalized + 1) * denorm_factors + min_bounds
+        predicted_trajectory_raw = (predicted_trajectory + 1.0) * denorm_factors + min_bounds
+        ground_truth_states_raw = (ground_truth_states + 1.0) * denorm_factors + min_bounds
+    else:
+        predicted_trajectory_raw = predicted_trajectory
+        ground_truth_states_raw = ground_truth_states
+    
+    # Trajectory loss: multi-step prediction error across all steps (in raw space)
     # We compute the L2 distance for each (sample, step) pair
-    prediction_error = predicted_trajectory - ground_truth_states  # (batch, H, 8)
+    prediction_error = predicted_trajectory_raw - ground_truth_states_raw  # (batch, H, 8)
     trajectory_loss = torch.norm(prediction_error, p=2, dim=2).mean()  # Average L2 norm
     
     # Check for NaN in trajectory loss
