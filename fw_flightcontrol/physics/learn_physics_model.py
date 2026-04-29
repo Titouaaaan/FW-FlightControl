@@ -89,6 +89,35 @@ def compute_denorm_factors(min_bounds: np.ndarray, max_bounds: np.ndarray) -> np
     return (max_bounds - min_bounds) / 2.0
 
 
+def compute_actual_scales(df: pd.DataFrame) -> np.ndarray:
+    """
+    Compute actual per-state scales from training data (mean absolute value).
+    
+    These reflect what's actually in the data, not config bounds.
+    Important for per-state loss scaling: states with small actual variation
+    get amplified gradients, states with large variation get dampened gradients.
+    
+    Args:
+        df: DataFrame with state columns
+    
+    Returns:
+        actual_scales: array of shape (state_dim,) with mean |value| for each state
+    """
+    state_indices = [0, 1, 2, 3, 4, 5, 8, 9]
+    state_cols = [f's_t_{i}' for i in state_indices]
+    
+    actual_scales = []
+    for col in state_cols:
+        values = df[col].values.copy()
+        # Convert airspeed from km/h to m/s
+        if col == 's_t_2':
+            values = values / 3.6
+        mean_abs = np.mean(np.abs(values))
+        actual_scales.append(mean_abs)
+    
+    return np.array(actual_scales, dtype=np.float32)
+
+
 def normalize_state(state: np.ndarray, min_bounds: np.ndarray, max_bounds: np.ndarray) -> np.ndarray:
     """
     Normalize state from raw values to [-1, 1] range.
@@ -463,6 +492,21 @@ def main(resume_checkpoint: Optional[str] = None):
     denorm_factors_torch = torch.tensor(denorm_factors, dtype=torch.float32, device=device)
     min_bounds_torch = torch.tensor(min_bounds, dtype=torch.float32, device=device)
     
+    # Compute actual scales from data for per-state loss scaling (if enabled)
+    # These reflect what's actually in the data, not config bounds
+    use_actual_scales = config['data'].get('per_state_loss_norm', False)
+    if use_actual_scales:
+        print("\n  Computing actual per-state scales from training data...")
+        df = pd.read_csv(str(csv_path))
+        actual_scales = compute_actual_scales(df)
+        per_state_scales_torch = torch.tensor(actual_scales, dtype=torch.float32, device=device)
+        print(f"  Actual scales (mean |gt|): {actual_scales}")
+        print(f"  Config denorm factors: {denorm_factors}")
+        print(f"  Ratio (under-weighting): {denorm_factors / actual_scales}")
+    else:
+        # If not using per-state scaling, still pass denorm_factors for denorm/renorm in ODE
+        per_state_scales_torch = None
+    
     # Extract training hyperparameters
     train_config = config['training']
     aphynity_config = config['aphynity']
@@ -521,9 +565,10 @@ def main(resume_checkpoint: Optional[str] = None):
     print(f"  • Initial λ: {lambda_current}")
     print(f"  • λ step size (τ_2): {tau_2}")
     print(f"  • λ bounds: [{lambda_min}, {lambda_max}]")
-    
-    # Training tracking - restored from checkpoint or initialized fresh
-    from training_objective import train_aphynity_epoch
+
+    if config['data'].get('per_state_loss_norm', False):
+        print("\nPer-state loss normalization (half-range scales):")
+        print(f"  • Scales: {denorm_factors}")
     
     if resume_state:
         train_history = resume_state['train_history']
@@ -632,7 +677,8 @@ def main(resume_checkpoint: Optional[str] = None):
                 ode_atol=config['integration']['atol'],
                 dt=config['integration']['dt'],
                 denorm_factors=denorm_factors_torch if config['data']['normalize'] else None,
-                min_bounds=min_bounds_torch if config['data']['normalize'] else None
+                min_bounds=min_bounds_torch if config['data']['normalize'] else None,
+                per_state_scales=per_state_scales_torch  # Use actual scales when per_state_loss_norm enabled
             )
             
             # Accumulate metrics for epoch-level statistics
@@ -743,18 +789,38 @@ def main(resume_checkpoint: Optional[str] = None):
                     for step in range(horizon):
                         action = batch_actions[:, step, :]
                         residual_output = hybrid_model.residual_network(current_state, action)
-                        residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
+                        # Denormalize residual to raw space before penalizing (if using normalization)
+                        # This ensures validation regularization loss matches training computation
+                        if config['data']['normalize']:
+                            residual_output_raw = residual_output * denorm_factors_torch
+                            residual_norm = torch.norm(residual_output_raw, p=2, dim=1).mean()
+                        else:
+                            residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
                         residual_norms.append(residual_norm)
                         
-                        # Set action and integrate using stable wrapper
+                        # Denormalize current state to raw space for ODE integration
+                        if config['data']['normalize']:
+                            current_state_raw = (current_state + 1.0) * denorm_factors_torch + min_bounds_torch
+                        else:
+                            current_state_raw = current_state
+                        
+                        # Set action and integrate in raw space
                         ode_module.set_action(action)
-                        t_eval = torch.tensor([0.0, 0.01], dtype=current_state.dtype, device=device)
-                        solution = odeint(ode_module, current_state, t_eval, 
+                        t_eval = torch.tensor([0.0, config['integration']['dt']], dtype=current_state_raw.dtype, device=device)
+                        solution = odeint(ode_module, current_state_raw, t_eval, 
                                         method=config['integration']['method'],
                                         rtol=config['integration']['rtol'],
                                         atol=config['integration']['atol'])
-                        next_state = solution[-1]
-                        next_state = next_state.clamp(-100.0, 100.0)  # Clamp like training
+                        next_state_raw = solution[-1]
+                        # Clamp to valid physical bounds
+                        next_state_raw = next_state_raw.clamp(-1000.0, 1000.0)
+                        
+                        # Renormalize to normalized space
+                        if config['data']['normalize']:
+                            next_state = 2.0 * (next_state_raw - min_bounds_torch) / (2.0 * denorm_factors_torch) - 1.0
+                        else:
+                            next_state = next_state_raw
+                        
                         predicted_states.append(next_state)
                         current_state = next_state
                     
@@ -770,6 +836,8 @@ def main(resume_checkpoint: Optional[str] = None):
                         batch_states_raw = batch_states
                     
                     prediction_error = predicted_trajectory_raw - batch_states_raw
+                    if config['data'].get('per_state_loss_norm', False):
+                        prediction_error = prediction_error / (per_state_scales_torch ** 2)  # Use actual scales with inverse scaling
                     trajectory_loss = torch.norm(prediction_error, p=2, dim=2).mean()
                     regularization_loss = torch.stack(residual_norms).mean()
                     

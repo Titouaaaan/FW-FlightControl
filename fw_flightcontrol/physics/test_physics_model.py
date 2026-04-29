@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Dict, Tuple
 import numpy as np
 from tqdm import tqdm
+import pandas as pd
 
 # Add project to path
 sys.path.insert(0, '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl')
@@ -78,6 +79,35 @@ def compute_denorm_factors(min_bounds: np.ndarray, max_bounds: np.ndarray) -> np
         denorm_factors: array of shape (state_dim,) with (max-min)/2 for each state
     """
     return (max_bounds - min_bounds) / 2.0
+
+
+def compute_actual_scales(df: pd.DataFrame) -> np.ndarray:
+    """
+    Compute actual per-state scales from training data (mean absolute value).
+    
+    These reflect what's actually in the data, not config bounds.
+    Important for per-state loss scaling: states with small actual variation
+    get amplified gradients, states with large variation get dampened gradients.
+    
+    Args:
+        df: DataFrame with state columns
+    
+    Returns:
+        actual_scales: array of shape (state_dim,) with mean |value| for each state
+    """
+    state_indices = [0, 1, 2, 3, 4, 5, 8, 9]
+    state_cols = [f's_t_{i}' for i in state_indices]
+    
+    actual_scales = []
+    for col in state_cols:
+        values = df[col].values.copy()
+        # Convert airspeed from km/h to m/s
+        if col == 's_t_2':
+            values = values / 3.6
+        mean_abs = np.mean(np.abs(values))
+        actual_scales.append(mean_abs)
+    
+    return np.array(actual_scales, dtype=np.float32)
 
 
 def normalize_state(state: np.ndarray, min_bounds: np.ndarray, max_bounds: np.ndarray) -> np.ndarray:
@@ -230,9 +260,17 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     return make_loader(train_seqs), make_loader(val_seqs), make_loader(test_seqs), denorm_factors, min_bounds
 
 
-def initialize_models(config: Dict, checkpoint_path: str, device: torch.device) -> HybridDynamicsModel:
+def initialize_models(config: Dict, checkpoint_path: str, device: torch.device,
+                      with_prior: bool = True, with_residual: bool = True) -> HybridDynamicsModel:
     """
     Build the hybrid model and load residual network weights from checkpoint.
+    
+    Args:
+        config: Configuration dictionary
+        checkpoint_path: Path to model weights checkpoint
+        device: Device to load model on
+        with_prior: Whether to include physics prior (ablation)
+        with_residual: Whether to include learned residual (ablation)
     The checkpoint may be a full training checkpoint (dict) or a bare state_dict.
     """
     print("\n" + "="*60)
@@ -273,8 +311,8 @@ def initialize_models(config: Dict, checkpoint_path: str, device: torch.device) 
     hybrid_model = HybridDynamicsModel(
         physics_prior=physics_prior,
         residual_network=residual_network,
-        with_prior=True,
-        with_residual=True,
+        with_prior=with_prior,
+        with_residual=with_residual,
         integration_method=integration_method,
     )
     hybrid_model = hybrid_model.to(device)
@@ -286,7 +324,8 @@ def initialize_models(config: Dict, checkpoint_path: str, device: torch.device) 
 
 @torch.no_grad()
 def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: torch.device,
-             split_name: str = "eval", denorm_factors: torch.Tensor = None, min_bounds: torch.Tensor = None) -> Dict:
+             split_name: str = "eval", denorm_factors: torch.Tensor = None, min_bounds: torch.Tensor = None,
+             per_state_scales: torch.Tensor = None) -> Dict:
     """Evaluate model on a dataset split, computing compounded errors."""
     from torchdiffeq import odeint
 
@@ -297,6 +336,13 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
     dt         = config['integration']['dt']
     lambda_val = config['aphynity'].get('lambda_init', 1.0)
     state_dim  = config['network']['state_dim']
+
+    # denorm_factors and min_bounds are already torch tensors on the correct device,
+    # passed in from main(). Just alias them for clarity throughout this function.
+    # denorm_factors is non-None when normalize=True OR per_state_loss_norm=True.
+    # min_bounds is non-None only when normalize=True.
+    denorm_factors_torch = denorm_factors
+    min_bounds_torch = min_bounds
 
     # Human-readable names for the 8 state components
     # State indices kept from CSV: [0,1,2,3,4,5,8,9]
@@ -343,27 +389,44 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
         residual_norms   = []
         current_state    = batch_initial
 
-        ode_module = HybridDynamicsODE(hybrid_model, device, denorm_factors=denorm_factors, min_bounds=min_bounds).to(device)
+        # Only pass denorm/min_bounds to the ODE when normalize=True — the ODE uses
+        # these to convert between normalized and raw space internally. When normalize=False
+        # the ODE already operates in raw space and must not receive these tensors.
+        ode_module = HybridDynamicsODE(
+            hybrid_model, device,
+            denorm_factors=denorm_factors_torch if config['data']['normalize'] else None,
+            min_bounds=min_bounds_torch if config['data']['normalize'] else None,
+        ).to(device)
 
         for step in range(horizon):
             action = batch_actions[:, step, :]
 
-            residual_output = hybrid_model.residual_network(current_state, action)
-            
-            # Denormalize residual to raw space before penalizing (if using normalization)
-            # This ensures regularization penalty is consistent with trajectory loss (both in raw space)
-            if config['data']['normalize']:
-                residual_output_raw = residual_output * denorm_factors
-                residual_norm = torch.norm(residual_output_raw, p=2, dim=1).mean()
-            else:
-                residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
-            residual_norms.append(residual_norm)
+            # Only compute residual regularization if model uses residual (modular ablation)
+            if hybrid_model.with_residual:
+                residual_output = hybrid_model.residual_network(current_state, action)
+                
+                # Denormalize residual to raw space before penalizing (if using normalization)
+                # This ensures regularization penalty is consistent with trajectory loss (both in raw space)
+                if config['data']['normalize']:
+                    residual_output_raw = residual_output * denorm_factors_torch
+                    residual_norm = torch.norm(residual_output_raw, p=2, dim=1).mean()
+                else:
+                    residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
+                residual_norms.append(residual_norm)
 
             ode_module.set_action(action)
             t_eval   = torch.tensor([0.0, dt], dtype=current_state.dtype, device=device)
-            solution = odeint(ode_module, current_state, t_eval,
+            if config['data']['normalize']:
+                current_state_raw = (current_state + 1.0) * denorm_factors_torch + min_bounds_torch
+            else:
+                current_state_raw = current_state
+            solution = odeint(ode_module, current_state_raw, t_eval,
                               method=ode_method, rtol=ode_rtol, atol=ode_atol)
-            next_state = solution[-1].clamp(-100.0, 100.0)
+            next_state_raw = solution[-1].clamp(-100.0, 100.0)
+            if config['data']['normalize']:
+                next_state = 2.0 * (next_state_raw - min_bounds_torch) / (2.0 * denorm_factors_torch) - 1.0
+            else:
+                next_state = next_state_raw
             predicted_states.append(next_state)
             current_state = next_state
 
@@ -371,17 +434,29 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
         
         # Denormalize predictions and ground truth to raw space (same as training)
         if config['data']['normalize']:
-            predicted_trajectory_raw = (predicted_trajectory + 1.0) * denorm_factors + min_bounds
-            batch_states_raw = (batch_states + 1.0) * denorm_factors + min_bounds
+            predicted_trajectory_raw = (predicted_trajectory + 1.0) * denorm_factors_torch + min_bounds_torch
+            batch_states_raw = (batch_states + 1.0) * denorm_factors_torch + min_bounds_torch
         else:
             predicted_trajectory_raw = predicted_trajectory
             batch_states_raw = batch_states
         
         prediction_error = predicted_trajectory_raw - batch_states_raw
 
+        # Capture the raw-space error (physical units) BEFORE any loss scaling.
+        # This is used exclusively for the per-state reporting table (MAE/RMSE/rel err)
+        # so that those numbers are always interpretable regardless of the loss flags.
+        prediction_error_raw = prediction_error.detach()
+
+        # Apply per_state_loss_norm scaling only for the loss value itself, mirroring
+        # exactly what the training objective does.
+        # Only applied if per_state_scales was computed and passed in
+        if per_state_scales is not None:
+            prediction_error = prediction_error / (per_state_scales ** 2)
+
         # --- Compounded trajectory loss (what training optimizes) ---
         traj_loss  = torch.norm(prediction_error, p=2, dim=2).mean().item()
-        reg_loss   = torch.stack(residual_norms).mean().item()
+        # Regularization loss is only non-zero if model uses residual (modular ablation)
+        reg_loss   = torch.stack(residual_norms).mean().item() if residual_norms else 0.0
         total_loss = reg_loss + lambda_val * traj_loss
 
         all_traj_losses.append(traj_loss)
@@ -389,8 +464,10 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
         all_total_losses.append(total_loss)
 
         # --- Per-state error accumulation (compounded errors from full trajectory) ---
-        err_np   = prediction_error.cpu().numpy()        # (B, H, state_dim)
-        gt_np    = batch_states_raw.cpu().numpy()        # (B, H, state_dim) now in raw space
+        # Always use raw-space error so MAE/RMSE are in physical units (rad, m/s, …)
+        # regardless of normalize / per_state_loss_norm flags.
+        err_np   = prediction_error_raw.cpu().numpy()    # (B, H, state_dim) — raw space
+        gt_np    = batch_states_raw.cpu().numpy()        # (B, H, state_dim) — raw space
         err_flat = err_np.reshape(-1, state_dim)         # (B*H, state_dim)
         gt_flat  = gt_np.reshape(-1, state_dim)          # (B*H, state_dim)
         per_state_abs_err_sum += np.abs(err_flat).sum(axis=0)
@@ -398,7 +475,7 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
         per_state_abs_gt_sum  += np.abs(gt_flat).sum(axis=0)
         per_state_count       += err_flat.shape[0]
 
-        # --- Per-horizon compounded error accumulation ---
+        # --- Per-horizon compounded error accumulation (also raw space) ---
         for h in horizon_steps:
             if h-1 < err_np.shape[1]:
                 per_horizon_err[h].append(err_np[:, h-1, :])  # (B, state_dim)
@@ -490,6 +567,10 @@ def main():
                         help='Path to .pt checkpoint (training checkpoint or final_model.pt)')
     parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'],
                         help='Which data split to evaluate on (default: test)')
+    parser.add_argument('--with-prior', type=lambda x: x.lower() in ('true', '1', 'yes'), default=True,
+                        help='Include physics prior in model (default: True)')
+    parser.add_argument('--with-residual', type=lambda x: x.lower() in ('true', '1', 'yes'), default=True,
+                        help='Include learned residual in model (default: True)')
     args = parser.parse_args()
 
     print("\n" + "="*60)
@@ -497,6 +578,8 @@ def main():
     print("="*60)
     print(f"  Checkpoint : {args.checkpoint}")
     print(f"  Split      : {args.split}")
+    print(f"  Physics prior : {args.with_prior}")
+    print(f"  Residual network : {args.with_residual}")
 
     # Load config from the physics directory (same as training script)
     config_path = Path(__file__).parent / 'training_params.yaml'
@@ -511,17 +594,37 @@ def main():
     train_loader, val_loader, test_loader, denorm_factors, min_bounds = load_trajectory_data(str(csv_path), config)
     denorm_factors_torch = torch.tensor(denorm_factors, dtype=torch.float32, device=device)
     min_bounds_torch = torch.tensor(min_bounds, dtype=torch.float32, device=device)
+    
+    # Compute actual scales from data ONLY if per-state loss scaling is enabled
+    # These are applied differently from denorm_factors:
+    # - denorm_factors: used for state denormalization in ODE integrator (when normalize=true)
+    # - per_state_scales: used for loss computation scaling (only if per_state_loss_norm=true)
+    per_state_scales_torch = None
+    if config['data'].get('per_state_loss_norm', False):
+        print("\n  Computing actual per-state scales from training data (for consistent evaluation)...")
+        df = pd.read_csv(str(csv_path))
+        actual_scales = compute_actual_scales(df)
+        per_state_scales_torch = torch.tensor(actual_scales, dtype=torch.float32, device=device)
+        print(f"  Using actual scales for loss computation: {actual_scales}")
+    else:
+        print("\n  per_state_loss_norm disabled - evaluating with raw loss (no scaling)")
 
     loader_map = {'train': train_loader, 'val': val_loader, 'test': test_loader}
     target_loader = loader_map[args.split]
 
     # Build model and load weights
-    hybrid_model = initialize_models(config, args.checkpoint, device)
+    hybrid_model = initialize_models(config, args.checkpoint, device,
+                                     with_prior=args.with_prior,
+                                     with_residual=args.with_residual)
 
     # Run evaluation
-    evaluate(hybrid_model, target_loader, config, device, split_name=args.split, 
-             denorm_factors=denorm_factors_torch if config['data']['normalize'] else None,
-             min_bounds=min_bounds_torch if config['data']['normalize'] else None)
+    # denorm_factors is always passed — it is needed for ODE state denormalization when normalize=True.
+    # min_bounds is only needed when normalize=True (state de/renorm in ODE).
+    # per_state_scales is passed when per_state_loss_norm was enabled during training.
+    evaluate(hybrid_model, target_loader, config, device, split_name=args.split,
+             denorm_factors=denorm_factors_torch,
+             min_bounds=min_bounds_torch if config['data']['normalize'] else None,
+             per_state_scales=per_state_scales_torch)
 
 '''
 run script like this for exmaple:
