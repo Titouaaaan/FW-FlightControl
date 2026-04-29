@@ -54,14 +54,14 @@ aphynity:
                           # Passed to optimizer, NOT applied as gradient scaling
   # Lagrange multiplier initialization and update
   lambda_init: 1.0        # Initial λ (balanced: reg=1.0, trajectory_loss weighted by λ)
-  tau_2: 0.1              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
+  tau_2: 0.005              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
                           # Conservative value; can increase to 1.0 after verifying numerical stability
   
   # Lagrange multiplier bounds
   # NOTE: Official APHYNITY has NO upper bound - lambda grows naturally
   # Setting to high value for safety (detects pathological loss explosion only)
-  lambda_max: 1000.0      # Effectively unbounded; grows naturally via dual ascent
-  lambda_min: 0.1         # Prevent numerical issues at very low values
+  lambda_max: 100000.0      
+  lambda_min: 0.01         # Prevent numerical issues at very low values
 
 
 # ============================================================================
@@ -94,7 +94,11 @@ data:
   # Data normalization (physics prior always works in raw space; this controls residual network)
   # false: residual learns in raw space, combines directly with physics prior
   # true: residual learns in normalized [-1,1] space, derivatives denormalized before combining
-  normalize: true
+  normalize: false
+
+  # Per-state loss normalization for trajectory loss
+  # When true, trajectory errors are scaled by per-state half-range (denorm_factors)
+  per_state_loss_norm: false
   
   # Sequence sampling
   random_seed: 42
@@ -145,10 +149,6 @@ state_bounds:
 regularization:
   # L2 weight decay on residual network
   weight_decay: 0.0
-  
-  # Early stopping patience (epochs without improvement)
-  early_stopping_patience: 20
-  early_stopping_metric: val_loss
 
 
 # ============================================================================
@@ -161,5 +161,5 @@ logging:
   
   # Output directories
   checkpoint_dir: ./checkpoints
-  checkpoint_subdirectory: exp_v0.6    # Subdirectory for this run (e.g., test1, test2, exp_v1)
+  checkpoint_subdirectory: exp_normalization_and_per_state_loss_penalty # per_state_norm_expv.0.8    
   log_dir: ./logs
