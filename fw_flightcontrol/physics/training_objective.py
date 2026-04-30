@@ -16,7 +16,9 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 from torchdiffeq import odeint
-from typing import Dict
+from typing import Dict, Optional
+
+from .utils import normalize_state_torch, denormalize_state_torch
 
 
 class HybridDynamicsODE(nn.Module):
@@ -34,38 +36,26 @@ class HybridDynamicsODE(nn.Module):
     consistent gradient tracking through the computation graph.
     """
     def __init__(self, hybrid_model: nn.Module, device: torch.device = torch.device('cpu'),
-                 denorm_factors: torch.Tensor = None, min_bounds: torch.Tensor = None):
+                 denorm_factors: torch.Tensor = None, min_bounds: torch.Tensor = None,
+                 norm_type: Optional[str] = None):
         super().__init__()
         self.model = hybrid_model
         self.device = device
         self.current_action = None
-        # Denormalization factors for residual output: (max - min) / 2 per state
-        self.denorm_factors = denorm_factors
-        # Minimum bounds for state denormalization: needed to convert [-1,1] states back to raw
-        self.min_bounds = min_bounds
+        self.denorm_factors = denorm_factors  # (max-min)/2 for bounds, std for data-driven
+        self.min_bounds = min_bounds          # min for bounds, mean for data-driven
+        self.norm_type = norm_type            # 'bounds_normalization' | 'data_driven_normalization' | None
     
     def set_action(self, action: torch.Tensor):
         self.current_action = action
     
     def _denormalize_state(self, state_norm: torch.Tensor) -> torch.Tensor:
-        """Convert normalized state from [-1, 1] back to raw physical units.
-        
-        If normalized = 2*(raw - min)/(max - min) - 1, then:
-        raw = (normalized + 1) * (max - min) / 2 + min
-            = (normalized + 1) * denorm_factors + min_bounds
-        """
-        state_raw = (state_norm + 1.0) * self.denorm_factors + self.min_bounds
-        return state_raw
-    
+        """Convert normalized state back to raw physical units."""
+        return denormalize_state_torch(state_norm, self.denorm_factors, self.min_bounds, self.norm_type)
+
     def _normalize_state(self, state_raw: torch.Tensor) -> torch.Tensor:
-        """Convert raw physical state back to normalized [-1, 1] space.
-        
-        If raw = (normalized + 1) * denorm_factors + min_bounds, then:
-        normalized = (raw - min_bounds) / denorm_factors - 1
-                   = 2 * (raw - min_bounds) / (max - min) - 1
-        """
-        state_norm = 2.0 * (state_raw - self.min_bounds) / (2.0 * self.denorm_factors) - 1.0
-        return state_norm
+        """Convert raw physical state to normalized space."""
+        return normalize_state_torch(state_raw, self.denorm_factors, self.min_bounds, self.norm_type)
     
     def forward(self, t: torch.Tensor, state_raw: torch.Tensor) -> torch.Tensor:
         """Compute state derivative: ds_raw/dt = F_p(s_raw, u) + F_a(s_norm(s_raw), u).
@@ -114,8 +104,8 @@ def train_aphynity_epoch(
     trajectory_batch: Dict,
     optimizer: Optimizer,
     lambda_current: float,
-    tau_1: float,
     tau_2: float,
+    grad_clip_norm: float = 1.0,
     device: torch.device = torch.device('cpu'),
     ode_method: str = 'dopri5',
     ode_rtol: float = 1e-4,
@@ -123,7 +113,8 @@ def train_aphynity_epoch(
     dt: float = 0.01,
     denorm_factors: torch.Tensor = None,
     min_bounds: torch.Tensor = None,
-    per_state_scales: torch.Tensor = None
+    per_state_scales: torch.Tensor = None,
+    norm_type: Optional[str] = None,
 ) -> Dict:
     """
     Train residual network using APHYNITY (Augmented Physics with Newton's method).
@@ -149,8 +140,8 @@ def train_aphynity_epoch(
             - 'states': (batch_size, H, 8) ground truth trajectory s_1...s_H
         optimizer: Configured for residual_network parameters only
         lambda_current: Current λ value (Lagrange multiplier for dual ascent)
-        tau_1: Gradient scaling factor (step size regularization). Applied as τ₁∇L before optimizer.step()
         tau_2: Step size for λ update
+        grad_clip_norm: Max gradient norm for clipping
         device: CPU or CUDA
     
     Returns:
@@ -177,15 +168,14 @@ def train_aphynity_epoch(
     
     # Use semi-implicit Euler if requested (custom method with gradient support)
     if ode_method == 'semi_implicit_euler':
-        ode_module = HybridDynamicsODE(hybrid_model, device, denorm_factors=denorm_factors, min_bounds=min_bounds).to(device)
+        ode_module = HybridDynamicsODE(hybrid_model, device, denorm_factors=denorm_factors, min_bounds=min_bounds, norm_type=norm_type).to(device)
         # Manual semi-implicit Euler loop preserves gradient flow through unrolled loop
         for step in range(horizon):
             action = actions[:, step, :]  # (batch_size, 3)
             
-            # For semi-implicit Euler, current_state starts in normalized space
-            # Denormalize to raw for physics integration
+            # current_state is in normalized space; denormalize to raw for ODE integration
             if denorm_factors is not None:
-                current_state_raw = (current_state + 1.0) * denorm_factors + min_bounds
+                current_state_raw = denormalize_state_torch(current_state, denorm_factors, min_bounds, norm_type)
             else:
                 current_state_raw = current_state
             
@@ -231,19 +221,19 @@ def train_aphynity_epoch(
             if torch.isnan(next_state_raw).any() or torch.isinf(next_state_raw).any():
                 raise ValueError(f"NaN/Inf after semi-implicit Euler integration at step {step}")
             
-            # Renormalize to normalized space for next iteration
+            # Renormalize raw state back to normalized space for next iteration
             if denorm_factors is not None:
-                next_state = 2.0 * (next_state_raw - min_bounds) / (2.0 * denorm_factors) - 1.0
+                next_state = normalize_state_torch(next_state_raw, denorm_factors, min_bounds, norm_type)
             else:
                 next_state = next_state_raw
-            
+
             predicted_states.append(next_state)
             current_state = next_state
-    
+
     else:
         # Use torchdiffeq for other ODE methods (RK4, dopri8, etc.)
         # ODE integration happens in RAW PHYSICAL SPACE
-        ode_module = HybridDynamicsODE(hybrid_model, device, denorm_factors=denorm_factors, min_bounds=min_bounds).to(device)
+        ode_module = HybridDynamicsODE(hybrid_model, device, denorm_factors=denorm_factors, min_bounds=min_bounds, norm_type=norm_type).to(device)
         
         for step in range(horizon):
             action = actions[:, step, :]  # (batch_size, 3)
@@ -265,9 +255,9 @@ def train_aphynity_epoch(
                 if torch.isnan(residual_norm) or torch.isinf(residual_norm):
                     raise ValueError(f"NaN/Inf in residual norm at step {step}")
             
-            # Denormalize current state to raw space for ODE integration
+            # current_state is in normalized space; denormalize to raw for ODE integration
             if denorm_factors is not None:
-                current_state_raw = (current_state + 1.0) * denorm_factors + min_bounds
+                current_state_raw = denormalize_state_torch(current_state, denorm_factors, min_bounds, norm_type)
             else:
                 current_state_raw = current_state
             
@@ -286,12 +276,12 @@ def train_aphynity_epoch(
             if torch.isnan(next_state_raw).any() or torch.isinf(next_state_raw).any():
                 raise ValueError(f"NaN/Inf after {ode_method} integration at step {step}")
             
-            # Renormalize to normalized space for next iteration
+            # Renormalize raw state back to normalized space for next iteration
             if denorm_factors is not None:
-                next_state = 2.0 * (next_state_raw - min_bounds) / (2.0 * denorm_factors) - 1.0
+                next_state = normalize_state_torch(next_state_raw, denorm_factors, min_bounds, norm_type)
             else:
                 next_state = next_state_raw
-            
+
             predicted_states.append(next_state)
             current_state = next_state
     
@@ -301,21 +291,21 @@ def train_aphynity_epoch(
     # ========================================================================
     # LOSS COMPUTATION
     # ========================================================================
-    
-    # Denormalize predictions and ground truth to raw space if using normalization
-    # This ensures loss is computed in raw (physical) space for meaningful values
-    if denorm_factors is not None:
-        # predicted_trajectory and ground_truth_states are in normalized space
-        # Denormalize: raw = (normalized + 1) * denorm_factors + min_bounds
-        predicted_trajectory_raw = (predicted_trajectory + 1.0) * denorm_factors + min_bounds
-        ground_truth_states_raw = (ground_truth_states + 1.0) * denorm_factors + min_bounds
+    #
+    # Loss space depends on normalization type:
+    #   data_driven_normalization → loss in NORMALIZED space
+    #       predicted_trajectory and ground_truth_states are already normalized;
+    #       computing L2 directly is equivalent to 1/std-weighted raw-space loss.
+    #   bounds_normalization / no normalization → loss in RAW physical space
+    #       denormalize both to raw space before computing L2.
+    if norm_type == 'data_driven_normalization':
+        prediction_error = predicted_trajectory - ground_truth_states  # (batch, H, 8)
+    elif denorm_factors is not None:
+        predicted_trajectory_raw = denormalize_state_torch(predicted_trajectory, denorm_factors, min_bounds, norm_type)
+        ground_truth_states_raw  = denormalize_state_torch(ground_truth_states,  denorm_factors, min_bounds, norm_type)
+        prediction_error = predicted_trajectory_raw - ground_truth_states_raw
     else:
-        predicted_trajectory_raw = predicted_trajectory
-        ground_truth_states_raw = ground_truth_states
-    
-    # Trajectory loss: multi-step prediction error across all steps (in raw space)
-    # We compute the L2 distance for each (sample, step) pair
-    prediction_error = predicted_trajectory_raw - ground_truth_states_raw  # (batch, H, 8)
+        prediction_error = predicted_trajectory - ground_truth_states
     if per_state_scales is not None:
         # Inverse scaling: multiply by 1/per_state_scales so small-scale states (angular rates)
         # get amplified gradients and large-scale states (airspeed) get reduced gradients
@@ -335,7 +325,7 @@ def train_aphynity_epoch(
         regularization_loss = torch.stack(residual_norms).mean()
     else:
         # No residual component; regularization is zero
-        regularization_loss = torch.tensor(0.0, device=state.device, dtype=state.dtype)
+        regularization_loss = torch.tensor(0.0, device=initial_states.device, dtype=initial_states.dtype)
     
     # Check for NaN in regularization loss
     if torch.isnan(regularization_loss):
@@ -379,8 +369,8 @@ def train_aphynity_epoch(
     grad_max_before_clipping = max(grad_norms_before) if grad_norms_before else 0.0
     
     # Clip gradients for stability
-    grad_norm_clipped = torch.nn.utils.clip_grad_norm_(hybrid_model.residual_network.parameters(), 
-                                                       max_norm=1.0)
+    grad_norm_clipped = torch.nn.utils.clip_grad_norm_(hybrid_model.residual_network.parameters(),
+                                                       max_norm=grad_clip_norm)
     
     # Compute gradient statistics after clipping
     grad_norms_after = []
