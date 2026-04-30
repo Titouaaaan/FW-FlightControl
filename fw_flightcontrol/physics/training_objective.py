@@ -45,9 +45,18 @@ class HybridDynamicsODE(nn.Module):
         self.denorm_factors = denorm_factors  # (max-min)/2 for bounds, std for data-driven
         self.min_bounds = min_bounds          # min for bounds, mean for data-driven
         self.norm_type = norm_type            # 'bounds_normalization' | 'data_driven_normalization' | None
-    
+        self._capture_next = False
+        self.captured_residual_norm = None
+
     def set_action(self, action: torch.Tensor):
         self.current_action = action
+
+    def arm_capture(self):
+        """Arm to capture the residual norm on the next forward call (k1 for RK4).
+        Call this immediately before odeint so the regularization norm is taken at
+        the actual current state, not at an intermediate RK stage."""
+        self._capture_next = True
+        self.captured_residual_norm = None
     
     def _denormalize_state(self, state_norm: torch.Tensor) -> torch.Tensor:
         """Convert normalized state back to raw physical units."""
@@ -59,44 +68,41 @@ class HybridDynamicsODE(nn.Module):
     
     def forward(self, t: torch.Tensor, state_raw: torch.Tensor) -> torch.Tensor:
         """Compute state derivative: ds_raw/dt = F_p(s_raw, u) + F_a(s_norm(s_raw), u).
-        
-        CRITICAL: This wrapper works entirely in RAW PHYSICAL SPACE.
-        - state_raw: raw physical state (what ODE integrator sends)
-        - Returns: raw physical derivatives ds_raw/dt (what ODE integrator expects)
-        
-        Internally:
-        - Physics prior operates on raw state → returns ds_raw/dt
-        - Normalize raw state to normalized space for residual network
-        - Residual network outputs normalized derivatives 
-        - Denormalize residual derivatives to raw space
-        - Combine both in raw space
-        - Return raw derivatives for ODE integration
+
+        Works entirely in RAW PHYSICAL SPACE. On the first call after arm_capture(),
+        stores the residual norm so the training loop can use it for regularization
+        without an extra forward pass.
         """
         if self.current_action is None:
             raise RuntimeError("Action not set before forward pass")
-        
-        # When no normalization, state is raw, return raw derivatives
+
         if self.denorm_factors is None:
-            hybrid_deriv = self.model(state_raw, self.current_action)
-            return hybrid_deriv
-        
-        # Path when using normalization: receive raw, work with normalized, return raw
-        # Normalize raw state to [-1, 1] for residual network
+            # No-normalization path: inline model.forward to access residual for capture
+            dx_dt = torch.zeros_like(state_raw)
+            if self.model.with_prior:
+                dx_dt = self.model.physics_prior(state_raw, self.current_action)
+            if self.model.with_residual:
+                residual_output = self.model.residual_network(state_raw, self.current_action)
+                if self._capture_next:
+                    self.captured_residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
+                    self._capture_next = False
+                dx_dt = dx_dt + residual_output if self.model.with_prior else residual_output
+            elif self._capture_next:
+                self._capture_next = False
+            return dx_dt
+
+        # Normalization path: residual sees normalized state, derivatives returned in raw space
         state_norm = self._normalize_state(state_raw)
-        
-        # Physics prior operates on raw states (expects physical units)
         prior_deriv = self.model.physics_prior(state_raw, self.current_action)
-        
-        # Residual network operates on normalized states, outputs normalized derivatives
         residual_output = self.model.residual_network(state_norm, self.current_action)
-        
-        # Denormalize residual output: multiply by (max - min) / 2 to convert to raw space
-        residual_output_denorm = residual_output * self.denorm_factors
-        
-        # Combine derivatives in raw space and return raw derivatives
-        hybrid_deriv_raw = prior_deriv + residual_output_denorm
-        
-        return hybrid_deriv_raw
+
+        if self._capture_next:
+            self.captured_residual_norm = torch.norm(
+                residual_output * self.denorm_factors, p=2, dim=1
+            ).mean()
+            self._capture_next = False
+
+        return prior_deriv + residual_output * self.denorm_factors
 
 
 def train_aphynity_epoch(
@@ -115,6 +121,7 @@ def train_aphynity_epoch(
     min_bounds: torch.Tensor = None,
     per_state_scales: torch.Tensor = None,
     norm_type: Optional[str] = None,
+    check_nan: bool = False,
 ) -> Dict:
     """
     Train residual network using APHYNITY (Augmented Physics with Newton's method).
@@ -155,7 +162,6 @@ def train_aphynity_epoch(
     
     batch_size = initial_states.shape[0]
     horizon = actions.shape[1]
-    hybrid_model = hybrid_model.to(device)
     optimizer.zero_grad()
     
     # ========================================================================
@@ -166,122 +172,76 @@ def train_aphynity_epoch(
     
     current_state = initial_states
     
-    # Use semi-implicit Euler if requested (custom method with gradient support)
+    ode_module = HybridDynamicsODE(
+        hybrid_model, device, denorm_factors=denorm_factors, min_bounds=min_bounds, norm_type=norm_type
+    ).to(device)
+    # t_eval allocated once; reused every horizon step
+    t_eval = torch.tensor([0.0, dt], dtype=initial_states.dtype, device=device)
+
     if ode_method == 'semi_implicit_euler':
-        ode_module = HybridDynamicsODE(hybrid_model, device, denorm_factors=denorm_factors, min_bounds=min_bounds, norm_type=norm_type).to(device)
-        # Manual semi-implicit Euler loop preserves gradient flow through unrolled loop
         for step in range(horizon):
-            action = actions[:, step, :]  # (batch_size, 3)
-            
-            # current_state is in normalized space; denormalize to raw for ODE integration
+            action = actions[:, step, :]
+
             if denorm_factors is not None:
                 current_state_raw = denormalize_state_torch(current_state, denorm_factors, min_bounds, norm_type)
             else:
                 current_state_raw = current_state
-            
-            # Compute residual output at this step for regularization term (only if model uses residual)
-            if hybrid_model.with_residual:
-                residual_output = hybrid_model.residual_network(current_state, action)
-                
-                # Denormalize residual to raw space before penalizing (if using normalization)
-                # This ensures regularization penalty is consistent with trajectory loss (both in raw space)
-                if denorm_factors is not None:
-                    residual_output_raw = residual_output * denorm_factors
-                    residual_norm = torch.norm(residual_output_raw, p=2, dim=1).mean()
-                else:
-                    residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
-                residual_norms.append(residual_norm)
-                
-                # Check for NaN/Inf
-                if torch.isnan(residual_norm) or torch.isinf(residual_norm):
-                    raise ValueError(f"NaN/Inf in residual norm at step {step}")
-            
-            # Semi-implicit Euler step on RAW state: integrate in raw space
-            # Use HybridDynamicsODE to ensure residual sees normalized state when normalization is enabled.
+
+            # arm_capture: residual norm is captured on the single Euler evaluation (no extra forward pass)
             ode_module.set_action(action)
+            ode_module.arm_capture()
             derivatives_raw = ode_module(None, current_state_raw)
 
+            if hybrid_model.with_residual and ode_module.captured_residual_norm is not None:
+                if check_nan and (torch.isnan(ode_module.captured_residual_norm) or
+                                  torch.isinf(ode_module.captured_residual_norm)):
+                    raise ValueError(f"NaN/Inf in residual norm at step {step}")
+                residual_norms.append(ode_module.captured_residual_norm)
+
             state_dim = current_state_raw.shape[-1]
-            half_dim = state_dim // 2
-            positions = current_state_raw[:, :half_dim]
-            velocities = current_state_raw[:, half_dim:]
+            half_dim  = state_dim // 2
+            velocities_new = current_state_raw[:, half_dim:] + derivatives_raw[:, half_dim:] * dt
+            positions_new  = current_state_raw[:, :half_dim] + velocities_new * dt
+            next_state_raw = torch.cat([positions_new, velocities_new], dim=-1).clamp(-1000.0, 1000.0)
 
-            dpos_dt = derivatives_raw[:, :half_dim]
-            dvel_dt = derivatives_raw[:, half_dim:]
-
-            velocities_new = velocities + dvel_dt * dt
-            positions_new = positions + velocities_new * dt
-
-            next_state_raw = torch.cat([positions_new, velocities_new], dim=-1)
-            
-            # Clamp raw state to valid physical bounds (prevent explosion)
-            next_state_raw = next_state_raw.clamp(-1000.0, 1000.0)
-            
-            # Check for NaN after integration
-            if torch.isnan(next_state_raw).any() or torch.isinf(next_state_raw).any():
+            if check_nan and (torch.isnan(next_state_raw).any() or torch.isinf(next_state_raw).any()):
                 raise ValueError(f"NaN/Inf after semi-implicit Euler integration at step {step}")
-            
-            # Renormalize raw state back to normalized space for next iteration
-            if denorm_factors is not None:
-                next_state = normalize_state_torch(next_state_raw, denorm_factors, min_bounds, norm_type)
-            else:
-                next_state = next_state_raw
 
+            next_state = (normalize_state_torch(next_state_raw, denorm_factors, min_bounds, norm_type)
+                          if denorm_factors is not None else next_state_raw)
             predicted_states.append(next_state)
             current_state = next_state
 
     else:
-        # Use torchdiffeq for other ODE methods (RK4, dopri8, etc.)
-        # ODE integration happens in RAW PHYSICAL SPACE
-        ode_module = HybridDynamicsODE(hybrid_model, device, denorm_factors=denorm_factors, min_bounds=min_bounds, norm_type=norm_type).to(device)
-        
+        # torchdiffeq path (RK4, dopri8, …) — ODE integration in RAW PHYSICAL SPACE
         for step in range(horizon):
-            action = actions[:, step, :]  # (batch_size, 3)
-            
-            # Compute residual output at this step for regularization term (only if model uses residual)
-            if hybrid_model.with_residual:
-                residual_output = hybrid_model.residual_network(current_state, action)
-                
-                # Denormalize residual to raw space before penalizing (if using normalization)
-                # This ensures regularization penalty is consistent with trajectory loss (both in raw space)
-                if denorm_factors is not None:
-                    residual_output_raw = residual_output * denorm_factors
-                    residual_norm = torch.norm(residual_output_raw, p=2, dim=1).mean()
-                else:
-                    residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
-                residual_norms.append(residual_norm)
-                
-                # Check for NaN/Inf
-                if torch.isnan(residual_norm) or torch.isinf(residual_norm):
-                    raise ValueError(f"NaN/Inf in residual norm at step {step}")
-            
-            # current_state is in normalized space; denormalize to raw for ODE integration
+            action = actions[:, step, :]
+
             if denorm_factors is not None:
                 current_state_raw = denormalize_state_torch(current_state, denorm_factors, min_bounds, norm_type)
             else:
                 current_state_raw = current_state
-            
-            # Integrate one simulation step using torchdiffeq (in raw space)
-            ode_module.set_action(action)
-            t_eval = torch.tensor([0.0, dt], dtype=current_state_raw.dtype, device=device)
-            
-            solution = odeint(ode_module, current_state_raw, t_eval,
-                             method=ode_method, rtol=ode_rtol, atol=ode_atol)
-            next_state_raw = solution[-1]
-            
-            # Clamp raw state to valid physical bounds (prevent explosion)
-            next_state_raw = next_state_raw.clamp(-1000.0, 1000.0)
-            
-            # Check for NaN after integration
-            if torch.isnan(next_state_raw).any() or torch.isinf(next_state_raw).any():
-                raise ValueError(f"NaN/Inf after {ode_method} integration at step {step}")
-            
-            # Renormalize raw state back to normalized space for next iteration
-            if denorm_factors is not None:
-                next_state = normalize_state_torch(next_state_raw, denorm_factors, min_bounds, norm_type)
-            else:
-                next_state = next_state_raw
 
+            # arm_capture: k1 evaluation (at current state) captures the residual norm —
+            # no separate residual forward pass needed for regularization
+            ode_module.set_action(action)
+            ode_module.arm_capture()
+            solution = odeint(ode_module, current_state_raw, t_eval,
+                              method=ode_method, rtol=ode_rtol, atol=ode_atol)
+
+            if hybrid_model.with_residual and ode_module.captured_residual_norm is not None:
+                if check_nan and (torch.isnan(ode_module.captured_residual_norm) or
+                                  torch.isinf(ode_module.captured_residual_norm)):
+                    raise ValueError(f"NaN/Inf in residual norm at step {step}")
+                residual_norms.append(ode_module.captured_residual_norm)
+
+            next_state_raw = solution[-1].clamp(-1000.0, 1000.0)
+
+            if check_nan and (torch.isnan(next_state_raw).any() or torch.isinf(next_state_raw).any()):
+                raise ValueError(f"NaN/Inf after {ode_method} integration at step {step}")
+
+            next_state = (normalize_state_torch(next_state_raw, denorm_factors, min_bounds, norm_type)
+                          if denorm_factors is not None else next_state_raw)
             predicted_states.append(next_state)
             current_state = next_state
     
@@ -352,37 +312,25 @@ def train_aphynity_epoch(
     # PyTorch's autograd automatically handles this through torchdiffeq
     total_loss.backward()
     
-    # Check for NaN in gradients
-    for name, param in hybrid_model.residual_network.named_parameters():
-        if param.grad is not None and torch.isnan(param.grad).any():
-            print(f"NaN detected in gradients of {name}")
-            print(f"  grad range: [{param.grad.min()}, {param.grad.max()}]")
-            raise ValueError(f"NaN gradient in {name}")
-    
-    # Compute gradient statistics before clipping
-    grad_norms_before = []
-    for param in hybrid_model.residual_network.parameters():
-        if param.grad is not None:
-            grad_norms_before.append(torch.norm(param.grad).item())
-    
-    grad_norm_before_clipping = sum(grad_norms_before) / len(grad_norms_before) if grad_norms_before else 0.0
-    grad_max_before_clipping = max(grad_norms_before) if grad_norms_before else 0.0
-    
-    # Clip gradients for stability
-    grad_norm_clipped = torch.nn.utils.clip_grad_norm_(hybrid_model.residual_network.parameters(),
-                                                       max_norm=grad_clip_norm)
-    
-    # Compute gradient statistics after clipping
-    grad_norms_after = []
-    for param in hybrid_model.residual_network.parameters():
-        if param.grad is not None:
-            grad_norms_after.append(torch.norm(param.grad).item())
-    
-    grad_norm_after_clipping = sum(grad_norms_after) / len(grad_norms_after) if grad_norms_after else 0.0
-    grad_max_after_clipping = max(grad_norms_after) if grad_norms_after else 0.0
-    
-    # Update residual network parameters
-    # Note: tau_1 is handled by Adam optimizer as learning rate, NOT applied here
+    if check_nan:
+        for name, param in hybrid_model.residual_network.named_parameters():
+            if param.grad is not None and torch.isnan(param.grad).any():
+                print(f"NaN detected in gradients of {name}")
+                print(f"  grad range: [{param.grad.min()}, {param.grad.max()}]")
+                raise ValueError(f"NaN gradient in {name}")
+
+    # clip_grad_norm_ returns the total L2 gradient norm before clipping — 1 GPU sync
+    grad_norm_before = torch.nn.utils.clip_grad_norm_(
+        hybrid_model.residual_network.parameters(), max_norm=grad_clip_norm
+    ).item()
+
+    # Total norm after clipping — single reduction, 1 GPU sync
+    params_with_grad = [p for p in hybrid_model.residual_network.parameters() if p.grad is not None]
+    grad_norm_after = (
+        torch.stack([p.grad.detach().norm() for p in params_with_grad]).norm().item()
+        if params_with_grad else 0.0
+    )
+
     optimizer.step()
     
     # ========================================================================
@@ -394,15 +342,12 @@ def train_aphynity_epoch(
     lambda_new = lambda_current + tau_2 * trajectory_loss.item()
     
     return {
-        'loss_total': total_loss.item(),
-        'loss_trajectory': trajectory_loss.item(),
-        'loss_regularization': regularization_loss.item(),
-        'lambda_new': lambda_new,
-        'grad_norm_before_clipping': grad_norm_before_clipping,
-        'grad_max_before_clipping': grad_max_before_clipping,
-        'grad_norm_after_clipping': grad_norm_after_clipping,
-        'grad_max_after_clipping': grad_max_after_clipping,
-        'grad_norm_clipped': grad_norm_clipped.item() if isinstance(grad_norm_clipped, torch.Tensor) else grad_norm_clipped
+        'loss_total':              total_loss.item(),
+        'loss_trajectory':         trajectory_loss.item(),
+        'loss_regularization':     regularization_loss.item(),
+        'lambda_new':              lambda_new,
+        'grad_norm_before_clipping': grad_norm_before,
+        'grad_norm_after_clipping':  grad_norm_after,
     }
 
 

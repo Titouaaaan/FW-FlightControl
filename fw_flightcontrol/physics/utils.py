@@ -161,18 +161,21 @@ class TrajectoryDataset(torch.utils.data.Dataset):
     """Dataset wrapping trajectory sequences as fixed-length sliding windows."""
 
     def __init__(self, sequences: List[Dict]):
-        self.sequences = sequences
+        # Convert numpy arrays to tensors once at construction; __getitem__ returns pre-built tensors
+        self.sequences = [
+            {
+                'initial_states': torch.tensor(seq['initial_state'], dtype=torch.float32),
+                'actions':        torch.tensor(seq['actions'],        dtype=torch.float32),
+                'states':         torch.tensor(seq['states'],         dtype=torch.float32),
+            }
+            for seq in sequences
+        ]
 
     def __len__(self) -> int:
         return len(self.sequences)
 
     def __getitem__(self, idx: int) -> Dict:
-        seq = self.sequences[idx]
-        return {
-            'initial_states': torch.tensor(seq['initial_state'], dtype=torch.float32),
-            'actions':        torch.tensor(seq['actions'],        dtype=torch.float32),
-            'states':         torch.tensor(seq['states'],         dtype=torch.float32),
-        }
+        return self.sequences[idx]
 
     @staticmethod
     def collate_fn(batch: List[Dict]) -> Dict:
@@ -290,6 +293,7 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=0,
+            pin_memory=True,
             collate_fn=TrajectoryDataset.collate_fn,
         )
 
@@ -343,11 +347,8 @@ def log_tensorboard_epoch(
         writer.add_scalar('Epoch/val_loss_regularization', val_metrics['loss_regularization'],  epoch)
 
     if grad_metrics is not None:
-        writer.add_scalar('Gradients/norm_before_clipping',     grad_metrics['grad_norm_before_clipping'],  epoch)
-        writer.add_scalar('Gradients/norm_after_clipping',      grad_metrics['grad_norm_after_clipping'],   epoch)
-        writer.add_scalar('Gradients/max_norm_before_clipping', grad_metrics['grad_max_before_clipping'],   epoch)
-        writer.add_scalar('Gradients/max_norm_after_clipping',  grad_metrics['grad_max_after_clipping'],    epoch)
-        writer.add_scalar('Gradients/clipping_threshold',       grad_metrics['grad_norm_clipped'],          epoch)
+        writer.add_scalar('Gradients/norm_before_clipping', grad_metrics['grad_norm_before_clipping'], epoch)
+        writer.add_scalar('Gradients/norm_after_clipping',  grad_metrics['grad_norm_after_clipping'],  epoch)
 
     if current_lr is not None:
         writer.add_scalar('Training/learning_rate', current_lr, epoch)

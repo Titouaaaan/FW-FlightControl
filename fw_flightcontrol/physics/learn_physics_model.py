@@ -206,6 +206,17 @@ def run_validation_epoch(
         'batch_count':        0,
     }
 
+    # Build ODE module and t_eval once — reused across all batches
+    ode_module = HybridDynamicsODE(
+        hybrid_model, device,
+        denorm_factors=denorm_factors_torch if norm_type is not None else None,
+        min_bounds=min_bounds_torch if norm_type is not None else None,
+        norm_type=norm_type,
+    ).to(device)
+    t_eval = torch.tensor(
+        [0.0, config['integration']['dt']], dtype=torch.float32, device=device
+    )
+
     val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1:3d}/{num_epochs}: Val",
                     leave=False, unit="batch")
 
@@ -219,41 +230,27 @@ def run_validation_epoch(
             residual_norms   = []
             current_state    = batch_initial
 
-            ode_module = HybridDynamicsODE(
-                hybrid_model, device,
-                denorm_factors=denorm_factors_torch if norm_type is not None else None,
-                min_bounds=min_bounds_torch if norm_type is not None else None,
-                norm_type=norm_type,
-            ).to(device)
-
             for step in range(horizon):
                 action = batch_actions[:, step, :]
 
-                residual_output = hybrid_model.residual_network(current_state, action)
-                if norm_type is not None:
-                    # Regularization in raw space: multiply normalized residual by scale
-                    residual_output_raw = residual_output * denorm_factors_torch
-                    residual_norm = torch.norm(residual_output_raw, p=2, dim=1).mean()
-                else:
-                    residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
-                residual_norms.append(residual_norm)
-
-                # Denormalize state to raw space for ODE integration
                 if norm_type is not None:
                     current_state_raw = denormalize_state_torch(current_state, denorm_factors_torch, min_bounds_torch, norm_type)
                 else:
                     current_state_raw = current_state
 
+                # arm_capture: residual norm captured from k1, no extra forward pass
                 ode_module.set_action(action)
-                t_eval = torch.tensor([0.0, config['integration']['dt']],
-                                      dtype=current_state_raw.dtype, device=device)
+                ode_module.arm_capture()
                 solution = odeint(ode_module, current_state_raw, t_eval,
                                   method=config['integration']['method'],
                                   rtol=config['integration']['rtol'],
                                   atol=config['integration']['atol'])
+
+                if hybrid_model.with_residual and ode_module.captured_residual_norm is not None:
+                    residual_norms.append(ode_module.captured_residual_norm)
+
                 next_state_raw = solution[-1].clamp(-1000.0, 1000.0)
 
-                # Renormalize back to normalized space for next iteration
                 if norm_type is not None:
                     next_state = normalize_state_torch(next_state_raw, denorm_factors_torch, min_bounds_torch, norm_type)
                 else:
@@ -402,6 +399,13 @@ def main(resume_checkpoint: Optional[str] = None):
     print(f"Using device: {device}")
 
     residual_network, hybrid_model = initialize_models(config, device)
+
+    # Compile the two sub-modules that are called inside the ODE loop on every forward pass.
+    # physics_prior benefits most (many fused trig/element-wise ops → fewer CUDA kernel launches).
+    # residual_network also benefits (MLP forward fused into fewer ops).
+    hybrid_model.physics_prior     = torch.compile(hybrid_model.physics_prior)
+    hybrid_model.residual_network  = torch.compile(hybrid_model.residual_network)
+
     optimizer, scheduler, min_lr   = create_optimizer(residual_network, config)
 
     start_epoch  = 0
@@ -449,9 +453,9 @@ def main(resume_checkpoint: Optional[str] = None):
     lambda_max     = aphynity_config['lambda_max']
 
     # TensorBoard
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{datetime.now().strftime('%y%m%d')}_{checkpoint_subdir}"
     log_base  = Path(__file__).parent.parent / "logs" / "tensorboard"
-    log_dir   = log_base / timestamp
+    log_dir   = log_base / run_name
     log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(str(log_dir))
 
@@ -487,7 +491,6 @@ def main(resume_checkpoint: Optional[str] = None):
         epoch_metrics = {k: 0 for k in [
             'loss_total', 'loss_trajectory', 'loss_regularization', 'batch_count',
             'grad_norm_before_clipping', 'grad_norm_after_clipping',
-            'grad_max_before_clipping', 'grad_max_after_clipping', 'grad_norm_clipped',
         ]}
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:3d}/{num_epochs}: Train",
@@ -527,10 +530,7 @@ def main(resume_checkpoint: Optional[str] = None):
 
             if 'grad_norm_before_clipping' in metrics:
                 epoch_metrics['grad_norm_before_clipping'] += metrics['grad_norm_before_clipping']
-                epoch_metrics['grad_max_before_clipping']   = max(epoch_metrics['grad_max_before_clipping'], metrics['grad_max_before_clipping'])
                 epoch_metrics['grad_norm_after_clipping']  += metrics['grad_norm_after_clipping']
-                epoch_metrics['grad_max_after_clipping']    = max(epoch_metrics['grad_max_after_clipping'],  metrics['grad_max_after_clipping'])
-                epoch_metrics['grad_norm_clipped']          = max(epoch_metrics['grad_norm_clipped'],        metrics['grad_norm_clipped'])
 
             global_step += 1
             pbar.set_postfix({
@@ -542,8 +542,9 @@ def main(resume_checkpoint: Optional[str] = None):
         # Average loss metrics over batches
         for key in ['loss_total', 'loss_trajectory', 'loss_regularization']:
             epoch_metrics[key] /= epoch_metrics['batch_count']
-        epoch_metrics['grad_norm_before_clipping'] /= epoch_metrics['batch_count']
-        epoch_metrics['grad_norm_after_clipping']  /= epoch_metrics['batch_count']
+        if epoch_metrics['batch_count'] > 0:
+            epoch_metrics['grad_norm_before_clipping'] /= epoch_metrics['batch_count']
+            epoch_metrics['grad_norm_after_clipping']  /= epoch_metrics['batch_count']
 
         train_history['loss_total'].append(epoch_metrics['loss_total'])
         train_history['loss_trajectory'].append(epoch_metrics['loss_trajectory'])
@@ -578,7 +579,6 @@ def main(resume_checkpoint: Optional[str] = None):
 
         grad_metrics = {k: epoch_metrics[k] for k in [
             'grad_norm_before_clipping', 'grad_norm_after_clipping',
-            'grad_max_before_clipping',  'grad_max_after_clipping', 'grad_norm_clipped',
         ]}
         log_tensorboard_epoch(writer, epoch, epoch_metrics, val_metrics, lambda_current, grad_metrics, current_lr)
 

@@ -24,7 +24,7 @@ training:
   horizon: 10
   
   # Batch parameters
-  batch_size: 25
+  batch_size: 256
   num_epochs: 1000
   
   # Actual learning rate is set via aphynity.tau_1 (passed to Adam optimizer)
@@ -54,7 +54,7 @@ aphynity:
                           # Passed to optimizer, NOT applied as gradient scaling
   # Lagrange multiplier initialization and update
   lambda_init: 1.0        # Initial λ (balanced: reg=1.0, trajectory_loss weighted by λ)
-  tau_2: 0.005              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
+  tau_2: 0.01              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
                           # Conservative value; can increase to 1.0 after verifying numerical stability
   
   # Lagrange multiplier bounds
@@ -95,7 +95,7 @@ data:
   # 'data_driven_normalization': normalize by (x - mean) / std, computed from training data.
   # 'bounds_normalization':      normalize to [-1, 1] using config state_bounds.
   # absent / null:               no normalization.
-  normalization_type: 'data_driven_normalization'
+  normalization_type: 'bounds_normalization'
 
   # Per-state loss normalization for trajectory loss
   # When true, trajectory errors are scaled by per-state half-range (denorm_factors)
@@ -162,5 +162,5 @@ logging:
   
   # Output directories
   checkpoint_dir: ./checkpoints
-  checkpoint_subdirectory: data_driven_normalization # per_state_norm_expv.0.8    
+  checkpoint_subdirectory: bounds_normalization_1.0 # per_state_norm_expv.0.8    
   log_dir: ./logs

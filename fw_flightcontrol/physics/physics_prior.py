@@ -23,6 +23,20 @@ class PhysicsPrior(torch.nn.Module):
         # Register constants as buffers so they move with the model to GPU
         for key, value in self.params.items():
             self.register_buffer(key, torch.tensor(value, dtype=torch.float32))
+
+        # Precompute inertia Gamma factors (derived from constant J values — no need to recompute per call)
+        self._precompute_gamma()
+
+    def _precompute_gamma(self):
+        Gamma = self.J_x * self.J_z - self.J_xz ** 2
+        self.register_buffer('Gamma1', self.J_xz * (self.J_x - self.J_y + self.J_z) / Gamma)
+        self.register_buffer('Gamma2', (self.J_z * (self.J_z - self.J_y) + self.J_xz ** 2) / Gamma)
+        self.register_buffer('Gamma3', self.J_z / Gamma)
+        self.register_buffer('Gamma4', self.J_xz / Gamma)
+        self.register_buffer('Gamma5', (self.J_z - self.J_x) / self.J_y)
+        self.register_buffer('Gamma6', self.J_xz / self.J_y)
+        self.register_buffer('Gamma7', ((self.J_x - self.J_y) * self.J_x + self.J_xz ** 2) / Gamma)
+        self.register_buffer('Gamma8', self.J_x / Gamma)
     
     def load_config(self, config_path: str):
         """Load aerodynamic coefficients and aircraft parameters from YAML."""
@@ -164,35 +178,14 @@ class PhysicsPrior(torch.nn.Module):
              self.C_n_r * (self.b * r) / (2 * Va + 1e-6) +
              self.C_n_delta_a * delta_a) * (q_dyn_b + 1e-6)
         
-        # Compute Gamma parameters from inertia tensor
-        # These come from inverting the inertia matrix for decoupled angular dynamics
-        # Reference: Beard & McLain, Chapter 10 - equations for rigid body rotational dynamics
-        J_x = self.J_x
-        J_y = self.J_y
-        J_z = self.J_z
-        J_xz = self.J_xz
-        
-        # Primary denominator: Gamma = J_x * J_z - J_xz^2
-        Gamma = J_x * J_z - J_xz**2
-        
-        # Gamma parameters for angular rate derivatives
-        Gamma1 = J_xz * (J_x - J_y + J_z) / Gamma
-        Gamma2 = (J_z * (J_z - J_y) + J_xz**2) / Gamma
-        Gamma3 = J_z / Gamma
-        Gamma4 = J_xz / Gamma
-        Gamma5 = (J_z - J_x) / J_y
-        Gamma6 = J_xz / J_y
-        Gamma7 = ((J_x - J_y) * J_x + J_xz**2) / Gamma
-        Gamma8 = J_x / Gamma
-        
-        # Angular rate derivatives
-        p_dot = (Gamma1 * p * q - Gamma2 * q * r + 
-                Gamma3 * l + Gamma4 * n)
-        
-        q_dot = Gamma5 * p * r - Gamma6 * (p**2 - r**2) + m / J_y
-        
-        r_dot = (Gamma7 * p * q - Gamma1 * q * r + 
-                Gamma4 * l + Gamma8 * n)
+        # Angular rate derivatives (Gamma buffers precomputed in __init__)
+        p_dot = (self.Gamma1 * p * q - self.Gamma2 * q * r +
+                 self.Gamma3 * l + self.Gamma4 * n)
+
+        q_dot = self.Gamma5 * p * r - self.Gamma6 * (p**2 - r**2) + m / self.J_y
+
+        r_dot = (self.Gamma7 * p * q - self.Gamma1 * q * r +
+                 self.Gamma4 * l + self.Gamma8 * n)
         
         # ===================== STACK STATE DERIVATIVES =====================
         # Output: [phi_dot, theta_dot, Va_dot, p_dot, q_dot, r_dot, alpha_dot, beta_dot]
