@@ -38,7 +38,7 @@ MAX_DELTA_ROLL = 12
 MAX_DELTA_PITCH = 12
 
 # Number of trajectories to generate
-NUM_TRAJECTORIES = 10
+NUM_TRAJECTORIES = 50
 
 # JSBSim environment configurations to generate data for
 JSBSIM_CONFIGS = ['noatmo']
@@ -253,7 +253,7 @@ def run_single_trajectory(env, trajectory_num, roll_targets_array, pitch_targets
     return trajectory_data
 
 
-def save_trajectory_data_to_csv(trajectory_results, output_file='updated_trajectory_data_progressive.csv'):
+def save_trajectory_data_to_csv(trajectory_results, output_file='updated_trajectory_data_progressive_noatmo_2.0.csv'):
     """
     Save trajectory data (state transitions) to CSV file for dynamics learning.
     
@@ -461,17 +461,12 @@ def main(cfg: DictConfig):
         print_trajectory_summary(trajectory_results)
         
         # Save trajectory data to CSV file
-        output_file = f'../data/updated_trajectory_data_progressive_noatmo.csv'
+        output_file = f'../updated_trajectory_data_progressive_noatmo_2.0.csv'
         csv_file = save_trajectory_data_to_csv(trajectory_results, output_file)
         
         print(f"\n{'='*100}")
         print("✓ Data collection with progressive targets complete!")
         print(f"{'='*100}")
-        print(f"\nGenerated CSV file in fw_flightcontrol/data/:")
-        print(f"  - updated_trajectory_data_progressive_noatmo.csv")
-        print(f"\nYou can load it with:")
-        print(f"  df = pd.read_csv('fw_flightcontrol/data/updated_trajectory_data_progressive_noatmo.csv')")
-
         
     except Exception as e:
         print(f"\nError: {e}")
