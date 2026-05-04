@@ -306,6 +306,43 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
 
 
 # ============================================================================
+# NORMALIZATION PARAMETER RESOLUTION
+# ============================================================================
+
+def _resolve_norm_params(checkpoint_path, config, computed_scale, computed_offset,
+                         norm_type, device):
+    """Return (norm_scale, norm_offset, source_description) for evaluation.
+
+    Priority:
+      1. Embedded in the checkpoint (saved during training — most reliable)
+      2. Hardcoded in config under normalization_params (correct for a given dataset/seed)
+      3. Recomputed from the data split (seed-dependent — only a fallback)
+    """
+    if norm_type is None:
+        return computed_scale, computed_offset, "none (no normalization)"
+
+    # 1. Checkpoint
+    raw = torch.load(checkpoint_path, map_location='cpu')
+    if isinstance(raw, dict) and 'norm_scale' in raw and 'norm_offset' in raw:
+        scale  = np.array(raw['norm_scale'],  dtype=np.float32)
+        offset = np.array(raw['norm_offset'], dtype=np.float32)
+        return scale, offset, "checkpoint (embedded at training time)"
+
+    # 2. Config hardcoded values
+    if 'normalization_params' in config:
+        p = config['normalization_params']
+        scale  = np.array(p['norm_scale'],  dtype=np.float32)
+        offset = np.array(p['norm_offset'], dtype=np.float32)
+        return scale, offset, "config normalization_params (hardcoded)"
+
+    # 3. Computed from data split — seed-dependent, may not match training
+    print("\n  WARNING: norm params not found in checkpoint or config.")
+    print("  Using values computed from the current data split (seed-dependent).")
+    print("  Results will be wrong if the seed differs from training.")
+    return computed_scale, computed_offset, "computed from data split (seed-dependent — may be wrong)"
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -337,7 +374,25 @@ def main():
     print(f"  Device           : {device}")
 
     csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_progressive_noatmo.csv"
-    train_loader, val_loader, test_loader, denorm_factors, min_bounds = load_trajectory_data(str(csv_path), config)
+    train_loader, val_loader, test_loader, denorm_factors_computed, min_bounds_computed = load_trajectory_data(str(csv_path), config)
+
+    # ── Resolve normalization parameters (priority: checkpoint > config > computed) ──
+    # The model was trained with specific mean/std values. Using different ones at
+    # evaluation time breaks the residual network's normalized input space.
+    norm_type = get_norm_type(config)
+    denorm_factors, min_bounds, norm_source = _resolve_norm_params(
+        checkpoint_path=args.checkpoint,
+        config=config,
+        computed_scale=denorm_factors_computed,
+        computed_offset=min_bounds_computed,
+        norm_type=norm_type,
+        device='cpu',
+    )
+
+    print(f"\n  Normalization source : {norm_source}")
+    print(f"  norm_scale  (std):    {denorm_factors}")
+    print(f"  norm_offset (mean):   {min_bounds}")
+
     denorm_factors_torch = torch.tensor(denorm_factors, dtype=torch.float32, device=device)
     min_bounds_torch     = torch.tensor(min_bounds,     dtype=torch.float32, device=device)
 
@@ -358,7 +413,6 @@ def main():
                                      with_prior=args.with_prior,
                                      with_residual=args.with_residual)
 
-    norm_type = get_norm_type(config)
     evaluate(hybrid_model, target_loader, config, device, split_name=args.split,
              norm_type=norm_type,
              denorm_factors=denorm_factors_torch if norm_type is not None else None,

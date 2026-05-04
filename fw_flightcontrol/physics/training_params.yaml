@@ -87,22 +87,22 @@ integration:
 # ============================================================================
 data:
   # Train/val/test split
-  train_fraction: 0.7
-  val_fraction: 0.15
-  test_fraction: 0.15
+  train_fraction: 0.85
+  val_fraction: 0.1
+  test_fraction: 0.05
   
   # Normalization type for residual network inputs and loss computation.
   # 'data_driven_normalization': normalize by (x - mean) / std, computed from training data.
   # 'bounds_normalization':      normalize to [-1, 1] using config state_bounds.
   # absent / null:               no normalization.
-  normalization_type: 'bounds_normalization'
+  normalization_type: 'data_driven_normalization'
 
   # Per-state loss normalization for trajectory loss
   # When true, trajectory errors are scaled by per-state half-range (denorm_factors)
   per_state_loss_norm: false
   
   # Sequence sampling
-  random_seed: 42
+  random_seed: 0
   shuffle: true
 
 
@@ -145,6 +145,17 @@ state_bounds:
 
 
 # ============================================================================
+# NORMALIZATION PARAMETERS (data_driven_normalization, seed=42, full dataset)
+# ============================================================================
+# Computed from the 70% training split (seed=42) of updated_trajectory_data_progressive_noatmo.csv
+# State order: [roll, pitch, Va, p, q, r, alpha, beta]
+# Used as fallback in test_physics_model.py when a checkpoint does not embed these values.
+normalization_params:
+  norm_scale:   [0.38408855, 0.22760703, 3.7785916,  0.16657513, 0.2234954,  0.22431558, 0.02661955, 0.04277578]
+  norm_offset:  [0.26077324, -0.02739102, 19.3762856, 0.02599991, 0.10687269, 0.11603974, 0.02850350, 0.01635888]
+
+
+# ============================================================================
 # REGULARIZATION
 # ============================================================================
 regularization:
@@ -162,5 +173,5 @@ logging:
   
   # Output directories
   checkpoint_dir: ./checkpoints
-  checkpoint_subdirectory: bounds_normalization_1.0 # per_state_norm_expv.0.8    
+  checkpoint_subdirectory: data_driven_normalization_3.0 # per_state_norm_expv.0.8    
   log_dir: ./logs

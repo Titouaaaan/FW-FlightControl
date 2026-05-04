@@ -367,6 +367,8 @@ def save_checkpoint(
     lambda_current: float,
     train_history: Dict,
     val_history: Dict,
+    norm_scale: Optional[np.ndarray] = None,
+    norm_offset: Optional[np.ndarray] = None,
 ) -> None:
     """Save a training checkpoint to disk."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -380,5 +382,8 @@ def save_checkpoint(
     }
     if scheduler is not None:
         checkpoint['scheduler_state'] = scheduler.state_dict()
+    if norm_scale is not None:
+        checkpoint['norm_scale']  = norm_scale.tolist()
+        checkpoint['norm_offset'] = norm_offset.tolist()
     torch.save(checkpoint, path)
     print(f"Saved checkpoint to {path}")

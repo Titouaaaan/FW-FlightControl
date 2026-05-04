@@ -415,12 +415,21 @@ def main(resume_checkpoint: Optional[str] = None):
         start_epoch  = resume_state['start_epoch']
 
     # Load data
-    csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_progressive_noatmo.csv"
+    csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_progressive_noatmo_2.0.csv"
     train_loader, val_loader, _, denorm_factors, min_bounds = load_trajectory_data(str(csv_path), config)
     denorm_factors_torch = torch.tensor(denorm_factors, dtype=torch.float32, device=device)
     min_bounds_torch     = torch.tensor(min_bounds,     dtype=torch.float32, device=device)
-    # norm_scale / norm_offset semantics: (std, mean) for data-driven, ((max-min)/2, min) for bounds
     norm_type = get_norm_type(config)
+
+    # Log the exact norm params that will be embedded in every checkpoint.
+    # These must match what test_physics_model.py uses — copy them to config.normalization_params
+    # if re-running evaluation with a different seed.
+    if norm_type == 'data_driven_normalization':
+        print("\n" + "="*60)
+        print("NORMALIZATION PARAMS (embed these in config if evaluating later)")
+        print("="*60)
+        print(f"  norm_scale  (std):  {denorm_factors.tolist()}")
+        print(f"  norm_offset (mean): {min_bounds.tolist()}")
 
     # Per-state loss scaling (optional)
     per_state_scales_torch = None
@@ -588,6 +597,8 @@ def main(resume_checkpoint: Optional[str] = None):
                 checkpoint_base_dir / f"epoch_{epoch+1}.pt",
                 epoch, hybrid_model, optimizer, scheduler,
                 lambda_current, train_history, val_history,
+                norm_scale=denorm_factors if norm_type is not None else None,
+                norm_offset=min_bounds    if norm_type is not None else None,
             )
 
     print("\n" + "="*80)
@@ -596,11 +607,15 @@ def main(resume_checkpoint: Optional[str] = None):
     print(f"Final λ: {lambda_current:.4f}")
     print(f"Total epochs trained: {len(train_history['loss_total'])}")
 
-    # Save final model
+    # Save final model (same format as epoch checkpoints so test script can read norm params)
     final_path = checkpoint_base_dir / "final_model.pt"
     final_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(hybrid_model.residual_network.state_dict(), final_path)
-    print(f"Saved final model to {final_path}")
+    save_checkpoint(
+        final_path, num_epochs - 1, hybrid_model, optimizer, scheduler,
+        lambda_current, train_history, val_history,
+        norm_scale=denorm_factors if norm_type is not None else None,
+        norm_offset=min_bounds    if norm_type is not None else None,
+    )
 
     writer.close()
     print(f"TensorBoard logs saved to: {log_dir}")
