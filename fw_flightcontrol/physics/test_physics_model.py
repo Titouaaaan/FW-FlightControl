@@ -15,7 +15,7 @@ import torch
 import sys
 import argparse
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import numpy as np
 from tqdm import tqdm
 import pandas as pd
@@ -30,6 +30,7 @@ from fw_flightcontrol.physics.training_objective import HybridDynamicsODE
 from fw_flightcontrol.physics.utils import (
     load_config, load_trajectory_data, compute_actual_scales, STATE_NAMES,
     get_norm_type, normalize_state_torch, denormalize_state_torch,
+    clean_state_dict_for_compilation
 )
 
 
@@ -38,7 +39,7 @@ from fw_flightcontrol.physics.utils import (
 # ============================================================================
 
 def initialize_models(config: Dict, checkpoint_path: str, device: torch.device,
-                      with_prior: bool = True, with_residual: bool = True) -> HybridDynamicsModel:
+                      with_prior: bool = True, with_residual: bool = True) -> Tuple[HybridDynamicsModel, torch.Tensor, torch.Tensor, Optional[str]]:
     """
     Build the hybrid model and load residual network weights from checkpoint.
 
@@ -49,7 +50,11 @@ def initialize_models(config: Dict, checkpoint_path: str, device: torch.device,
         with_prior: Whether to include physics prior (ablation)
         with_residual: Whether to include learned residual (ablation)
 
+    Returns:
+        Tuple of (hybrid_model, denorm_factors, min_bounds, norm_type)
+        
     The checkpoint may be a full training checkpoint (dict) or a bare state_dict.
+    Normalization parameters are extracted from the checkpoint if available.
     """
     print("\n" + "="*60)
     print("INITIALIZING MODEL")
@@ -70,17 +75,40 @@ def initialize_models(config: Dict, checkpoint_path: str, device: torch.device,
     print(f"\n  Loading weights from: {checkpoint_path}")
     raw = torch.load(checkpoint_path, map_location=device)
 
+    # Extract normalization parameters from checkpoint
+    denorm_factors = None
+    min_bounds = None
+    norm_type = get_norm_type(config)
+
     if isinstance(raw, dict) and 'residual_state' in raw:
-        residual_network.load_state_dict(raw['residual_state'])
+        # Handle torch.compile artifacts
+        residual_state = clean_state_dict_for_compilation(raw['residual_state'])
+        residual_network.load_state_dict(residual_state)
         saved_epoch  = raw.get('epoch', '?')
         saved_lambda = raw.get('lambda', '?')
         print(f"  ✓ Loaded from training checkpoint (epoch={saved_epoch}, λ={saved_lambda})")
+        
+        # Extract normalization parameters from checkpoint (most reliable source)
+        if 'norm_scale' in raw and 'norm_offset' in raw:
+            denorm_factors = torch.tensor(raw['norm_scale'], dtype=torch.float32, device=device)
+            min_bounds = torch.tensor(raw['norm_offset'], dtype=torch.float32, device=device)
+            print(f"  ✓ Loaded normalization parameters from checkpoint")
     else:
+        # Handle torch.compile artifacts for bare state dict
+        raw = clean_state_dict_for_compilation(raw)
         residual_network.load_state_dict(raw)
         print("  ✓ Loaded bare state dict (final_model.pt format)")
 
     num_params = sum(p.numel() for p in residual_network.parameters())
     print(f"  ✓ Residual network: {num_params:,} parameters")
+
+    # If norm parameters not in checkpoint, try config
+    if norm_type is not None and denorm_factors is None:
+        if 'normalization_params' in config:
+            p = config['normalization_params']
+            denorm_factors = torch.tensor(p['norm_scale'], dtype=torch.float32, device=device)
+            min_bounds = torch.tensor(p['norm_offset'], dtype=torch.float32, device=device)
+            print(f"  ✓ Loaded normalization parameters from config")
 
     integration_method = config.get('integration', {}).get('method', 'rk4')
     hybrid_model = HybridDynamicsModel(
@@ -94,7 +122,7 @@ def initialize_models(config: Dict, checkpoint_path: str, device: torch.device,
     hybrid_model.eval()
 
     print(f"  ✓ Hybrid model ready on {device}")
-    return hybrid_model
+    return hybrid_model, denorm_factors, min_bounds, norm_type
 
 
 # ============================================================================
@@ -350,7 +378,7 @@ def main():
     parser = argparse.ArgumentParser(description='Evaluate a trained hybrid physics-augmented world model')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to .pt checkpoint (training checkpoint or final_model.pt)')
-    parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'],
+    parser.add_argument('--split', type=str, default='val', choices=['train', 'val', 'test'],
                         help='Which data split to evaluate on (default: test)')
     parser.add_argument('--with-prior',    type=lambda x: x.lower() in ('true', '1', 'yes'), default=True,
                         help='Include physics prior in model (default: True)')
@@ -373,28 +401,52 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"  Device           : {device}")
 
-    csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_progressive_noatmo.csv"
+    csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_progressive_noatmo_2.0.csv"
     train_loader, val_loader, test_loader, denorm_factors_computed, min_bounds_computed = load_trajectory_data(str(csv_path), config)
 
-    # ── Resolve normalization parameters (priority: checkpoint > config > computed) ──
-    # The model was trained with specific mean/std values. Using different ones at
-    # evaluation time breaks the residual network's normalized input space.
-    norm_type = get_norm_type(config)
-    denorm_factors, min_bounds, norm_source = _resolve_norm_params(
-        checkpoint_path=args.checkpoint,
-        config=config,
-        computed_scale=denorm_factors_computed,
-        computed_offset=min_bounds_computed,
-        norm_type=norm_type,
-        device='cpu',
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Load model and get normalization parameters from it
+    hybrid_model, denorm_factors, min_bounds, norm_type = initialize_models(
+        config, args.checkpoint, device,
+        with_prior=args.with_prior,
+        with_residual=args.with_residual
     )
 
-    print(f"\n  Normalization source : {norm_source}")
-    print(f"  norm_scale  (std):    {denorm_factors}")
-    print(f"  norm_offset (mean):   {min_bounds}")
+    # If model didn't provide normalization parameters, fall back to computed ones
+    if norm_type is not None:
+        if denorm_factors is None:
+            norm_type = get_norm_type(config)
+            denorm_factors, min_bounds, norm_source = _resolve_norm_params(
+                checkpoint_path=args.checkpoint,
+                config=config,
+                computed_scale=denorm_factors_computed,
+                computed_offset=min_bounds_computed,
+                norm_type=norm_type,
+                device='cpu',
+            )
+            print(f"\n  Normalization source : {norm_source}")
+        else:
+            norm_type = get_norm_type(config)
+            print(f"\n  Normalization source : checkpoint (extracted by initialize_models)")
+    else:
+        denorm_factors = None
+        min_bounds = None
 
-    denorm_factors_torch = torch.tensor(denorm_factors, dtype=torch.float32, device=device)
-    min_bounds_torch     = torch.tensor(min_bounds,     dtype=torch.float32, device=device)
+    if denorm_factors is not None and min_bounds is not None:
+        print(f"  norm_scale  (std):    {denorm_factors}")
+        print(f"  norm_offset (mean):   {min_bounds}")
+
+    # Convert to torch tensors if they're already tensors (from checkpoint)
+    if isinstance(denorm_factors, torch.Tensor):
+        denorm_factors_torch = denorm_factors.to(device)
+    else:
+        denorm_factors_torch = torch.tensor(denorm_factors, dtype=torch.float32, device=device) if denorm_factors is not None else None
+    
+    if isinstance(min_bounds, torch.Tensor):
+        min_bounds_torch = min_bounds.to(device)
+    else:
+        min_bounds_torch = torch.tensor(min_bounds, dtype=torch.float32, device=device) if min_bounds is not None else None
 
     per_state_scales_torch = None
     if config['data'].get('per_state_loss_norm', False):
@@ -408,10 +460,6 @@ def main():
 
     loader_map    = {'train': train_loader, 'val': val_loader, 'test': test_loader}
     target_loader = loader_map[args.split]
-
-    hybrid_model = initialize_models(config, args.checkpoint, device,
-                                     with_prior=args.with_prior,
-                                     with_residual=args.with_residual)
 
     evaluate(hybrid_model, target_loader, config, device, split_name=args.split,
              norm_type=norm_type,

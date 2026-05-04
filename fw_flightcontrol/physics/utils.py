@@ -32,6 +32,34 @@ def load_config(config_path: str) -> Dict:
         return yaml.safe_load(f)
 
 
+def clean_state_dict_for_compilation(state_dict: Dict) -> Dict:
+    """
+    Remove torch.compile artifacts from state dict.
+    
+    When models are compiled with torch.compile, the state dict keys are prefixed
+    with '_orig_mod.'. This function strips those prefixes so the state dict can
+    be loaded into an uncompiled model.
+    
+    Args:
+        state_dict: State dict potentially containing '_orig_mod.' prefixes
+    
+    Returns:
+        Cleaned state dict with prefixes removed (if present)
+    """
+    # Check if any key has the _orig_mod prefix
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        print("  ⚠ Detected torch.compile artifacts in state dict, cleaning...")
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('_orig_mod.'):
+                new_key = key.replace('_orig_mod.', '', 1)
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        return new_state_dict
+    return state_dict
+
+
 # ============================================================================
 # NORMALIZATION
 # ============================================================================
