@@ -315,6 +315,7 @@ class MPPIController:
 
     def reset(self):
         self.mean_actions = np.zeros((self.horizon, self.action_dim))
+        self.mean_actions[:, 2] = 0.3  # throttle warm-start near training data mean
 
     def optimize(
         self,
@@ -344,11 +345,11 @@ class MPPIController:
         )
         exploit_actions = np.clip(self.mean_actions[None] + noise, -1.0, 1.0)
         explore_actions = np.random.uniform(-1.0, 1.0, (n_random, self.horizon, self.action_dim))
+        explore_actions[:, :, 2] = np.random.uniform(0.0, 1.0, (n_random, self.horizon))
         sampled_actions = np.concatenate([exploit_actions, explore_actions], axis=0)
 
-        # Throttle (dim 2) is managed by the environment's PI controller, not MPPI.
-        # Fix it to 0 so model predictions match the actual environment behavior.
-        sampled_actions[:, :, 2] = 0.0
+        # Throttle lives in [0, 1] (aileron/elevator are [-1, 1])
+        sampled_actions[:, :, 2] = np.clip(sampled_actions[:, :, 2], 0.0, 1.0)
 
         # --- Roll out all samples through the dynamics model ---
         t_rollout = time.time()
@@ -358,12 +359,14 @@ class MPPIController:
         )
         time_rollout = time.time() - t_rollout
 
-        # --- Compute costs: sum of |roll_error| + |pitch_error| over horizon ---
+        # --- Compute costs: roll/pitch tracking + small airspeed penalty ---
         target_roll_rad = np.deg2rad(target_roll)
         target_pitch_rad = np.deg2rad(target_pitch)
+        target_va_ms = 60.0 / 3.6  # 16.667 m/s — env maintains 60 kph
         roll_errors  = np.abs(trajectories[:, :, 0] - target_roll_rad)
         pitch_errors = np.abs(trajectories[:, :, 1] - target_pitch_rad)
-        costs = np.sum(roll_errors + pitch_errors, axis=1)  # (num_samples,)
+        va_errors    = np.abs(trajectories[:, :, 2] - target_va_ms)
+        costs = np.sum(roll_errors + pitch_errors + 0.1 * va_errors, axis=1)
 
         # --- MPPI weights: exp(-(cost - min_cost) / temperature) ---
         valid_mask = np.isfinite(costs)
@@ -384,8 +387,10 @@ class MPPIController:
         # --- Update mean action sequence (weighted sum over all samples) ---
         self.mean_actions = np.einsum('k,khd->hd', weights, sampled_actions)
 
-        # Return the first action of the updated mean sequence
-        best_action = np.clip(self.mean_actions[0], -1.0, 1.0)
+        # Return the first action — aileron/elevator in [-1,1], throttle in [0,1]
+        best_action = self.mean_actions[0].copy()
+        best_action[:2] = np.clip(best_action[:2], -1.0, 1.0)
+        best_action[2]  = np.clip(best_action[2],  0.0,  1.0)
 
         # Shift mean forward for next call (warm-start)
         self._shift_mean()
@@ -393,9 +398,10 @@ class MPPIController:
         return best_action, self._debug_info(costs, valid_mask, weights, t_start, time_rollout)
 
     def _shift_mean(self):
-        """Shift nominal sequence one step forward; pad the last entry with zeros."""
+        """Shift nominal sequence one step forward; pad last entry with neutral values."""
         self.mean_actions = np.roll(self.mean_actions, -1, axis=0)
-        self.mean_actions[-1] = 0.0
+        self.mean_actions[-1, :2] = 0.0   # aileron/elevator neutral
+        self.mean_actions[-1, 2]  = 0.3   # throttle near training mean
 
     def _debug_info(self, costs, valid_mask, weights, t_start, time_rollout):
         # Report costs over valid trajectories only (exclude NaN-penalized ones)
@@ -452,6 +458,20 @@ def run_mppi_control(
           f"temperature={mppi_temperature}, noise_std={mppi_noise_std}")
     print("="*60 + "\n")
 
+    # Override the environment's PI-controller throttle with the MPPI-computed
+    # throttle. apply_action() sets aileron/elevator AND runs the PI throttle,
+    # then sim.run_step() uses whatever is in sim[throttle_cmd]. By monkey-patching
+    # apply_action we write our throttle AFTER the PI, before run_step().
+    from fw_jsbgym.utils import jsbsim_properties as prp
+    mppi_throttle_ref = [0.0]
+    _original_apply = env.unwrapped.apply_action
+
+    def _patched_apply_action(action):
+        _original_apply(action)
+        env.unwrapped.sim[prp.throttle_cmd] = float(np.clip(mppi_throttle_ref[0], 0.0, 1.0))
+
+    env.unwrapped.apply_action = _patched_apply_action
+
     controller = MPPIController(
         horizon=mppi_horizon,
         action_dim=3,
@@ -497,7 +517,8 @@ def run_mppi_control(
                 device,
             )
             
-            # Step environment (only send aileron and elevator)
+            # Feed MPPI throttle to the monkey-patched apply_action, then step
+            mppi_throttle_ref[0] = float(best_action[2])
             obs, reward, terminated, truncated, info = env.step(best_action[:2])
             episode_reward += reward
             time_step = (time.time() - t_step) * 1000  # Convert to ms
@@ -586,17 +607,17 @@ def main():
                         help='Path to model checkpoint')
     parser.add_argument('--config', type=str, default='training_params.yaml',
                         help='Path to training configuration file')
-    parser.add_argument('--target-roll', type=float, default=15,
+    parser.add_argument('--target-roll', type=float, default=-15,
                         help='Target roll angle in degrees')
-    parser.add_argument('--target-pitch', type=float, default=15,
+    parser.add_argument('--target-pitch', type=float, default=10,
                         help='Target pitch angle in degrees')
     parser.add_argument('--episodes', type=int, default=1,
                         help='Number of episodes to run')
-    parser.add_argument('--steps-per-episode', type=int, default=500,
+    parser.add_argument('--steps-per-episode', type=int, default=1000,
                         help='Max steps per episode')
-    parser.add_argument('--mppi-samples', type=int, default=200,
+    parser.add_argument('--mppi-samples', type=int, default=400,
                         help='Number of MPPI trajectory samples')
-    parser.add_argument('--mppi-horizon', type=int, default=20,
+    parser.add_argument('--mppi-horizon', type=int, default=15,
                         help='MPPI prediction horizon (steps at 0.01s each)')
     parser.add_argument('--mppi-temperature', type=float, default=1.0,
                         help='MPPI temperature λ. Match to cost scale (costs ~4-8 rad → λ~1.0)')
