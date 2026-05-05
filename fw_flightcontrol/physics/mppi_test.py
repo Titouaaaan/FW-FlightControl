@@ -34,6 +34,8 @@ sys.path.insert(0, '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl')
 from fw_flightcontrol.physics.physics_prior import PhysicsPrior
 from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel
 from fw_flightcontrol.physics.training_objective import HybridDynamicsODE
+from fw_flightcontrol.agents.pid import PID
+from fw_jsbgym.trim.trim_point import TrimPoint
 from fw_flightcontrol.physics.utils import (
     load_config, get_norm_type, normalize_state_torch, denormalize_state_torch,
     extract_bounds_from_config, compute_denorm_factors, compute_data_norm_params,
@@ -596,6 +598,83 @@ def run_mppi_control(
 
 
 # ============================================================================
+# PID-ONLY BASELINE
+# ============================================================================
+
+def run_pid_control(
+    env: gym.Env,
+    target_roll: float = 0.0,
+    target_pitch: float = 0.0,
+    max_episodes: int = 1,
+    max_steps_per_episode: int = 1000,
+):
+    """PID-only baseline using the same targets and step count as the MPPI run."""
+    print("\n" + "="*60)
+    print("PID BASELINE CONTROL")
+    print("="*60)
+    print(f"Target: Roll={target_roll:.1f}°, Pitch={target_pitch:.1f}°")
+    print("="*60 + "\n")
+
+    target_roll_rad  = np.deg2rad(target_roll)
+    target_pitch_rad = np.deg2rad(target_pitch)
+
+    all_roll_errors  = []
+    all_pitch_errors = []
+
+    for episode in range(max_episodes):
+        pid_aileron = PID(
+            kp=1.5, ki=0.1, kd=0.1,
+            dt=env.unwrapped.fdm_dt,
+            trim=TrimPoint(), limit=1.0, is_throttle=False,
+        )
+        pid_elevator = PID(
+            kp=-2.0, ki=-0.3, kd=-0.1,
+            dt=env.unwrapped.fdm_dt,
+            trim=TrimPoint(), limit=1.0, is_throttle=False,
+        )
+        pid_aileron.set_reference(target_roll_rad)
+        pid_elevator.set_reference(target_pitch_rad)
+
+        env.unwrapped.init()
+        obs, _ = env.reset()
+
+        ep_roll_errors  = []
+        ep_pitch_errors = []
+
+        for _ in range(max_steps_per_episode):
+            roll, pitch = obs[0], obs[1]
+            p_radps, q_radps = obs[3], obs[4]
+
+            aileron_cmd, _, _  = pid_aileron.update(state=roll,  state_dot=p_radps, saturate=True, normalize=False)
+            elevator_cmd, _, _ = pid_elevator.update(state=pitch, state_dot=q_radps, saturate=True, normalize=False)
+
+            obs, _, terminated, truncated, _ = env.step(np.array([aileron_cmd, elevator_cmd]))
+
+            ep_roll_errors.append(abs(np.rad2deg(obs[0]) - target_roll))
+            ep_pitch_errors.append(abs(np.rad2deg(obs[1]) - target_pitch))
+
+            if terminated or truncated:
+                break
+
+        all_roll_errors.extend(ep_roll_errors)
+        all_pitch_errors.extend(ep_pitch_errors)
+
+    print("PID BASELINE - FINAL SUMMARY")
+    print("="*60)
+    print(f"Target angles:   Roll={target_roll:.1f}°, Pitch={target_pitch:.1f}°")
+    print(f"Steps evaluated: {len(all_roll_errors)}")
+    print(f"Roll  error — Mean: {np.mean(all_roll_errors):.2f}°  "
+          f"Std: {np.std(all_roll_errors):.2f}°  "
+          f"Max: {np.max(all_roll_errors):.2f}°")
+    print(f"Pitch error — Mean: {np.mean(all_pitch_errors):.2f}°  "
+          f"Std: {np.std(all_pitch_errors):.2f}°  "
+          f"Max: {np.max(all_pitch_errors):.2f}°")
+    print("="*60 + "\n")
+
+    env.close()
+
+
+# ============================================================================
 # MAIN ENTRY POINT
 # ============================================================================
 
@@ -625,6 +704,8 @@ def main():
                         help='Std of perturbation noise around warm-started mean action')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Device to use (cuda or cpu)')
+    parser.add_argument('--pid', action='store_true', default=False,
+                        help='Run PID-only baseline after MPPI using the same targets and steps')
     
     args = parser.parse_args()
     
@@ -679,6 +760,16 @@ def main():
         mppi_noise_std=args.mppi_noise_std,
         model_path=args.checkpoint,
     )
+
+    if args.pid:
+        env = initialize_environment(cfg)
+        run_pid_control(
+            env,
+            target_roll=args.target_roll,
+            target_pitch=args.target_pitch,
+            max_episodes=args.episodes,
+            max_steps_per_episode=args.steps_per_episode,
+        )
 
 
 if __name__ == '__main__':
