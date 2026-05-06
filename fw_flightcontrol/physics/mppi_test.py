@@ -39,7 +39,7 @@ from fw_jsbgym.trim.trim_point import TrimPoint
 from fw_flightcontrol.physics.utils import (
     load_config, get_norm_type, normalize_state_torch, denormalize_state_torch,
     extract_bounds_from_config, compute_denorm_factors, compute_data_norm_params,
-    clean_state_dict_for_compilation
+    clean_state_dict_for_compilation, compute_convergence_stats, plot_tracking_performance,
 )
 
 
@@ -482,6 +482,9 @@ def run_mppi_control(
         noise_std=mppi_noise_std,
     )
 
+    all_roll_deg   = []  # actual angle history across all episodes
+    all_pitch_deg  = []
+
     for episode in range(max_episodes):
         print(f"\n{'='*60}")
         print(f"EPISODE {episode + 1}/{max_episodes}")
@@ -497,6 +500,8 @@ def run_mppi_control(
         episode_reward = 0.0
         episode_roll_errors = []
         episode_pitch_errors = []
+        episode_roll_deg    = []
+        episode_pitch_deg   = []
         actions_taken = []
         episode_timings = []
 
@@ -539,6 +544,8 @@ def run_mppi_control(
             
             episode_roll_errors.append(roll_error_abs)
             episode_pitch_errors.append(pitch_error_abs)
+            episode_roll_deg.append(np.rad2deg(roll_rad))
+            episode_pitch_deg.append(np.rad2deg(pitch_rad))
             actions_taken.append(best_action)
             episode_timings.append(time_step)
             
@@ -553,26 +560,46 @@ def run_mppi_control(
                 break
         
         # Episode statistics
-        avg_roll_error = np.mean(episode_roll_errors)
+        avg_roll_error  = np.mean(episode_roll_errors)
         avg_pitch_error = np.mean(episode_pitch_errors)
-        avg_step_time = np.mean(episode_timings)
-        
+        avg_step_time   = np.mean(episode_timings)
+
+        roll_conv  = compute_convergence_stats(episode_roll_deg,  target_roll,  threshold_deg=1.0)
+        pitch_conv = compute_convergence_stats(episode_pitch_deg, target_pitch, threshold_deg=1.0)
+
+        all_roll_deg.extend(episode_roll_deg)
+        all_pitch_deg.extend(episode_pitch_deg)
+
         print(f"\n{'='*60}")
         print(f"EPISODE {episode + 1} SUMMARY")
         print(f"{'='*60}")
         print(f"Steps executed:        {len(episode_roll_errors)}")
         print(f"Total reward:          {episode_reward:>10.4f}")
         print(f"Avg time per step:     {avg_step_time:>10.2f} ms")
-        print(f"\nRoll Tracking:")
+        print(f"\nRoll Tracking (target={target_roll:.1f}°, threshold=±1°):")
         print(f"  Mean error:          {avg_roll_error:>10.2f}°")
         print(f"  Std dev:             {np.std(episode_roll_errors):>10.2f}°")
         print(f"  Min error:           {np.min(episode_roll_errors):>10.2f}°")
         print(f"  Max error:           {np.max(episode_roll_errors):>10.2f}°")
-        print(f"\nPitch Tracking:")
+        if roll_conv['convergence_step'] is not None:
+            print(f"  Converged at step:   {roll_conv['convergence_step']:>10d}  "
+                  f"({roll_conv['convergence_step'] * 0.01:.2f}s)")
+        else:
+            print(f"  Converged at step:       never (threshold ±2°)")
+        print(f"  Steady-state mean err:{roll_conv['steady_mean_error']:>9.2f}°")
+        print(f"  Steady-state std:    {roll_conv['steady_std']:>10.2f}°")
+        print(f"\nPitch Tracking (target={target_pitch:.1f}°, threshold=±1°):")
         print(f"  Mean error:          {avg_pitch_error:>10.2f}°")
         print(f"  Std dev:             {np.std(episode_pitch_errors):>10.2f}°")
         print(f"  Min error:           {np.min(episode_pitch_errors):>10.2f}°")
         print(f"  Max error:           {np.max(episode_pitch_errors):>10.2f}°")
+        if pitch_conv['convergence_step'] is not None:
+            print(f"  Converged at step:   {pitch_conv['convergence_step']:>10d}  "
+                  f"({pitch_conv['convergence_step'] * 0.01:.2f}s)")
+        else:
+            print(f"  Converged at step:       never (threshold ±2°)")
+        print(f"  Steady-state mean err:{pitch_conv['steady_mean_error']:>9.2f}°")
+        print(f"  Steady-state std:    {pitch_conv['steady_std']:>10.2f}°")
         
         # Action statistics
         actions_array = np.array(actions_taken)
@@ -585,7 +612,7 @@ def run_mppi_control(
               f"Min: {np.min(actions_array[:, 2]):>7.3f}  Max: {np.max(actions_array[:, 2]):>7.3f}")
     
     env.close()
-    
+
     # Print final summary across all episodes
     print("\n" + "="*60)
     print("MPPI CONTROL COMPLETE - FINAL SUMMARY")
@@ -595,6 +622,8 @@ def run_mppi_control(
     print(f"Target angles:         Roll={target_roll:.1f}°, Pitch={target_pitch:.1f}°")
     print(f"MPPI Configuration:    samples={mppi_samples}, horizon={mppi_horizon}, temp={mppi_temperature}")
     print("="*60 + "\n")
+
+    return all_roll_deg, all_pitch_deg
 
 
 # ============================================================================
@@ -620,6 +649,8 @@ def run_pid_control(
 
     all_roll_errors  = []
     all_pitch_errors = []
+    all_roll_deg     = []
+    all_pitch_deg    = []
 
     for episode in range(max_episodes):
         pid_aileron = PID(
@@ -640,6 +671,8 @@ def run_pid_control(
 
         ep_roll_errors  = []
         ep_pitch_errors = []
+        ep_roll_deg     = []
+        ep_pitch_deg    = []
 
         for _ in range(max_steps_per_episode):
             roll, pitch = obs[0], obs[1]
@@ -650,28 +683,44 @@ def run_pid_control(
 
             obs, _, terminated, truncated, _ = env.step(np.array([aileron_cmd, elevator_cmd]))
 
-            ep_roll_errors.append(abs(np.rad2deg(obs[0]) - target_roll))
-            ep_pitch_errors.append(abs(np.rad2deg(obs[1]) - target_pitch))
+            ep_roll_deg.append(np.rad2deg(obs[0]))
+            ep_pitch_deg.append(np.rad2deg(obs[1]))
+            ep_roll_errors.append(abs(ep_roll_deg[-1] - target_roll))
+            ep_pitch_errors.append(abs(ep_pitch_deg[-1] - target_pitch))
 
             if terminated or truncated:
                 break
 
         all_roll_errors.extend(ep_roll_errors)
         all_pitch_errors.extend(ep_pitch_errors)
+        all_roll_deg.extend(ep_roll_deg)
+        all_pitch_deg.extend(ep_pitch_deg)
+
+    roll_conv  = compute_convergence_stats(all_roll_deg,  target_roll,  threshold_deg=1.0)
+    pitch_conv = compute_convergence_stats(all_pitch_deg, target_pitch, threshold_deg=1.0)
 
     print("PID BASELINE - FINAL SUMMARY")
     print("="*60)
     print(f"Target angles:   Roll={target_roll:.1f}°, Pitch={target_pitch:.1f}°")
     print(f"Steps evaluated: {len(all_roll_errors)}")
-    print(f"Roll  error — Mean: {np.mean(all_roll_errors):.2f}°  "
-          f"Std: {np.std(all_roll_errors):.2f}°  "
-          f"Max: {np.max(all_roll_errors):.2f}°")
-    print(f"Pitch error — Mean: {np.mean(all_pitch_errors):.2f}°  "
-          f"Std: {np.std(all_pitch_errors):.2f}°  "
-          f"Max: {np.max(all_pitch_errors):.2f}°")
+    print(f"\nRoll  (threshold ±2°):")
+    print(f"  Mean error: {np.mean(all_roll_errors):.2f}°  Std: {np.std(all_roll_errors):.2f}°  Max: {np.max(all_roll_errors):.2f}°")
+    if roll_conv['convergence_step'] is not None:
+        print(f"  Converged at step {roll_conv['convergence_step']}  ({roll_conv['convergence_step'] * 0.01:.2f}s)")
+    else:
+        print(f"  Never converged (threshold ±2°)")
+    print(f"  Steady-state mean error: {roll_conv['steady_mean_error']:.2f}°  |  Std: {roll_conv['steady_std']:.2f}°")
+    print(f"\nPitch (threshold ±2°):")
+    print(f"  Mean error: {np.mean(all_pitch_errors):.2f}°  Std: {np.std(all_pitch_errors):.2f}°  Max: {np.max(all_pitch_errors):.2f}°")
+    if pitch_conv['convergence_step'] is not None:
+        print(f"  Converged at step {pitch_conv['convergence_step']}  ({pitch_conv['convergence_step'] * 0.01:.2f}s)")
+    else:
+        print(f"  Never converged (threshold ±2°)")
+    print(f"  Steady-state mean error: {pitch_conv['steady_mean_error']:.2f}°  |  Std: {pitch_conv['steady_std']:.2f}°")
     print("="*60 + "\n")
 
     env.close()
+    return all_roll_deg, all_pitch_deg
 
 
 # ============================================================================
@@ -742,7 +791,7 @@ def main():
         return
     
     # Run MPPI control
-    run_mppi_control(
+    mppi_roll, mppi_pitch = run_mppi_control(
         env,
         hybrid_model,
         model_config,
@@ -761,15 +810,25 @@ def main():
         model_path=args.checkpoint,
     )
 
+    pid_roll, pid_pitch = None, None
     if args.pid:
         env = initialize_environment(cfg)
-        run_pid_control(
+        pid_roll, pid_pitch = run_pid_control(
             env,
             target_roll=args.target_roll,
             target_pitch=args.target_pitch,
             max_episodes=args.episodes,
             max_steps_per_episode=args.steps_per_episode,
         )
+
+    plot_tracking_performance(
+        target_roll=args.target_roll,
+        target_pitch=args.target_pitch,
+        mppi_roll=mppi_roll,
+        mppi_pitch=mppi_pitch,
+        pid_roll=pid_roll,
+        pid_pitch=pid_pitch,
+    )
 
 
 if __name__ == '__main__':

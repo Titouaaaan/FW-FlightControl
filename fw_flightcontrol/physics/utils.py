@@ -415,3 +415,107 @@ def save_checkpoint(
         checkpoint['norm_offset'] = norm_offset.tolist()
     torch.save(checkpoint, path)
     print(f"Saved checkpoint to {path}")
+
+
+# ============================================================================
+# CONTROL EVALUATION UTILITIES
+# ============================================================================
+
+def compute_convergence_stats(
+    history_deg: List[float],
+    target_deg: float,
+    threshold_deg: float = 1.0,
+    min_stable_steps: int = 100,
+) -> Dict:
+    """Detect convergence and measure steady-state stability.
+
+    Convergence is defined as the first step after which the error stays
+    within `threshold_deg` for at least `min_stable_steps` consecutive steps.
+    Steady-state statistics are computed from that point onward (or the last
+    20 % of steps if convergence is never reached).
+
+    Returns a dict with:
+      convergence_step  — step index of first convergence, or None
+      steady_mean_error — mean |angle - target| in steady state [°]
+      steady_std        — std of actual angle in steady state [°] (oscillation measure)
+    """
+    errors = np.abs(np.array(history_deg) - target_deg)
+    n = len(errors)
+
+    convergence_step = None
+    for i in range(n - min_stable_steps + 1):
+        if np.all(errors[i : i + min_stable_steps] < threshold_deg):
+            convergence_step = i
+            break
+
+    steady_slice = slice(convergence_step, None) if convergence_step is not None \
+                   else slice(int(0.8 * n), None)
+
+    return {
+        'convergence_step': convergence_step,
+        'steady_mean_error': float(np.mean(errors[steady_slice])),
+        'steady_std': float(np.std(np.array(history_deg)[steady_slice])),
+    }
+
+
+def plot_tracking_performance(
+    target_roll: float,
+    target_pitch: float,
+    filename: str = 'tracking_performance.png',
+    mppi_roll: Optional[List[float]] = None,
+    mppi_pitch: Optional[List[float]] = None,
+    pid_roll: Optional[List[float]] = None,
+    pid_pitch: Optional[List[float]] = None,
+    dt: float = 0.01,
+) -> None:
+    """Save a 2-subplot tracking performance figure (roll top, pitch bottom).
+
+    Always saves to FW-FlightControl/fw_flightcontrol/data/mppi-performance/,
+    creating the folder if it does not exist.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    save_dir = Path(__file__).parent.parent / 'data' / 'mppi-performance'
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / filename
+
+    fig, (ax_roll, ax_pitch) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+
+    def time_axis(history):
+        return np.arange(len(history)) * dt
+
+    # --- Roll subplot ---
+    if mppi_roll is not None:
+        t = time_axis(mppi_roll)
+        ax_roll.plot(t, mppi_roll, color='steelblue', linewidth=1.2, label='MPPI')
+        ax_roll.axhline(target_roll, color='red', linestyle='--', linewidth=1.2, label='Target')
+    if pid_roll is not None:
+        t = time_axis(pid_roll)
+        ax_roll.plot(t, pid_roll, color='darkorange', linewidth=1.2, label='PID')
+        if mppi_roll is None:
+            ax_roll.axhline(target_roll, color='red', linestyle='--', linewidth=1.2, label='Target')
+    ax_roll.set_ylabel('Roll angle [°]')
+    ax_roll.legend(loc='upper right')
+    ax_roll.grid(True, alpha=0.3)
+
+    # --- Pitch subplot ---
+    if mppi_pitch is not None:
+        t = time_axis(mppi_pitch)
+        ax_pitch.plot(t, mppi_pitch, color='steelblue', linewidth=1.2, label='MPPI')
+        ax_pitch.axhline(target_pitch, color='red', linestyle='--', linewidth=1.2, label='Target')
+    if pid_pitch is not None:
+        t = time_axis(pid_pitch)
+        ax_pitch.plot(t, pid_pitch, color='darkorange', linewidth=1.2, label='PID')
+        if mppi_pitch is None:
+            ax_pitch.axhline(target_pitch, color='red', linestyle='--', linewidth=1.2, label='Target')
+    ax_pitch.set_ylabel('Pitch angle [°]')
+    ax_pitch.set_xlabel('Time [s]')
+    ax_pitch.legend(loc='upper right')
+    ax_pitch.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Tracking plot saved to {save_path}")
