@@ -519,3 +519,44 @@ def plot_tracking_performance(
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Tracking plot saved to {save_path}")
+
+
+def plot_action_history(
+    filename: str = 'action_history.png',
+    mppi_actions: Optional[np.ndarray] = None,
+    pid_actions: Optional[np.ndarray] = None,
+    dt: float = 0.01,
+) -> None:
+    """Save a 3-subplot action history figure (aileron, elevator, throttle).
+
+    mppi_actions / pid_actions: arrays of shape (N, 3) — columns are
+    [aileron, elevator, throttle]. Either may be None.
+    Saved to FW-FlightControl/fw_flightcontrol/data/mppi-performance/.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    save_dir = Path(__file__).parent.parent / 'data' / 'mppi-performance'
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / filename
+
+    labels   = ['Aileron command [-]', 'Elevator command [-]', 'Throttle command [-]']
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+
+    for i, (ax, ylabel) in enumerate(zip(axes, labels)):
+        if mppi_actions is not None:
+            t = np.arange(len(mppi_actions)) * dt
+            ax.plot(t, mppi_actions[:, i], color='steelblue', linewidth=1.0, label='MPPI')
+        if pid_actions is not None:
+            t = np.arange(len(pid_actions)) * dt
+            ax.plot(t, pid_actions[:, i], color='darkorange', linewidth=1.0, label='PID')
+        ax.set_ylabel(ylabel)
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel('Time [s]')
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Action history plot saved to {save_path}")

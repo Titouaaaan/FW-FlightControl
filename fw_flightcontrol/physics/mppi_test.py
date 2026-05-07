@@ -39,7 +39,8 @@ from fw_jsbgym.trim.trim_point import TrimPoint
 from fw_flightcontrol.physics.utils import (
     load_config, get_norm_type, normalize_state_torch, denormalize_state_torch,
     extract_bounds_from_config, compute_denorm_factors, compute_data_norm_params,
-    clean_state_dict_for_compilation, compute_convergence_stats, plot_tracking_performance,
+    clean_state_dict_for_compilation, compute_convergence_stats,
+    plot_tracking_performance, plot_action_history,
 )
 
 
@@ -484,6 +485,7 @@ def run_mppi_control(
 
     all_roll_deg   = []  # actual angle history across all episodes
     all_pitch_deg  = []
+    all_actions    = []
 
     for episode in range(max_episodes):
         print(f"\n{'='*60}")
@@ -569,6 +571,7 @@ def run_mppi_control(
 
         all_roll_deg.extend(episode_roll_deg)
         all_pitch_deg.extend(episode_pitch_deg)
+        all_actions.extend(actions_taken)
 
         print(f"\n{'='*60}")
         print(f"EPISODE {episode + 1} SUMMARY")
@@ -623,7 +626,7 @@ def run_mppi_control(
     print(f"MPPI Configuration:    samples={mppi_samples}, horizon={mppi_horizon}, temp={mppi_temperature}")
     print("="*60 + "\n")
 
-    return all_roll_deg, all_pitch_deg
+    return all_roll_deg, all_pitch_deg, np.array(all_actions)
 
 
 # ============================================================================
@@ -647,10 +650,13 @@ def run_pid_control(
     target_roll_rad  = np.deg2rad(target_roll)
     target_pitch_rad = np.deg2rad(target_pitch)
 
+    from fw_jsbgym.utils import jsbsim_properties as prp
+
     all_roll_errors  = []
     all_pitch_errors = []
     all_roll_deg     = []
     all_pitch_deg    = []
+    all_actions      = []
 
     for episode in range(max_episodes):
         pid_aileron = PID(
@@ -673,6 +679,7 @@ def run_pid_control(
         ep_pitch_errors = []
         ep_roll_deg     = []
         ep_pitch_deg    = []
+        ep_actions      = []
 
         for _ in range(max_steps_per_episode):
             roll, pitch = obs[0], obs[1]
@@ -683,6 +690,8 @@ def run_pid_control(
 
             obs, _, terminated, truncated, _ = env.step(np.array([aileron_cmd, elevator_cmd]))
 
+            throttle = env.unwrapped.sim[prp.throttle_cmd]
+            ep_actions.append([aileron_cmd, elevator_cmd, throttle])
             ep_roll_deg.append(np.rad2deg(obs[0]))
             ep_pitch_deg.append(np.rad2deg(obs[1]))
             ep_roll_errors.append(abs(ep_roll_deg[-1] - target_roll))
@@ -695,6 +704,7 @@ def run_pid_control(
         all_pitch_errors.extend(ep_pitch_errors)
         all_roll_deg.extend(ep_roll_deg)
         all_pitch_deg.extend(ep_pitch_deg)
+        all_actions.extend(ep_actions)
 
     roll_conv  = compute_convergence_stats(all_roll_deg,  target_roll,  threshold_deg=1.0)
     pitch_conv = compute_convergence_stats(all_pitch_deg, target_pitch, threshold_deg=1.0)
@@ -720,7 +730,7 @@ def run_pid_control(
     print("="*60 + "\n")
 
     env.close()
-    return all_roll_deg, all_pitch_deg
+    return all_roll_deg, all_pitch_deg, np.array(all_actions)
 
 
 # ============================================================================
@@ -735,15 +745,15 @@ def main():
                         help='Path to model checkpoint')
     parser.add_argument('--config', type=str, default='training_params.yaml',
                         help='Path to training configuration file')
-    parser.add_argument('--target-roll', type=float, default=-15,
+    parser.add_argument('--target-roll', type=float, default=20,
                         help='Target roll angle in degrees')
     parser.add_argument('--target-pitch', type=float, default=10,
                         help='Target pitch angle in degrees')
     parser.add_argument('--episodes', type=int, default=1,
                         help='Number of episodes to run')
-    parser.add_argument('--steps-per-episode', type=int, default=1000,
+    parser.add_argument('--steps-per-episode', type=int, default=750,
                         help='Max steps per episode')
-    parser.add_argument('--mppi-samples', type=int, default=400,
+    parser.add_argument('--mppi-samples', type=int, default=600,
                         help='Number of MPPI trajectory samples')
     parser.add_argument('--mppi-horizon', type=int, default=15,
                         help='MPPI prediction horizon (steps at 0.01s each)')
@@ -791,7 +801,7 @@ def main():
         return
     
     # Run MPPI control
-    mppi_roll, mppi_pitch = run_mppi_control(
+    mppi_roll, mppi_pitch, mppi_actions = run_mppi_control(
         env,
         hybrid_model,
         model_config,
@@ -810,10 +820,10 @@ def main():
         model_path=args.checkpoint,
     )
 
-    pid_roll, pid_pitch = None, None
+    pid_roll, pid_pitch, pid_actions = None, None, None
     if args.pid:
         env = initialize_environment(cfg)
-        pid_roll, pid_pitch = run_pid_control(
+        pid_roll, pid_pitch, pid_actions = run_pid_control(
             env,
             target_roll=args.target_roll,
             target_pitch=args.target_pitch,
@@ -828,6 +838,11 @@ def main():
         mppi_pitch=mppi_pitch,
         pid_roll=pid_roll,
         pid_pitch=pid_pitch,
+    )
+
+    plot_action_history(
+        mppi_actions=mppi_actions,
+        pid_actions=pid_actions,
     )
 
 
