@@ -26,41 +26,43 @@ from pathlib import Path
 # ============================================================================
 # Trajectory parameters
 NUM_STEPS = 2000                           # 20 seconds at 100 Hz
-TARGET_CHANGE_INTERVAL = 100               # steps between target changes (8 intervals total)
-NUM_INTERVALS = NUM_STEPS // TARGET_CHANGE_INTERVAL  # 8 intervals
+TARGET_CHANGE_INTERVAL_MIN = 80            # minimum steps between target changes
+TARGET_CHANGE_INTERVAL_MAX = 120           # maximum steps between target changes
 
-# Target angle bounds (degrees)
-ROLL_MIN, ROLL_MAX = -45, 45
-PITCH_MIN, PITCH_MAX = -25, 25
+# Target angle bounds — covers both nominal and hard targets (degrees)
+# Nominal: roll [-45, 45], pitch [-25, 25]
+# Hard:    roll [-60, -45[ and ]45, 60], pitch [-30, -25[ and ]25, 30]
+ROLL_MIN, ROLL_MAX = -60, 60
+PITCH_MIN, PITCH_MAX = -30, 30
 
 # Maximum change per interval (degrees)
-MAX_DELTA_ROLL = 12
-MAX_DELTA_PITCH = 12
+MAX_DELTA_ROLL = 20
+MAX_DELTA_PITCH = 15
 
 # Number of trajectories to generate
-NUM_TRAJECTORIES = 50
+NUM_TRAJECTORIES = 60
 
 # JSBSim environment configurations to generate data for
 JSBSIM_CONFIGS = ['noatmo']
 
 
-def generate_progressive_targets(num_intervals=NUM_INTERVALS, 
-                                 max_delta_roll=MAX_DELTA_ROLL, 
+def generate_progressive_targets(num_intervals=20,
+                                 max_delta_roll=MAX_DELTA_ROLL,
                                  max_delta_pitch=MAX_DELTA_PITCH,
                                  roll_min=ROLL_MIN, roll_max=ROLL_MAX,
                                  pitch_min=PITCH_MIN, pitch_max=PITCH_MAX):
     """
     Generate progressive target angles that change smoothly every interval.
-    
+
     Uses a random walk approach to ensure smooth transitions between targets.
-    
+
     Args:
-        num_intervals: Number of intervals (default 8 for 2000 steps)
+        num_intervals: Number of intervals
         max_delta_roll: Maximum change in roll angle per interval (degrees)
         max_delta_pitch: Maximum change in pitch angle per interval (degrees)
         roll_min, roll_max: Bounds for roll angle
         pitch_min, pitch_max: Bounds for pitch angle
-    
+
     Returns:
         Tuple of (roll_targets, pitch_targets) arrays of length num_intervals
     """
@@ -83,8 +85,8 @@ def generate_progressive_targets(num_intervals=NUM_INTERVALS,
     return np.array(roll_targets), np.array(pitch_targets)
 
 
-def expand_targets_to_trajectory(roll_targets_array, pitch_targets_array, 
-                                 target_change_interval=TARGET_CHANGE_INTERVAL):
+def expand_targets_to_trajectory(roll_targets_array, pitch_targets_array,
+                                 target_change_interval=100):
     """
     Expand interval-based targets to full trajectory length.
     
@@ -106,32 +108,22 @@ def expand_targets_to_trajectory(roll_targets_array, pitch_targets_array,
     return np.array(roll_targets_full), np.array(pitch_targets_full)
 
 
-def run_single_trajectory(env, trajectory_num, roll_targets_array, pitch_targets_array):
+def run_single_trajectory(env, trajectory_num):
     """
     Run a single attitude control trajectory with time-varying targets.
-    
-    Targets change every TARGET_CHANGE_INTERVAL steps to progressively cover
-    the observable space efficiently.
-    
-    Args:
-        env: The attitude control environment
-        trajectory_num: Trajectory number for display
-        roll_targets_array: Array of target roll angles (one per interval)
-        pitch_targets_array: Array of target pitch angles (one per interval)
-    
+
+    Targets change every TARGET_CHANGE_INTERVAL_MIN–TARGET_CHANGE_INTERVAL_MAX steps
+    (random walk, clipped to bounds) to cover both nominal and hard target angles.
+
     Returns:
-        Dictionary with:
-        - Trajectory metadata
-        - List of transitions: [(s_t, a_t, s_t+1, r_t), ...]
+        Dictionary with trajectory metadata and list of transitions.
     """
-    
-    # Expand interval-based targets to full trajectory
-    roll_targets_deg = expand_targets_to_trajectory(roll_targets_array, pitch_targets_array)[0]
-    pitch_targets_deg = expand_targets_to_trajectory(roll_targets_array, pitch_targets_array)[1]
-    
-    # Convert to radians
-    roll_targets_rad = np.deg2rad(roll_targets_deg)
-    pitch_targets_rad = np.deg2rad(pitch_targets_deg)
+    # Dynamic target initialisation — starts at a random point within bounds
+    current_roll_deg  = np.random.uniform(ROLL_MIN, ROLL_MAX)
+    current_pitch_deg = np.random.uniform(PITCH_MIN, PITCH_MAX)
+    steps_until_change = np.random.randint(TARGET_CHANGE_INTERVAL_MIN, TARGET_CHANGE_INTERVAL_MAX + 1)
+    steps_in_current   = 0
+    targets_log = [(current_roll_deg, current_pitch_deg)]  # for metadata
     
     # Initialize PID controllers
     pid_aileron = PID(
@@ -163,87 +155,95 @@ def run_single_trajectory(env, trajectory_num, roll_targets_array, pitch_targets
     pitch_errors = []
     
     for step in range(NUM_STEPS):
-        # Get current target for this step
-        target_roll_current = roll_targets_rad[step]
-        target_pitch_current = pitch_targets_rad[step]
-        
+        # Switch target when the current interval expires
+        if steps_in_current >= steps_until_change:
+            current_roll_deg  = np.clip(
+                current_roll_deg  + np.random.uniform(-MAX_DELTA_ROLL,  MAX_DELTA_ROLL),
+                ROLL_MIN, ROLL_MAX
+            )
+            current_pitch_deg = np.clip(
+                current_pitch_deg + np.random.uniform(-MAX_DELTA_PITCH, MAX_DELTA_PITCH),
+                PITCH_MIN, PITCH_MAX
+            )
+            steps_until_change = np.random.randint(TARGET_CHANGE_INTERVAL_MIN, TARGET_CHANGE_INTERVAL_MAX + 1)
+            steps_in_current   = 0
+            targets_log.append((current_roll_deg, current_pitch_deg))
+
+        target_roll_current  = np.deg2rad(current_roll_deg)
+        target_pitch_current = np.deg2rad(current_pitch_deg)
+        steps_in_current += 1
+
         # Store current state (s_t)
         state_t = obs.copy()
-        
+
         # Extract state for PID
-        roll = obs[0]
-        pitch = obs[1]
-        p_radps = obs[3]  # roll rate
-        q_radps = obs[4]  # pitch rate
-        
+        roll    = obs[0]
+        pitch   = obs[1]
+        p_radps = obs[3]
+        q_radps = obs[4]
+
         # Update PID references and compute commands
         pid_aileron.set_reference(target_roll_current)
         pid_elevator.set_reference(target_pitch_current)
-        
-        aileron_cmd, _, _ = pid_aileron.update(state=roll, state_dot=p_radps, saturate=True, normalize=False)
+
+        aileron_cmd,  _, _ = pid_aileron.update(state=roll,  state_dot=p_radps, saturate=True, normalize=False)
         elevator_cmd, _, _ = pid_elevator.update(state=pitch, state_dot=q_radps, saturate=True, normalize=False)
-        
-        # Store action (a_t) - will be updated with throttle after step
-        action = np.array([aileron_cmd, elevator_cmd, 0.0])  # throttle added below
-        
-        # Step environment
-        obs, reward, terminated, truncated, info = env.step(action[:2])  # Only send aileron/elevator to env
+
+        # Store action (a_t) — throttle filled in after step
+        action = np.array([aileron_cmd, elevator_cmd, 0.0])
+
+        obs, reward, terminated, truncated, info = env.step(action[:2])
         episode_reward += reward
-        
-        # Query throttle from environment after step
-        throttle = env.unwrapped.sim[prp.throttle_cmd]
-        action[2] = throttle  # Update 3rd dimension with actual throttle
-        
-        # Store next state (s_t+1) and transition info
+
+        throttle   = env.unwrapped.sim[prp.throttle_cmd]
+        action[2]  = throttle
+
         state_next = obs.copy()
-        terminal = terminated or truncated
-        
-        # Record transition with current targets
+        terminal   = terminated or truncated
+
         transitions.append({
-            'state_t': state_t,
-            'action': action,
-            'state_next': state_next,
-            'reward': reward,
-            'terminal': terminal,
-            'target_roll': np.rad2deg(target_roll_current),
-            'target_pitch': np.rad2deg(target_pitch_current)
+            'state_t':      state_t,
+            'action':       action,
+            'state_next':   state_next,
+            'reward':       reward,
+            'terminal':     terminal,
+            'target_roll':  current_roll_deg,
+            'target_pitch': current_pitch_deg,
         })
-        
-        # Track angles and errors for statistics
+
         roll_angles.append(np.rad2deg(obs[0]))
         pitch_angles.append(np.rad2deg(obs[1]))
-        
+
         if len(obs) > 7:
             roll_errors.append(np.rad2deg(obs[6]))
             pitch_errors.append(np.rad2deg(obs[7]))
         else:
-            roll_errors.append(np.rad2deg(target_roll_current - obs[0]))
+            roll_errors.append(np.rad2deg(target_roll_current  - obs[0]))
             pitch_errors.append(np.rad2deg(target_pitch_current - obs[1]))
-        
+
         if terminal:
             break
-    
+
     env.close()
-    
-    # Compute final statistics
-    avg_roll = np.mean(roll_angles) if roll_angles else 0.0
-    avg_pitch = np.mean(pitch_angles) if pitch_angles else 0.0
-    avg_roll_error = np.mean(np.abs(roll_errors)) if roll_errors else 0.0
+
+    avg_roll        = np.mean(roll_angles)        if roll_angles  else 0.0
+    avg_pitch       = np.mean(pitch_angles)       if pitch_angles else 0.0
+    avg_roll_error  = np.mean(np.abs(roll_errors))  if roll_errors  else 0.0
     avg_pitch_error = np.mean(np.abs(pitch_errors)) if pitch_errors else 0.0
-    
+
     trajectory_data = {
         'metadata': {
-            'trajectory_num': trajectory_num,
-            'roll_targets': roll_targets_array,
-            'pitch_targets': pitch_targets_array,
-            'avg_roll': avg_roll,
-            'avg_pitch': avg_pitch,
-            'avg_roll_error': avg_roll_error,
+            'trajectory_num':  trajectory_num,
+            'roll_targets':    np.array([t[0] for t in targets_log]),
+            'pitch_targets':   np.array([t[1] for t in targets_log]),
+            'avg_roll':        avg_roll,
+            'avg_pitch':       avg_pitch,
+            'avg_roll_error':  avg_roll_error,
             'avg_pitch_error': avg_pitch_error,
-            'total_reward': episode_reward,
-            'steps_executed': len(roll_angles)
+            'total_reward':    episode_reward,
+            'steps_executed':  len(roll_angles),
         },
-        'transitions': transitions
+        'transitions': transitions,
     }
     
     print(f"[Traj {trajectory_num:2d}] Avg Roll={avg_roll:6.2f}°, Avg Pitch={avg_pitch:6.2f}°, "
@@ -375,7 +375,7 @@ def print_trajectory_summary(trajectory_results):
     print(f"Total state transitions collected: {total_transitions}")
     print(f"Configuration:")
     print(f"  - Trajectory length: {NUM_STEPS} steps (20 seconds at 100 Hz)")
-    print(f"  - Target change interval: {TARGET_CHANGE_INTERVAL} steps ({NUM_INTERVALS} intervals)")
+    print(f"  - Target change interval: {TARGET_CHANGE_INTERVAL_MIN}–{TARGET_CHANGE_INTERVAL_MAX} steps (random)")
     print(f"  - Roll bounds: [{ROLL_MIN}, {ROLL_MAX}]°")
     print(f"  - Pitch bounds: [{PITCH_MIN}, {PITCH_MAX}]°")
     print(f"  - Max delta per interval: {MAX_DELTA_ROLL}° (roll), {MAX_DELTA_PITCH}° (pitch)\n")
@@ -402,7 +402,7 @@ def generate_progressive_trajectories(cfg: DictConfig, jsbsim_config_name='noatm
     print(f"JSBSim config: {jsbsim_config_name}")
     print(f"Number of trajectories: {num_trajectories}")
     print(f"Trajectory length: {NUM_STEPS} steps")
-    print(f"Target change interval: {TARGET_CHANGE_INTERVAL} steps")
+    print(f"Target change interval: {TARGET_CHANGE_INTERVAL_MIN}–{TARGET_CHANGE_INTERVAL_MAX} steps (random)")
     print(f"Roll bounds: [{ROLL_MIN}, {ROLL_MAX}]°, Pitch bounds: [{PITCH_MIN}, {PITCH_MAX}]°")
     print("="*120 + "\n")
     
@@ -410,15 +410,9 @@ def generate_progressive_trajectories(cfg: DictConfig, jsbsim_config_name='noatm
     for traj_num in range(1, num_trajectories + 1):
         print(f"Generating trajectory {traj_num}/{num_trajectories}...")
         
-        # Generate progressive targets for this trajectory
-        roll_targets, pitch_targets = generate_progressive_targets()
-        
-        print(f"  Roll targets: {[f'{x:.1f}' for x in roll_targets]}°")
-        print(f"  Pitch targets: {[f'{x:.1f}' for x in pitch_targets]}°")
-        
         # Load configuration
         cfg.env.jsbsim = OmegaConf.load(f'../config/env/jsbsim/{jsbsim_config_name}.yaml')
-        
+
         try:
             # Create fresh environment for each trajectory
             env = gym.make(
@@ -426,11 +420,9 @@ def generate_progressive_trajectories(cfg: DictConfig, jsbsim_config_name='noatm
                 cfg_env=cfg.env,
                 render_mode='none'
             )
-            
-            # Run trajectory
-            trajectory_data = run_single_trajectory(
-                env, traj_num, roll_targets, pitch_targets
-            )
+
+            # Run trajectory (targets generated dynamically inside)
+            trajectory_data = run_single_trajectory(env, traj_num)
             
             trajectory_results.append(trajectory_data)
             
@@ -461,7 +453,7 @@ def main(cfg: DictConfig):
         print_trajectory_summary(trajectory_results)
         
         # Save trajectory data to CSV file
-        output_file = f'../updated_trajectory_data_progressive_noatmo_2.0.csv'
+        output_file = f'../data/trajectory_data_nominal_and_hard_targets.csv'
         csv_file = save_trajectory_data_to_csv(trajectory_results, output_file)
         
         print(f"\n{'='*100}")

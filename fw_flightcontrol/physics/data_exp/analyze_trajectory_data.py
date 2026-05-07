@@ -31,8 +31,8 @@ plt.rcParams['legend.fontsize'] = 10
 # ============================================================================
 # Get the script directory and navigate to data folder
 SCRIPT_DIR = Path(__file__).parent
-CSV_FILE = SCRIPT_DIR.parent.parent / 'data' / 'updated_trajectory_data_progressive_noatmo.csv'
-OUTPUT_DIR = SCRIPT_DIR.parent.parent / 'data' / 'new_analysis_outputs'
+CSV_FILE = SCRIPT_DIR.parent.parent / 'data' / 'trajectory_data_nominal_and_hard_targets.csv'
+OUTPUT_DIR = SCRIPT_DIR.parent.parent / 'data' / 'new_analysis_outputs_3.0'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # State dimension names and units
