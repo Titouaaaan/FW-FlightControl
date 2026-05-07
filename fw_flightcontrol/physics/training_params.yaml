@@ -86,6 +86,9 @@ integration:
 # DATA HANDLING
 # ============================================================================
 data:
+  # CSV file located in fw_flightcontrol/data/
+  file: 'trajectory_data_nominal_and_hard_targets.csv'
+
   # Train/val/test split
   train_fraction: 0.85
   val_fraction: 0.1
@@ -173,5 +176,5 @@ logging:
   
   # Output directories
   checkpoint_dir: ./checkpoints
-  checkpoint_subdirectory: data_driven_normalization_3.0 # per_state_norm_expv.0.8    
+  checkpoint_subdirectory: hard_targets_residual_model_v0.1 # per_state_norm_expv.0.8    
   log_dir: ./logs
