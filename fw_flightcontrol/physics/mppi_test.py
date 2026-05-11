@@ -220,7 +220,8 @@ def rollout_trajectories(
     denorm_factors: Optional[torch.Tensor],
     min_bounds: Optional[torch.Tensor],
     norm_type: Optional[str],
-    device: torch.device
+    device: torch.device,
+    residual_clamp: Optional[float] = None,
 ) -> np.ndarray:
     """
     Simulate multiple action sequences using HybridDynamicsODE — the same
@@ -254,7 +255,8 @@ def rollout_trajectories(
     # HybridDynamicsODE: physics_prior(state_RAW) + residual(state_NORM) * scale
     ode_module = HybridDynamicsODE(
         hybrid_model, device,
-        denorm_factors=denorm_factors, min_bounds=min_bounds, norm_type=norm_type
+        denorm_factors=denorm_factors, min_bounds=min_bounds, norm_type=norm_type,
+        residual_clamp=residual_clamp,
     )
 
     trajectories = torch.empty(num_samples, horizon, states_raw.shape[1], device=device)
@@ -331,6 +333,7 @@ class MPPIController:
         min_bounds: Optional[torch.Tensor],
         norm_type: Optional[str],
         device: torch.device,
+        residual_clamp: Optional[float] = None,
     ) -> Tuple[np.ndarray, Dict]:
         t_start = time.time()
 
@@ -358,18 +361,17 @@ class MPPIController:
         t_rollout = time.time()
         trajectories = rollout_trajectories(
             current_state, sampled_actions, hybrid_model,
-            config, denorm_factors, min_bounds, norm_type, device
+            config, denorm_factors, min_bounds, norm_type, device,
+            residual_clamp=residual_clamp,
         )
         time_rollout = time.time() - t_rollout
 
-        # --- Compute costs: roll/pitch tracking + small airspeed penalty ---
-        target_roll_rad = np.deg2rad(target_roll)
+        # --- Compute costs: roll/pitch tracking only ---
+        target_roll_rad  = np.deg2rad(target_roll)
         target_pitch_rad = np.deg2rad(target_pitch)
-        target_va_ms = 60.0 / 3.6  # 16.667 m/s — env maintains 60 kph
         roll_errors  = np.abs(trajectories[:, :, 0] - target_roll_rad)
         pitch_errors = np.abs(trajectories[:, :, 1] - target_pitch_rad)
-        va_errors    = np.abs(trajectories[:, :, 2] - target_va_ms)
-        costs = np.sum(roll_errors + pitch_errors + 0.1 * va_errors, axis=1)
+        costs = np.sum(roll_errors + pitch_errors, axis=1)
 
         # --- MPPI weights: exp(-(cost - min_cost) / temperature) ---
         valid_mask = np.isfinite(costs)
@@ -444,7 +446,8 @@ def run_mppi_control(
     mppi_samples: int = 64,
     mppi_temperature: float = 1.0,
     mppi_noise_std: float = 0.8,
-    model_path: str = ""
+    model_path: str = "",
+    residual_clamp: Optional[float] = None,
 ):
     """
     Main control loop: run MPPI on the environment.
@@ -524,6 +527,7 @@ def run_mppi_control(
                 min_bounds,
                 norm_type,
                 device,
+                residual_clamp=residual_clamp,
             )
             
             # Feed MPPI throttle to the monkey-patched apply_action, then step
@@ -765,6 +769,9 @@ def main():
                         help='Device to use (cuda or cpu)')
     parser.add_argument('--pid', action='store_true', default=False,
                         help='Run PID-only baseline after MPPI using the same targets and steps')
+    parser.add_argument('--residual-clamp', type=float, default=None,
+                        help='Clamp residual network output to [-x, x] in normalized space before scaling. '
+                             'Prevents OOD explosion. Try 0.5 as a starting point. Default: no clamp.')
     parser.add_argument('--plot-name', type=str, default=None,
                         help='Base name for saved plot files (e.g. "ablation_v1" → ablation_v1_tracking.png / ablation_v1_actions.png). Defaults to tracking_performance.png / action_history.png')
 
@@ -820,6 +827,7 @@ def main():
         mppi_temperature=args.mppi_temperature,
         mppi_noise_std=args.mppi_noise_std,
         model_path=args.checkpoint,
+        residual_clamp=args.residual_clamp,
     )
 
     pid_roll, pid_pitch, pid_actions = None, None, None
