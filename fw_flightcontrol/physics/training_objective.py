@@ -92,17 +92,21 @@ class HybridDynamicsODE(nn.Module):
             return dx_dt
 
         # Normalization path: residual sees normalized state, derivatives returned in raw space
-        state_norm = self._normalize_state(state_raw)
-        prior_deriv = self.model.physics_prior(state_raw, self.current_action)
-        residual_output = self.model.residual_network(state_norm, self.current_action)
-
-        if self._capture_next:
-            self.captured_residual_norm = torch.norm(
-                residual_output * self.denorm_factors, p=2, dim=1
-            ).mean()
+        dx_dt = torch.zeros_like(state_raw)
+        if self.model.with_prior:
+            dx_dt = self.model.physics_prior(state_raw, self.current_action)
+        if self.model.with_residual:
+            state_norm = self._normalize_state(state_raw)
+            residual_output = self.model.residual_network(state_norm, self.current_action)
+            if self._capture_next:
+                self.captured_residual_norm = torch.norm(
+                    residual_output * self.denorm_factors, p=2, dim=1
+                ).mean()
+                self._capture_next = False
+            dx_dt = dx_dt + residual_output * self.denorm_factors
+        elif self._capture_next:
             self._capture_next = False
-
-        return prior_deriv + residual_output * self.denorm_factors
+        return dx_dt
 
 
 def train_aphynity_epoch(

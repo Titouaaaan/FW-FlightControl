@@ -401,7 +401,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"  Device           : {device}")
 
-    csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_progressive_noatmo_2.0.csv"
+    csv_path = Path(__file__).parent.parent / "data" / "trajectory_data_nominal_and_hard_targets.csv" #"updated_trajectory_data_progressive_noatmo_2.0.csv" 
     train_loader, val_loader, test_loader, denorm_factors_computed, min_bounds_computed = load_trajectory_data(str(csv_path), config)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

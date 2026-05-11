@@ -765,7 +765,9 @@ def main():
                         help='Device to use (cuda or cpu)')
     parser.add_argument('--pid', action='store_true', default=False,
                         help='Run PID-only baseline after MPPI using the same targets and steps')
-    
+    parser.add_argument('--plot-name', type=str, default=None,
+                        help='Base name for saved plot files (e.g. "ablation_v1" → ablation_v1_tracking.png / ablation_v1_actions.png). Defaults to tracking_performance.png / action_history.png')
+
     args = parser.parse_args()
     
     # Set device
@@ -831,9 +833,13 @@ def main():
             max_steps_per_episode=args.steps_per_episode,
         )
 
+    tracking_filename = f"{args.plot_name}_tracking.png" if args.plot_name else 'tracking_performance.png'
+    actions_filename  = f"{args.plot_name}_actions.png"  if args.plot_name else 'action_history.png'
+
     plot_tracking_performance(
         target_roll=args.target_roll,
         target_pitch=args.target_pitch,
+        filename=tracking_filename,
         mppi_roll=mppi_roll,
         mppi_pitch=mppi_pitch,
         pid_roll=pid_roll,
@@ -841,6 +847,7 @@ def main():
     )
 
     plot_action_history(
+        filename=actions_filename,
         mppi_actions=mppi_actions,
         pid_actions=pid_actions,
     )
