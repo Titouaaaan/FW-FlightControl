@@ -755,7 +755,7 @@ def main():
                         help='Target pitch angle in degrees')
     parser.add_argument('--episodes', type=int, default=1,
                         help='Number of episodes to run')
-    parser.add_argument('--steps-per-episode', type=int, default=750,
+    parser.add_argument('--steps-per-episode', type=int, default=1500,
                         help='Max steps per episode')
     parser.add_argument('--mppi-samples', type=int, default=600,
                         help='Number of MPPI trajectory samples')

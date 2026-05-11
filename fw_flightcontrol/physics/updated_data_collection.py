@@ -42,6 +42,11 @@ MAX_DELTA_PITCH = 15
 # Number of trajectories to generate
 NUM_TRAJECTORIES = 60
 
+# Persistent excitation: Gaussian noise added to PID aileron/elevator outputs.
+# Keeps PID for stability while covering the wider action range MPPI uses at inference.
+# This is standard system-identification practice (model-independent fixed policy).
+EXCITATION_NOISE_STD = 0.15
+
 # JSBSim environment configurations to generate data for
 JSBSIM_CONFIGS = ['noatmo']
 
@@ -188,6 +193,12 @@ def run_single_trajectory(env, trajectory_num):
 
         aileron_cmd,  _, _ = pid_aileron.update(state=roll,  state_dot=p_radps, saturate=True, normalize=False)
         elevator_cmd, _, _ = pid_elevator.update(state=pitch, state_dot=q_radps, saturate=True, normalize=False)
+
+        # Persistent excitation: add Gaussian noise to PID outputs before applying.
+        # The noise is model-independent, covering the wider action range used at MPPI
+        # inference while the PID maintains trajectory stability.
+        aileron_cmd  = np.clip(aileron_cmd  + np.random.normal(0.0, EXCITATION_NOISE_STD), -1.0, 1.0)
+        elevator_cmd = np.clip(elevator_cmd + np.random.normal(0.0, EXCITATION_NOISE_STD), -1.0, 1.0)
 
         # Store action (a_t) — throttle filled in after step
         action = np.array([aileron_cmd, elevator_cmd, 0.0])
@@ -453,7 +464,7 @@ def main(cfg: DictConfig):
         print_trajectory_summary(trajectory_results)
         
         # Save trajectory data to CSV file
-        output_file = f'../data/trajectory_data_nominal_and_hard_targets.csv'
+        output_file = f'../data/trajectory_data_pid_pe.csv'
         csv_file = save_trajectory_data_to_csv(trajectory_results, output_file)
         
         print(f"\n{'='*100}")
