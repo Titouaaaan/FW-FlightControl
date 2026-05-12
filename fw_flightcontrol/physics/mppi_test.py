@@ -139,7 +139,7 @@ def load_config_and_model(
         physics_prior=physics_prior,
         residual_network=residual_network,
         with_prior=True,
-        with_residual=True,
+        with_residual=False,
         integration_method=integration_method,
     )
     hybrid_model = hybrid_model.to(device)
