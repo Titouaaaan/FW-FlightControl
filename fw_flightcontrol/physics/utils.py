@@ -458,6 +458,58 @@ def compute_convergence_stats(
     }
 
 
+# ============================================================================
+# JSBSim ENV STATE SAVE / RESTORE
+# ============================================================================
+
+def get_env_state(env) -> dict:
+    """Snapshot the physical state of a JSBSim env for later restoration.
+
+    Captures attitude, airspeed, angular rates, altitude and throttle — the
+    variables that fully determine short-horizon dynamics.  Alpha/beta are
+    implicitly encoded in the body-velocity components (u, v, w).
+    """
+    from fw_jsbgym.utils import jsbsim_properties as prp
+    sim = env.unwrapped.sim
+    return {
+        'roll_rad':    float(sim[prp.roll_rad]),
+        'pitch_rad':   float(sim[prp.pitch_rad]),
+        'heading_rad': float(sim[prp.heading_rad]),
+        'airspeed_kts': float(sim[prp.airspeed_kts]),
+        'p_radps':     float(sim[prp.p_radps]),
+        'q_radps':     float(sim[prp.q_radps]),
+        'r_radps':     float(sim[prp.r_radps]),
+        'altitude_ft': float(sim[prp.altitude_sl_ft]),
+        'throttle':    float(sim[prp.throttle_cmd]),
+        'alpha_rad':   float(sim.fdm['aero/alpha-rad']),
+        'beta_rad':    float(sim.fdm['aero/beta-rad']),
+    }
+
+
+def set_env_state(env, state: dict) -> None:
+    """Restore a JSBSim env to a previously snapshotted state.
+
+    Writes all physical state into JSBSim's IC slots then calls run_ic() so
+    the FDM (including its internal integrators) re-initialises from those
+    values.  Throttle is written directly after run_ic() since it is a
+    command property, not an IC property.
+    """
+    from fw_jsbgym.utils import jsbsim_properties as prp
+    sim = env.unwrapped.sim
+    sim[prp.ic_roll_rad]     = state['roll_rad']
+    sim[prp.ic_pitch_rad]    = state['pitch_rad']
+    sim[prp.ic_heading_rad]  = state['heading_rad']
+    sim[prp.ic_airspeed_kts] = state['airspeed_kts']
+    sim[prp.ic_p_radps]      = state['p_radps']
+    sim[prp.ic_q_radps]      = state['q_radps']
+    sim[prp.ic_r_radps]      = state['r_radps']
+    sim[prp.ic_altitude_ft]  = state['altitude_ft']
+    sim.fdm['ic/alpha-rad']  = state['alpha_rad']
+    sim.fdm['ic/beta-rad']   = state['beta_rad']
+    sim.fdm.run_ic()
+    sim[prp.throttle_cmd]    = state['throttle']
+
+
 def plot_tracking_performance(
     target_roll: float,
     target_pitch: float,
