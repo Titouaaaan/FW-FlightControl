@@ -33,12 +33,12 @@ training:
   scheduler:
     enabled: true
     type: 'steplr'        # Options: 'steplr', 'exponential', 'cosine'
-    step_size: 20         # Decay every N epochs
+    step_size: 10         # Decay every N epochs
     gamma: 0.7            # Multiply LR by this factor (0.7 = 30% reduction per step)
     min_lr: 0.0001        # Floor - don't go below this
   
   # Gradient clipping for stability
-  grad_clip_norm: 3.0
+  grad_clip_norm: 2.0
   
   # Validation frequency
   val_freq: 1           # Validate every epoch
@@ -54,7 +54,7 @@ aphynity:
                           # Passed to optimizer, NOT applied as gradient scaling
   # Lagrange multiplier initialization and update
   lambda_init: 1.0        # Initial λ (balanced: reg=1.0, trajectory_loss weighted by λ)
-  tau_2: 0.01              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
+  tau_2: 0.0005              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
                           # Conservative value; can increase to 1.0 after verifying numerical stability
   
   # Lagrange multiplier bounds

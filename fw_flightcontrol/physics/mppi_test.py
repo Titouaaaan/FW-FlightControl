@@ -139,7 +139,7 @@ def load_config_and_model(
         physics_prior=physics_prior,
         residual_network=residual_network,
         with_prior=True,
-        with_residual=False,
+        with_residual=True,
         integration_method=integration_method,
     )
     hybrid_model = hybrid_model.to(device)
@@ -768,7 +768,7 @@ def main():
                         help='MPPI prediction horizon (steps at 0.01s each)')
     parser.add_argument('--mppi-temperature', type=float, default=1.0,
                         help='MPPI temperature λ. Match to cost scale (costs ~4-8 rad → λ~1.0)')
-    parser.add_argument('--mppi-noise-std', type=float, default=0.8,
+    parser.add_argument('--mppi-noise-std', type=float, default=0.4,
                         help='Std of perturbation noise around warm-started mean action')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Device to use (cuda or cpu)')

@@ -77,6 +77,11 @@ class HybridDynamicsODE(nn.Module):
         if self.current_action is None:
             raise RuntimeError("Action not set before forward pass")
 
+        # Clamp state before any computation so torchdiffeq's intermediate RK4
+        # states (k2, k3, k4) never reach Inf. Without this, Inf intermediates
+        # cause 0*Inf=NaN in autograd even when the final output is clamped.
+        state_raw = state_raw.clamp(-1000.0, 1000.0)
+
         if self.denorm_factors is None:
             # No-normalization path: inline model.forward to access residual for capture
             dx_dt = torch.zeros_like(state_raw)
@@ -281,13 +286,13 @@ def train_aphynity_epoch(
         prediction_error = prediction_error / (per_state_scales ** 2)
     trajectory_loss = torch.norm(prediction_error, p=2, dim=2).mean()  # Average L2 norm
     
-    # Check for NaN in trajectory loss
-    if torch.isnan(trajectory_loss):
-        print(f"NaN detected in trajectory_loss")
-        print(f"  prediction_error range: [{prediction_error.min()}, {prediction_error.max()}]")
-        print(f"  trajectory_loss: {trajectory_loss}")
-        raise ValueError("NaN in trajectory loss")
-    
+    # Check for NaN/Inf in trajectory loss — isnan alone misses Inf, which causes
+    # NaN gradients after backward() and silently corrupts weights
+    if not torch.isfinite(trajectory_loss):
+        print(f"Non-finite trajectory_loss detected: {trajectory_loss.item()}")
+        print(f"  prediction_error range: [{prediction_error.min().item():.4f}, {prediction_error.max().item():.4f}]")
+        raise ValueError(f"Non-finite trajectory loss: {trajectory_loss.item()}")
+
     # Regularization loss: keep residual magnitudes small (only if model uses residual)
     # This prevents the network from learning large corrections that don't generalize
     if residual_norms:
@@ -295,38 +300,33 @@ def train_aphynity_epoch(
     else:
         # No residual component; regularization is zero
         regularization_loss = torch.tensor(0.0, device=initial_states.device, dtype=initial_states.dtype)
-    
-    # Check for NaN in regularization loss
-    if torch.isnan(regularization_loss):
-        print(f"NaN detected in regularization_loss")
-        print(f"  residual_norms: {torch.stack(residual_norms)}")
-        raise ValueError("NaN in regularization loss")
-    
+
+    if not torch.isfinite(regularization_loss):
+        raise ValueError(f"Non-finite regularization loss: {regularization_loss.item()}")
+
     # Combined APHYNITY loss: regularization + λ * trajectory_loss
     # Note: τ_1 is applied to gradients, not the loss itself (see APHYNITY paper)
     total_loss = regularization_loss + lambda_current * trajectory_loss
-    
-    # Check for NaN in total loss
-    if torch.isnan(total_loss):
-        print(f"NaN detected in total_loss")
-        print(f"  regularization_loss: {regularization_loss}")
-        print(f"  lambda_current: {lambda_current}")
-        print(f"  trajectory_loss: {trajectory_loss}")
-        raise ValueError("NaN in total loss")
-    
+
+    if not torch.isfinite(total_loss):
+        raise ValueError(f"Non-finite total loss: {total_loss.item()}")
+
     # ========================================================================
     # BACKWARD PASS
     # ========================================================================
     # Backpropagate through the entire unrolled trajectory
     # PyTorch's autograd automatically handles this through torchdiffeq
     total_loss.backward()
-    
-    if check_nan:
-        for name, param in hybrid_model.residual_network.named_parameters():
-            if param.grad is not None and torch.isnan(param.grad).any():
-                print(f"NaN detected in gradients of {name}")
-                print(f"  grad range: [{param.grad.min()}, {param.grad.max()}]")
-                raise ValueError(f"NaN gradient in {name}")
+
+    # Always check gradients before optimizer.step() — if any grad is NaN/Inf,
+    # zero them and raise so weights are never written with corrupted values
+    has_bad_grad = any(
+        p.grad is not None and not torch.isfinite(p.grad).all()
+        for p in hybrid_model.residual_network.parameters()
+    )
+    if has_bad_grad:
+        optimizer.zero_grad()
+        raise ValueError("NaN/Inf in gradients — weight update skipped")
 
     # clip_grad_norm_ returns the total L2 gradient norm before clipping — 1 GPU sync
     grad_norm_before = torch.nn.utils.clip_grad_norm_(

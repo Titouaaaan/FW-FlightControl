@@ -505,24 +505,31 @@ def main(resume_checkpoint: Optional[str] = None):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:3d}/{num_epochs}: Train",
                     leave=False, unit="batch")
 
+        nan_batches = 0
         for batch_data in pbar:
-            metrics = train_aphynity_epoch(
-                hybrid_model=hybrid_model,
-                trajectory_batch=batch_data,
-                optimizer=optimizer,
-                lambda_current=lambda_current,
-                tau_2=tau_2,
-                grad_clip_norm=train_config['grad_clip_norm'],
-                device=device,
-                ode_method=config['integration']['method'],
-                ode_rtol=config['integration']['rtol'],
-                ode_atol=config['integration']['atol'],
-                dt=config['integration']['dt'],
-                denorm_factors=denorm_factors_torch if norm_type is not None else None,
-                min_bounds=min_bounds_torch if norm_type is not None else None,
-                per_state_scales=per_state_scales_torch,
-                norm_type=norm_type,
-            )
+            try:
+                metrics = train_aphynity_epoch(
+                    hybrid_model=hybrid_model,
+                    trajectory_batch=batch_data,
+                    optimizer=optimizer,
+                    lambda_current=lambda_current,
+                    tau_2=tau_2,
+                    grad_clip_norm=train_config['grad_clip_norm'],
+                    device=device,
+                    ode_method=config['integration']['method'],
+                    ode_rtol=config['integration']['rtol'],
+                    ode_atol=config['integration']['atol'],
+                    dt=config['integration']['dt'],
+                    denorm_factors=denorm_factors_torch if norm_type is not None else None,
+                    min_bounds=min_bounds_torch if norm_type is not None else None,
+                    per_state_scales=per_state_scales_torch,
+                    norm_type=norm_type,
+                )
+            except ValueError as e:
+                nan_batches += 1
+                optimizer.zero_grad()
+                tqdm.write(f"  [Epoch {epoch+1}] Skipped NaN batch ({nan_batches} so far): {e}")
+                continue
 
             epoch_metrics['loss_total']          += metrics['loss_total']
             epoch_metrics['loss_trajectory']     += metrics['loss_trajectory']
@@ -549,6 +556,11 @@ def main(resume_checkpoint: Optional[str] = None):
             })
 
         # Average loss metrics over batches
+        if nan_batches > 0:
+            tqdm.write(f"  [Epoch {epoch+1}] Skipped {nan_batches} NaN batches out of {nan_batches + epoch_metrics['batch_count']}")
+        if epoch_metrics['batch_count'] == 0:
+            tqdm.write(f"  [Epoch {epoch+1}] WARNING: all batches were NaN — skipping epoch")
+            continue
         for key in ['loss_total', 'loss_trajectory', 'loss_regularization']:
             epoch_metrics[key] /= epoch_metrics['batch_count']
         if epoch_metrics['batch_count'] > 0:
