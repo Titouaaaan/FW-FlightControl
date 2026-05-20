@@ -472,17 +472,19 @@ def get_env_state(env) -> dict:
     from fw_jsbgym.utils import jsbsim_properties as prp
     sim = env.unwrapped.sim
     return {
-        'roll_rad':    float(sim[prp.roll_rad]),
-        'pitch_rad':   float(sim[prp.pitch_rad]),
-        'heading_rad': float(sim[prp.heading_rad]),
+        'roll_rad':     float(sim[prp.roll_rad]),
+        'pitch_rad':    float(sim[prp.pitch_rad]),
+        'heading_rad':  float(sim[prp.heading_rad]),
         'airspeed_kts': float(sim[prp.airspeed_kts]),
-        'p_radps':     float(sim[prp.p_radps]),
-        'q_radps':     float(sim[prp.q_radps]),
-        'r_radps':     float(sim[prp.r_radps]),
-        'altitude_ft': float(sim[prp.altitude_sl_ft]),
-        'throttle':    float(sim[prp.throttle_cmd]),
-        'alpha_rad':   float(sim.fdm['aero/alpha-rad']),
-        'beta_rad':    float(sim.fdm['aero/beta-rad']),
+        'p_radps':      float(sim[prp.p_radps]),
+        'q_radps':      float(sim[prp.q_radps]),
+        'r_radps':      float(sim[prp.r_radps]),
+        'altitude_ft':  float(sim[prp.altitude_sl_ft]),
+        'throttle':     float(sim[prp.throttle_cmd]),
+        'alpha_rad':    float(sim.fdm['aero/alpha-rad']),
+        'beta_rad':     float(sim.fdm['aero/beta-rad']),
+        'aileron_cmd':  float(sim[prp.aileron_cmd]),
+        'elevator_cmd': float(sim[prp.elevator_cmd]),
     }
 
 
@@ -508,6 +510,8 @@ def set_env_state(env, state: dict) -> None:
     sim.fdm['ic/beta-rad']   = state['beta_rad']
     sim.fdm.run_ic()
     sim[prp.throttle_cmd]    = state['throttle']
+    sim[prp.aileron_cmd]     = state['aileron_cmd']
+    sim[prp.elevator_cmd]    = state['elevator_cmd']
 
 
 def plot_tracking_performance(

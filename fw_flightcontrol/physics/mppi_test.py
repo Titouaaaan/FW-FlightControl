@@ -327,6 +327,31 @@ class MPPIController:
         self.mean_actions = np.zeros((self.horizon, self.action_dim))
         self.mean_actions[:, 2] = 0.3  # throttle warm-start near training data mean
 
+    def sample_actions(self) -> np.ndarray:
+        """
+        Sample a batch of candidate action sequences.
+
+        Aileron/elevator are sampled with noise_std and clipped to [-1, 1].
+        Throttle is sampled separately with half the noise_std and clipped
+        directly to [0, 1], avoiding the pile-up at 0 that arises when large
+        symmetric noise is applied to a mean near 0.3 and then hard-clipped.
+        """
+        n_random = self.num_samples // 4
+        n_noise  = self.num_samples - n_random
+
+        noise_ae = np.random.normal(0, self.noise_std,       (n_noise, self.horizon, 2))
+        noise_t  = np.random.normal(0, self.noise_std * 0.5, (n_noise, self.horizon))
+
+        exploit = np.empty((n_noise, self.horizon, self.action_dim))
+        exploit[:, :, :2] = np.clip(self.mean_actions[None, :, :2] + noise_ae, -1.0, 1.0)
+        exploit[:, :,  2] = np.clip(self.mean_actions[None, :,  2] + noise_t,   0.0, 1.0)
+
+        explore = np.empty((n_random, self.horizon, self.action_dim))
+        explore[:, :, :2] = np.random.uniform(-1.0, 1.0, (n_random, self.horizon, 2))
+        explore[:, :,  2] = np.random.uniform( 0.0, 1.0, (n_random, self.horizon))
+
+        return np.concatenate([exploit, explore], axis=0)
+
     def optimize(
         self,
         current_state: np.ndarray,
@@ -342,25 +367,7 @@ class MPPIController:
     ) -> Tuple[np.ndarray, Dict]:
         t_start = time.time()
 
-        # --- Sample action sequences ---
-        # Mix exploitative (Gaussian around warm-started mean) and purely random
-        # samples. Without random samples, once the mean drifts to a boundary
-        # (e.g. aileron=1.0), Gaussian noise is one-sided and the controller
-        # gets stuck unable to explore the opposite direction.
-        n_random = self.num_samples // 4
-        n_noise  = self.num_samples - n_random
-
-        noise = np.random.normal(
-            0, self.noise_std,
-            (n_noise, self.horizon, self.action_dim)
-        )
-        exploit_actions = np.clip(self.mean_actions[None] + noise, -1.0, 1.0)
-        explore_actions = np.random.uniform(-1.0, 1.0, (n_random, self.horizon, self.action_dim))
-        explore_actions[:, :, 2] = np.random.uniform(0.0, 1.0, (n_random, self.horizon))
-        sampled_actions = np.concatenate([exploit_actions, explore_actions], axis=0)
-
-        # Throttle lives in [0, 1] (aileron/elevator are [-1, 1])
-        sampled_actions[:, :, 2] = np.clip(sampled_actions[:, :, 2], 0.0, 1.0)
+        sampled_actions = self.sample_actions()
 
         # --- Roll out all samples through the dynamics model ---
         t_rollout = time.time()
@@ -449,7 +456,7 @@ def run_mppi_control(
     max_steps_per_episode: int = 2000,
     mppi_horizon: int = 30,
     mppi_samples: int = 64,
-    mppi_temperature: float = 1.0,
+    mppi_temperature: float = 0.3,
     mppi_noise_std: float = 0.8,
     model_path: str = "",
     residual_clamp: Optional[float] = None,
@@ -766,8 +773,8 @@ def main():
                         help='Number of MPPI trajectory samples')
     parser.add_argument('--mppi-horizon', type=int, default=15,
                         help='MPPI prediction horizon (steps at 0.01s each)')
-    parser.add_argument('--mppi-temperature', type=float, default=1.0,
-                        help='MPPI temperature λ. Match to cost scale (costs ~4-8 rad → λ~1.0)')
+    parser.add_argument('--mppi-temperature', type=float, default=0.3,
+                        help='MPPI temperature λ. Lower = greedier. Typical range 0.1–0.5.')
     parser.add_argument('--mppi-noise-std', type=float, default=0.4,
                         help='Std of perturbation noise around warm-started mean action')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',

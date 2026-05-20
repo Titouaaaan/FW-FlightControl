@@ -19,9 +19,32 @@ Usage:
 
 import numpy as np
 import sys
+import os
 import argparse
 import time
+from contextlib import contextmanager
 from pathlib import Path
+
+
+@contextmanager
+def suppress_output():
+    with open(os.devnull, 'w') as devnull:
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        old_fd_out = os.dup(1)
+        old_fd_err = os.dup(2)
+        os.dup2(devnull.fileno(), 1)
+        os.dup2(devnull.fileno(), 2)
+        sys.stdout = devnull
+        sys.stderr = devnull
+        try:
+            yield
+        finally:
+            os.dup2(old_fd_out, 1)
+            os.dup2(old_fd_err, 2)
+            os.close(old_fd_out)
+            os.close(old_fd_err)
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
 from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -44,7 +67,7 @@ from fw_flightcontrol.physics.mppi_test import MPPIController
 # ============================================================================
 MPPI_SAMPLES     = 50    # fewer samples — env rollouts are sequential and slow
 MPPI_HORIZON     = 10
-MPPI_TEMPERATURE = 1.0
+MPPI_TEMPERATURE = 0.3
 MPPI_NOISE_STD   = 0.8
 MAX_STEPS        = 1500
 DT               = 0.01
@@ -79,13 +102,15 @@ def rollout_env_trajectories(
     actions: np.ndarray,        # (N, H, 3)
     target_roll_rad: float,
     target_pitch_rad: float,
+    target_va_kmh: float,
+    va_weight: float,
 ) -> np.ndarray:                # (N,) costs
     """
     Roll out N candidate action sequences in the JSBSim environment.
 
-    For each candidate: restore rollout_env to saved_state, apply the H-step
-    action sequence, accumulate roll+pitch tracking cost.  The throttle is
-    injected via the same monkey-patch used in mppi_test.py.
+    Cost per step = |roll_err| + |pitch_err| + va_weight * |Va - target_Va|
+    The Va term gives throttle a direct optimization target: sequences that let
+    airspeed bleed off at high pitch angles are penalised regardless of attitude.
     """
     num_samples, horizon, _ = actions.shape
     costs = np.zeros(num_samples)
@@ -103,6 +128,10 @@ def rollout_env_trajectories(
     rollout_env.unwrapped.apply_action = _patched_apply
 
     for k in range(num_samples):
+        # reset() satisfies gymnasium's OrderEnforcing wrapper; set_env_state
+        # immediately overrides the JSBSim IC with the saved physical state
+        with suppress_output():
+            rollout_env.reset()
         set_env_state(rollout_env, saved_state)
         cost = 0.0
 
@@ -112,7 +141,8 @@ def rollout_env_trajectories(
 
             roll_err  = abs(obs[0] - target_roll_rad)
             pitch_err = abs(obs[1] - target_pitch_rad)
-            cost += roll_err + pitch_err
+            va_err    = abs(obs[2] - target_va_kmh)    # obs[2] is Va in km/h
+            cost += roll_err + pitch_err + va_weight * va_err
 
             if terminated or truncated:
                 cost += 100.0  # large penalty for crash
@@ -133,28 +163,21 @@ def mppi_optimize_env(
     rollout_env: gym.Env,
     target_roll: float,
     target_pitch: float,
+    va_weight: float,
 ) -> np.ndarray:
     """One MPPI optimisation step using JSBSim rollouts."""
     target_roll_rad  = np.deg2rad(target_roll)
     target_pitch_rad = np.deg2rad(target_pitch)
+    # Use current airspeed as Va target: "maintain what you have now"
+    target_va_kmh    = saved_state['airspeed_kts'] * 1.852
 
-    # Sample action sequences (same logic as MPPIController.optimize)
-    n_random = controller.num_samples // 4
-    n_noise  = controller.num_samples - n_random
-
-    noise          = np.random.normal(0, controller.noise_std,
-                                      (n_noise, controller.horizon, controller.action_dim))
-    exploit_actions = np.clip(controller.mean_actions[None] + noise, -1.0, 1.0)
-    explore_actions = np.random.uniform(-1.0, 1.0,
-                                        (n_random, controller.horizon, controller.action_dim))
-    explore_actions[:, :, 2] = np.random.uniform(0.0, 1.0, (n_random, controller.horizon))
-    sampled_actions = np.concatenate([exploit_actions, explore_actions], axis=0)
-    sampled_actions[:, :, 2] = np.clip(sampled_actions[:, :, 2], 0.0, 1.0)
+    sampled_actions = controller.sample_actions()
 
     # Evaluate all candidates in JSBSim
     costs = rollout_env_trajectories(
         rollout_env, saved_state, sampled_actions,
         target_roll_rad, target_pitch_rad,
+        target_va_kmh, va_weight,
     )
 
     # MPPI weights
@@ -191,12 +214,13 @@ def run_mppi_env_control(
     mppi_horizon: int,
     mppi_temperature: float,
     mppi_noise_std: float,
+    va_weight: float = 0.1,
 ) -> tuple:
     print(f"\n{'='*70}")
     print("MPPI CONTROL — JSBSim World Model")
     print(f"  Target: Roll={target_roll:+.1f}°  Pitch={target_pitch:+.1f}°")
     print(f"  MPPI: samples={mppi_samples}  horizon={mppi_horizon}  "
-          f"temp={mppi_temperature}  noise={mppi_noise_std}")
+          f"temp={mppi_temperature}  noise={mppi_noise_std}  va_weight={va_weight}")
     print(f"{'='*70}\n")
 
     # Throttle monkey-patch for main env
@@ -220,8 +244,8 @@ def run_mppi_env_control(
     )
     controller.reset()
 
-    main_env.unwrapped.init()
-    obs, _ = main_env.reset()
+    with suppress_output():
+        obs, _ = main_env.reset()
 
     roll_hist    = []
     pitch_hist   = []
@@ -238,7 +262,7 @@ def run_mppi_env_control(
         saved_state = get_env_state(main_env)
         best_action = mppi_optimize_env(
             controller, saved_state, rollout_env,
-            target_roll, target_pitch,
+            target_roll, target_pitch, va_weight,
         )
 
         throttle_ref[0] = float(best_action[2])
@@ -298,9 +322,11 @@ def main():
     args = parser.parse_args()
 
     print("Initialising main env...")
-    main_env = make_env()
+    with suppress_output():
+        main_env = make_env()
     print("Initialising rollout env...")
-    rollout_env = make_env()
+    with suppress_output():
+        rollout_env = make_env()
 
     roll_hist, pitch_hist, actions = run_mppi_env_control(
         main_env   = main_env,
