@@ -11,7 +11,6 @@ Farama-Notifications==0.0.4
 filelock==3.20.0
 fonttools==4.61.1
 fsspec==2025.12.0
--e git+ssh://git@github.com/Titouaaaan/FW-FlightControl.git@d1af4595947ec0d388ade944c849311dfa80a6fd#egg=fw_flightcontrol
 -e git+https://github.com/Akkodis/FW-JSBGym.git@571a52fe02ec3f7fc78968a076fa68a536be1455#egg=fw_jsbgym
 gitdb==4.0.12
 GitPython==3.1.46
