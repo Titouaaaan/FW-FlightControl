@@ -8,6 +8,8 @@ fw_flightcontrol/telemetry/
 fw_flightcontrol/outputs/
 fw_flightcontrol/eval/outputs/*
 
+telemetry/
+
 runs/
 wandb/
 logs/

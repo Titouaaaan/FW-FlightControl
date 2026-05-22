@@ -68,7 +68,7 @@ MODELS_DIR    = _PHYSICS_DIR / 'models'
 CONFIG_DIR    = str(_FC_DIR / 'config')
 NOATMO_YAML   = str(_FC_DIR / 'config' / 'env' / 'jsbsim' / 'noatmo.yaml')
 TRAINING_YAML = str(_PHYSICS_DIR / 'training_params.yaml')
-SAVE_DIR      = _FC_DIR / 'data' / 'full_analysis_nominal'
+SAVE_DIR      = _FC_DIR / 'data' / 'temp'
 
 DT        = 0.01
 STEPS_20S = 2000   # 20 s at 0.01 s/step
@@ -78,7 +78,7 @@ STEPS_20S = 2000   # 20 s at 0.01 s/step
 # ENVIRONMENT FACTORY
 # ============================================================================
 
-def make_env() -> gym.Env:
+def make_env(render_mode: str = 'none', telemetry_file: str = '') -> gym.Env:
     try:
         from hydra import compose, initialize_config_dir
         with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
@@ -86,7 +86,12 @@ def make_env() -> gym.Env:
     except Exception:
         cfg = OmegaConf.create({'env': {}})
     cfg.env.jsbsim = OmegaConf.load(NOATMO_YAML)
-    env = gym.make('ACBohnNoVaIErr-v0', cfg_env=cfg.env, render_mode='none')
+    import os
+    if render_mode != 'none' and not telemetry_file:
+        os.makedirs('telemetry', exist_ok=True)
+        telemetry_file = 'telemetry/telemetry.csv'
+    env = gym.make('ACBohnNoVaIErr-v0', cfg_env=cfg.env,
+                   render_mode=render_mode, telemetry_file=telemetry_file)
     env.unwrapped.init()
     return env
 
@@ -153,11 +158,12 @@ def load_model(model_path: str, device: torch.device):
 # PID RUN
 # ============================================================================
 
-def run_pid(target_roll: float, target_pitch: float, max_steps: int, seed: int) -> dict:
+def run_pid(target_roll: float, target_pitch: float, max_steps: int, seed: int,
+            render_mode: str = 'none') -> dict:
     np.random.seed(seed)
     with suppress_output():
-        env = make_env()
-        obs, _ = env.reset()
+        env = make_env(render_mode=render_mode, telemetry_file='telemetry/pid.csv')
+    obs, _ = env.reset()
 
     target_roll_rad  = np.deg2rad(target_roll)
     target_pitch_rad = np.deg2rad(target_pitch)
@@ -238,9 +244,9 @@ def _rollout_env(rollout_env, saved_state, actions, target_roll_rad, target_pitc
 
 
 def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
-                 mppi_cfg: dict, seed: int) -> dict:
+                 mppi_cfg: dict, seed: int, render_mode: str = 'none') -> dict:
     with suppress_output():
-        main_env    = make_env()
+        main_env    = make_env(render_mode=render_mode, telemetry_file='telemetry/mppi_env.csv')
         rollout_env = make_env()
 
     throttle_ref, restore = _throttle_patch(main_env)
@@ -251,8 +257,7 @@ def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
     )
     np.random.seed(seed)
     controller.reset()
-    with suppress_output():
-        obs, _ = main_env.reset()
+    obs, _ = main_env.reset()
 
     target_roll_rad  = np.deg2rad(target_roll)
     target_pitch_rad = np.deg2rad(target_pitch)
@@ -322,7 +327,8 @@ def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
 def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
                    target_pitch: float, max_steps: int, mppi_cfg: dict,
                    seed: int, device: torch.device,
-                   residual_clamp: Optional[float] = None) -> dict:
+                   residual_clamp: Optional[float] = None,
+                   render_mode: str = 'none') -> dict:
     if model_path is not None:
         hybrid, config, denorm_factors, min_bounds, norm_type = load_model(model_path, device)
     else:
@@ -345,7 +351,8 @@ def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
         residual_clamp = 0.0
 
     with suppress_output():
-        env = make_env()
+        env = make_env(render_mode=render_mode,
+                       telemetry_file=f'telemetry/{_safe_label(label)}.csv')
     throttle_ref, restore = _throttle_patch(env)
     controller = MPPIController(
         horizon=mppi_cfg['horizon'], action_dim=3,
@@ -354,8 +361,7 @@ def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
     )
     np.random.seed(seed)
     controller.reset()
-    with suppress_output():
-        obs, _ = env.reset()
+    obs, _ = env.reset()
 
     target_roll_rad  = np.deg2rad(target_roll)
     target_pitch_rad = np.deg2rad(target_pitch)
@@ -428,8 +434,8 @@ def main():
     parser = argparse.ArgumentParser(
         description='Full MPPI analysis — compare all world models side by side'
     )
-    parser.add_argument('--target-roll',      type=float, default=20.0)
-    parser.add_argument('--target-pitch',     type=float, default=10.0)
+    parser.add_argument('--target-roll',      type=float, default=55.0)
+    parser.add_argument('--target-pitch',     type=float, default=28.0)
     parser.add_argument('--steps',            type=int,   default=STEPS_20S,
                         help='Steps per run (default 2000 = 20 s)')
     parser.add_argument('--mppi-samples',     type=int,   default=1000)
@@ -442,6 +448,10 @@ def main():
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--skip-env-model',   action='store_true',
                         help='Skip the slow JSBSim-rollout MPPI run')
+    parser.add_argument('--render-mode',      type=str, default='none',
+                        choices=['none', 'plot_anim', 'plot_end', 'ext_log', 'fgear', 'fgear_plot'],
+                        help='Visualization mode for the main env of each run (default: none). '
+                             'plot_anim requires: sudo apt install python3-tk')
     args = parser.parse_args()
 
     device   = torch.device(args.device)
@@ -458,30 +468,35 @@ def main():
     print(f"  MPPI   : samples={args.mppi_samples}  horizon={args.mppi_horizon}  "
           f"temp={args.mppi_temperature}  noise={args.mppi_noise_std}")
     print(f"  Seed   : {args.seed}   Device: {device}")
+    print(f"  Render : {args.render_mode}")
 
     models = sorted(MODELS_DIR.glob('*.pt'))
     print(f"  Models : {', '.join(m.stem for m in models) or 'none found'}\n")
 
     results: List[dict] = []
 
-    results.append(run_pid(args.target_roll, args.target_pitch, args.steps, args.seed))
-
-    results.append(run_mppi_model(
-        label='Prior_only', model_path=None,
-        target_roll=args.target_roll, target_pitch=args.target_pitch,
-        max_steps=args.steps, mppi_cfg=mppi_cfg, seed=args.seed, device=device,
-    ))
+    results.append(run_pid(args.target_roll, args.target_pitch, args.steps, args.seed,
+                           render_mode=args.render_mode))
 
     for model_path in models:
         results.append(run_mppi_model(
             label=model_path.stem, model_path=str(model_path),
             target_roll=args.target_roll, target_pitch=args.target_pitch,
             max_steps=args.steps, mppi_cfg=mppi_cfg, seed=args.seed, device=device,
+            render_mode=args.render_mode,
         ))
+    
+    results.append(run_mppi_model(
+        label='Prior_only', model_path=None,
+        target_roll=args.target_roll, target_pitch=args.target_pitch,
+        max_steps=args.steps, mppi_cfg=mppi_cfg, seed=args.seed, device=device,
+        render_mode=args.render_mode,
+    ))
 
     if not args.skip_env_model:
         results.append(run_mppi_env(
-            args.target_roll, args.target_pitch, args.steps, mppi_cfg, args.seed
+            args.target_roll, args.target_pitch, args.steps, mppi_cfg, args.seed,
+            render_mode=args.render_mode,
         ))
 
     print(f"\nSaving plots to {SAVE_DIR}/")
