@@ -71,7 +71,7 @@ MODELS_DIR    = _PHYSICS_DIR / 'models'
 CONFIG_DIR    = str(_FC_DIR / 'config')
 NOATMO_YAML   = str(_FC_DIR / 'config' / 'env' / 'jsbsim' / 'noatmo.yaml')
 TRAINING_YAML = str(_PHYSICS_DIR / 'training_params.yaml')
-SAVE_DIR      = _FC_DIR / 'data' / 'full_analysis'
+SAVE_DIR      = _FC_DIR / 'data' / 'full_analysis_nominal'
 
 DT        = 0.01
 STEPS_20S = 2000   # 20 s at 0.01 s/step
@@ -581,8 +581,8 @@ def main():
     parser = argparse.ArgumentParser(
         description='Full MPPI analysis — compare all world models side by side'
     )
-    parser.add_argument('--target-roll',      type=float, default=30.0)
-    parser.add_argument('--target-pitch',     type=float, default=15.0)
+    parser.add_argument('--target-roll',      type=float, default=20.0)
+    parser.add_argument('--target-pitch',     type=float, default=10.0)
     parser.add_argument('--steps',            type=int,   default=STEPS_20S,
                         help='Steps per run (default 2000 = 20 s)')
     parser.add_argument('--mppi-samples',     type=int,   default=1000)
