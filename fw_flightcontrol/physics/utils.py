@@ -1,9 +1,13 @@
 """Shared utilities for physics model training and evaluation."""
 
+import os
+import sys
+import csv
 import torch
 import yaml
 import numpy as np
 import pandas as pd
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -616,3 +620,163 @@ def plot_action_history(
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Action history plot saved to {save_path}")
+
+
+# ============================================================================
+# TEST SCRIPT UTILITIES
+# ============================================================================
+
+@contextmanager
+def suppress_output():
+    """Suppress all stdout/stderr including C-level file descriptors (e.g. JSBSim)."""
+    with open(os.devnull, 'w') as devnull:
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        old_fd_out = os.dup(1)
+        old_fd_err = os.dup(2)
+        os.dup2(devnull.fileno(), 1)
+        os.dup2(devnull.fileno(), 2)
+        sys.stdout = devnull
+        sys.stderr = devnull
+        try:
+            yield
+        finally:
+            os.dup2(old_fd_out, 1)
+            os.dup2(old_fd_err, 2)
+            os.close(old_fd_out)
+            os.close(old_fd_err)
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+
+def _throttle_patch(env) -> Tuple:
+    """Monkey-patch apply_action so MPPI can override throttle. Returns (ref, restore_fn)."""
+    from fw_jsbgym.utils import jsbsim_properties as prp
+    throttle_ref = [0.3]
+    original = env.unwrapped.apply_action
+
+    def _patched(action):
+        original(action)
+        env.unwrapped.sim[prp.throttle_cmd] = float(np.clip(throttle_ref[0], 0.0, 1.0))
+
+    env.unwrapped.apply_action = _patched
+    return throttle_ref, lambda: setattr(env.unwrapped, 'apply_action', original)
+
+
+def _safe_label(label: str) -> str:
+    """Convert a run label to a filesystem-safe string."""
+    return label.replace(' ', '_').replace('/', '_').replace('(', '').replace(')', '')
+
+
+def plot_model_result(
+    res: dict,
+    target_roll: float,
+    target_pitch: float,
+    save_path: Path,
+    dt: float = 0.01,
+    tolerance_deg: float = 5.0,
+) -> None:
+    """Save a 4-panel figure: roll control, pitch control, commands, angular velocities."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    t = np.arange(res['steps']) * dt
+    actions = res['actions']
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+    ax_roll, ax_pitch = axes[0, 0], axes[0, 1]
+    ax_cmd,  ax_rates = axes[1, 0], axes[1, 1]
+
+    ax_roll.plot(t, res['roll'], color='steelblue', linewidth=1.1, label='roll')
+    ax_roll.axhline(target_roll, color='red', linestyle='--', linewidth=1.2, label='roll_ref')
+    ax_roll.axhspan(target_roll - tolerance_deg, target_roll + tolerance_deg,
+                    alpha=0.12, color='red')
+    ax_roll.set_title('roll control')
+    ax_roll.set_ylabel('roll [°]')
+    ax_roll.legend(loc='upper right', fontsize=8)
+    ax_roll.grid(True, alpha=0.3)
+
+    ax_pitch.plot(t, res['pitch'], color='steelblue', linewidth=1.1, label='pitch')
+    ax_pitch.axhline(target_pitch, color='red', linestyle='--', linewidth=1.2, label='pitch_ref')
+    ax_pitch.axhspan(target_pitch - tolerance_deg, target_pitch + tolerance_deg,
+                     alpha=0.12, color='red')
+    ax_pitch.set_title('pitch control')
+    ax_pitch.set_ylabel('pitch [°]')
+    ax_pitch.legend(loc='upper right', fontsize=8)
+    ax_pitch.grid(True, alpha=0.3)
+
+    ax_cmd.plot(t, actions[:, 0], color='steelblue',  linewidth=0.9, label='aileron_pos_norm')
+    ax_cmd.plot(t, actions[:, 1], color='darkorange', linewidth=0.9, label='elevator_pos_norm')
+    ax_cmd.plot(t, actions[:, 2], color='seagreen',   linewidth=0.9, label='throttle_pos')
+    ax_cmd.set_title('commands')
+    ax_cmd.set_ylabel('commands [-]')
+    ax_cmd.set_xlabel('time [s]')
+    ax_cmd.legend(loc='upper right', fontsize=8)
+    ax_cmd.grid(True, alpha=0.3)
+
+    ax_rates.plot(t, res['p'], color='steelblue',  linewidth=0.9, label='roll_rate')
+    ax_rates.plot(t, res['q'], color='darkorange', linewidth=0.9, label='pitch_rate')
+    ax_rates.plot(t, res['r'], color='seagreen',   linewidth=0.9, label='yaw_rate')
+    ax_rates.set_title('angular velocities')
+    ax_rates.set_ylabel('angular velocities [rad/s]')
+    ax_rates.set_xlabel('time [s]')
+    ax_rates.legend(loc='upper right', fontsize=8)
+    ax_rates.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved {save_path.name}")
+
+
+def save_metrics(
+    results: List[dict],
+    target_roll: float,
+    target_pitch: float,
+    save_path: Path,
+    dt: float = 0.01,
+) -> None:
+    """Compute per-run metrics, print a summary table, and write a CSV."""
+    rows = []
+    for res in results:
+        rc = compute_convergence_stats(res['roll'],  target_roll,  threshold_deg=1.0)
+        pc = compute_convergence_stats(res['pitch'], target_pitch, threshold_deg=1.0)
+
+        roll_arr  = np.array(res['roll'])
+        pitch_arr = np.array(res['pitch'])
+        avg_t_ms  = np.mean(res['step_times']) * 1000
+
+        rows.append({
+            'label':                 res['label'],
+            'steps':                 res['steps'],
+            'terminated':            res['terminated'],
+            'avg_step_time_ms':      f"{avg_t_ms:.2f}",
+            'roll_mean_err_deg':     f"{np.mean(np.abs(roll_arr  - target_roll)):.2f}",
+            'roll_converged_step':   rc['convergence_step'] if rc['convergence_step'] is not None else 'never',
+            'roll_converged_s':      f"{rc['convergence_step'] * dt:.2f}" if rc['convergence_step'] is not None else 'never',
+            'roll_ss_mean_err_deg':  f"{rc['steady_mean_error']:.2f}",
+            'roll_ss_std_deg':       f"{rc['steady_std']:.2f}",
+            'pitch_mean_err_deg':    f"{np.mean(np.abs(pitch_arr - target_pitch)):.2f}",
+            'pitch_converged_step':  pc['convergence_step'] if pc['convergence_step'] is not None else 'never',
+            'pitch_converged_s':     f"{pc['convergence_step'] * dt:.2f}" if pc['convergence_step'] is not None else 'never',
+            'pitch_ss_mean_err_deg': f"{pc['steady_mean_error']:.2f}",
+            'pitch_ss_std_deg':      f"{pc['steady_std']:.2f}",
+        })
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(save_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+    col_w = 30
+    print(f"\n{'Model':<{col_w}} {'Steps':>6} {'Term':>5} {'t_ms':>7} "
+          f"{'Roll err':>9} {'R conv':>7} {'Pitch err':>10} {'P conv':>7}")
+    print('-' * (col_w + 53))
+    for r in rows:
+        print(f"{r['label']:<{col_w}} {r['steps']:>6} {str(r['terminated']):>5} "
+              f"{r['avg_step_time_ms']:>7} {r['roll_mean_err_deg']:>9}° "
+              f"{str(r['roll_converged_s']):>7} {r['pitch_mean_err_deg']:>10}° "
+              f"{str(r['pitch_converged_s']):>7}")
+    print(f"\nMetrics saved to {save_path}")

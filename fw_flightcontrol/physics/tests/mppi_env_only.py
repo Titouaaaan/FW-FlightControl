@@ -11,43 +11,24 @@ For each MPPI step the rollout env is sequentially reset to the current main-env
 state (via IC save/restore) and stepped through each candidate action sequence.
 This is slow (~1-2 s per control step) but is intended as a diagnostic tool.
 
+NOTE: full_mppi_analysis.py covers this same run as part of a broader comparison.
+      Use this script for a quick isolated env-only MPPI run with verbose step output.
+
 Usage:
-    cd fw_flightcontrol/physics/
+    cd fw_flightcontrol/physics/tests/
     python mppi_env_only.py --target-roll 45 --target-pitch 25
     python mppi_env_only.py --target-roll 60 --target-pitch 30 --mppi-samples 30
 """
 
 import numpy as np
 import sys
-import os
 import argparse
 import time
-from contextlib import contextmanager
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
-@contextmanager
-def suppress_output():
-    with open(os.devnull, 'w') as devnull:
-        old_stdout, old_stderr = sys.stdout, sys.stderr
-        old_fd_out = os.dup(1)
-        old_fd_err = os.dup(2)
-        os.dup2(devnull.fileno(), 1)
-        os.dup2(devnull.fileno(), 2)
-        sys.stdout = devnull
-        sys.stderr = devnull
-        try:
-            yield
-        finally:
-            os.dup2(old_fd_out, 1)
-            os.dup2(old_fd_err, 2)
-            os.close(old_fd_out)
-            os.close(old_fd_err)
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
 from omegaconf import OmegaConf
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import fw_jsbgym  # noqa: F401 — registers gym environments
 import gymnasium as gym
@@ -58,8 +39,10 @@ from fw_flightcontrol.physics.utils import (
     plot_tracking_performance,
     plot_action_history,
     compute_convergence_stats,
+    suppress_output,
+    _throttle_patch,
 )
-from fw_flightcontrol.physics.mppi_test import MPPIController
+from fw_flightcontrol.physics.tests.mppi_test import MPPIController
 
 
 # ============================================================================
@@ -79,14 +62,14 @@ DT               = 0.01
 def make_env() -> gym.Env:
     try:
         from hydra import compose, initialize_config_dir
-        config_dir = str(Path(__file__).parent / '../config')
+        config_dir = str(Path(__file__).parent.parent / 'config')
         with initialize_config_dir(version_base=None, config_dir=config_dir):
             cfg = compose(config_name='default')
     except Exception:
         cfg = OmegaConf.create({'env': {}})
 
     cfg.env.jsbsim = OmegaConf.load(
-        str(Path(__file__).parent / '../config/env/jsbsim/noatmo.yaml')
+        str(Path(__file__).parent.parent / 'config/env/jsbsim/noatmo.yaml')
     )
     env = gym.make('ACBohnNoVaIErr-v0', cfg_env=cfg.env, render_mode='none')
     env.unwrapped.init()
@@ -115,21 +98,9 @@ def rollout_env_trajectories(
     num_samples, horizon, _ = actions.shape
     costs = np.zeros(num_samples)
 
-    # Throttle monkey-patch — same mechanism as mppi_test.run_mppi_control
-    throttle_ref = [0.3]
-    _original_apply = rollout_env.unwrapped.apply_action
-
-    def _patched_apply(action):
-        _original_apply(action)
-        rollout_env.unwrapped.sim[prp.throttle_cmd] = float(
-            np.clip(throttle_ref[0], 0.0, 1.0)
-        )
-
-    rollout_env.unwrapped.apply_action = _patched_apply
+    throttle_ref, restore = _throttle_patch(rollout_env)
 
     for k in range(num_samples):
-        # reset() satisfies gymnasium's OrderEnforcing wrapper; set_env_state
-        # immediately overrides the JSBSim IC with the saved physical state
         with suppress_output():
             rollout_env.reset()
         set_env_state(rollout_env, saved_state)
@@ -141,21 +112,21 @@ def rollout_env_trajectories(
 
             roll_err  = abs(obs[0] - target_roll_rad)
             pitch_err = abs(obs[1] - target_pitch_rad)
-            va_err    = abs(obs[2] - target_va_kmh)    # obs[2] is Va in km/h
+            va_err    = abs(obs[2] - target_va_kmh)
             cost += roll_err + pitch_err + va_weight * va_err
 
             if terminated or truncated:
-                cost += 100.0  # large penalty for crash
+                cost += 100.0
                 break
 
         costs[k] = cost
 
-    rollout_env.unwrapped.apply_action = _original_apply
+    restore()
     return costs
 
 
 # ============================================================================
-# MPPI OPTIMIZE (env-based, replaces MPPIController.optimize)
+# MPPI OPTIMIZE (env-based)
 # ============================================================================
 def mppi_optimize_env(
     controller: MPPIController,
@@ -168,19 +139,16 @@ def mppi_optimize_env(
     """One MPPI optimisation step using JSBSim rollouts."""
     target_roll_rad  = np.deg2rad(target_roll)
     target_pitch_rad = np.deg2rad(target_pitch)
-    # Use current airspeed as Va target: "maintain what you have now"
     target_va_kmh    = saved_state['airspeed_kts'] * 1.852
 
     sampled_actions = controller.sample_actions()
 
-    # Evaluate all candidates in JSBSim
     costs = rollout_env_trajectories(
         rollout_env, saved_state, sampled_actions,
         target_roll_rad, target_pitch_rad,
         target_va_kmh, va_weight,
     )
 
-    # MPPI weights
     valid  = np.isfinite(costs)
     if not valid.any():
         controller._shift_mean()
@@ -223,17 +191,7 @@ def run_mppi_env_control(
           f"temp={mppi_temperature}  noise={mppi_noise_std}  va_weight={va_weight}")
     print(f"{'='*70}\n")
 
-    # Throttle monkey-patch for main env
-    throttle_ref = [0.3]
-    _orig_apply = main_env.unwrapped.apply_action
-
-    def _patched(action):
-        _orig_apply(action)
-        main_env.unwrapped.sim[prp.throttle_cmd] = float(
-            np.clip(throttle_ref[0], 0.0, 1.0)
-        )
-
-    main_env.unwrapped.apply_action = _patched
+    throttle_ref, restore = _throttle_patch(main_env)
 
     controller = MPPIController(
         horizon=mppi_horizon,
@@ -286,7 +244,7 @@ def run_mppi_env_control(
             print(f"\n>>> Terminated at step {step+1}")
             break
 
-    main_env.unwrapped.apply_action = _orig_apply
+    restore()
 
     avg_t = np.mean(step_times)
     roll_conv  = compute_convergence_stats(roll_hist,  target_roll,  threshold_deg=1.0)
@@ -329,15 +287,15 @@ def main():
         rollout_env = make_env()
 
     roll_hist, pitch_hist, actions = run_mppi_env_control(
-        main_env   = main_env,
-        rollout_env= rollout_env,
-        target_roll      = args.target_roll,
-        target_pitch     = args.target_pitch,
-        max_steps        = args.steps,
-        mppi_samples     = args.mppi_samples,
-        mppi_horizon     = args.mppi_horizon,
-        mppi_temperature = args.mppi_temperature,
-        mppi_noise_std   = args.mppi_noise_std,
+        main_env        = main_env,
+        rollout_env     = rollout_env,
+        target_roll     = args.target_roll,
+        target_pitch    = args.target_pitch,
+        max_steps       = args.steps,
+        mppi_samples    = args.mppi_samples,
+        mppi_horizon    = args.mppi_horizon,
+        mppi_temperature= args.mppi_temperature,
+        mppi_noise_std  = args.mppi_noise_std,
     )
 
     main_env.close()
