@@ -68,10 +68,11 @@ MODELS_DIR    = _PHYSICS_DIR / 'models'
 CONFIG_DIR    = str(_FC_DIR / 'config')
 NOATMO_YAML   = str(_FC_DIR / 'config' / 'env' / 'jsbsim' / 'noatmo.yaml')
 TRAINING_YAML = str(_PHYSICS_DIR / 'training_params.yaml')
-SAVE_DIR      = _FC_DIR / 'data' / 'temp'
+SAVE_DIR      = _FC_DIR / 'data' / 'mppi_easytarget_H80_temp0.5_noise0.5_samples1000'
 
-DT        = 0.01
-STEPS_20S = 2000   # 20 s at 0.01 s/step
+DT           = 0.01
+STEPS_20S    = 2000   # 20 s at 0.01 s/step
+TARGET_VA_KPH = 60.0  # fixed cruise-speed target [km/h]
 
 
 # ============================================================================
@@ -163,10 +164,11 @@ def run_pid(target_roll: float, target_pitch: float, max_steps: int, seed: int,
     np.random.seed(seed)
     with suppress_output():
         env = make_env(render_mode=render_mode, telemetry_file='telemetry/pid.csv')
-    obs, _ = env.reset()
+    obs, _ = env.reset(options={"fgear_target_roll": target_roll, "fgear_target_pitch": target_pitch})
 
     target_roll_rad  = np.deg2rad(target_roll)
     target_pitch_rad = np.deg2rad(target_pitch)
+    env.unwrapped.set_target_state(np.array([target_roll_rad, target_pitch_rad]))
 
     pid_ail = PID(kp=1.5,  ki=0.1,  kd=0.1,  dt=env.unwrapped.fdm_dt,
                   trim=TrimPoint(), limit=1.0, is_throttle=False)
@@ -175,7 +177,7 @@ def run_pid(target_roll: float, target_pitch: float, max_steps: int, seed: int,
     pid_ail.set_reference(target_roll_rad)
     pid_ele.set_reference(target_pitch_rad)
 
-    roll_hist, pitch_hist, p_hist, q_hist, r_hist = [], [], [], [], []
+    roll_hist, pitch_hist, va_hist, p_hist, q_hist, r_hist = [], [], [], [], [], []
     actions_hist, step_times = [], []
     terminated = False
 
@@ -193,6 +195,7 @@ def run_pid(target_roll: float, target_pitch: float, max_steps: int, seed: int,
 
             roll_hist.append(np.rad2deg(obs[0]))
             pitch_hist.append(np.rad2deg(obs[1]))
+            va_hist.append(obs[2])
             p_hist.append(obs[3])
             q_hist.append(obs[4])
             r_hist.append(obs[5])
@@ -207,7 +210,7 @@ def run_pid(target_roll: float, target_pitch: float, max_steps: int, seed: int,
                 break
 
     env.close()
-    return dict(label='PID', roll=roll_hist, pitch=pitch_hist,
+    return dict(label='PID', roll=roll_hist, pitch=pitch_hist, va=va_hist,
                 p=p_hist, q=q_hist, r=r_hist,
                 actions=np.array(actions_hist), step_times=step_times,
                 steps=len(roll_hist), terminated=terminated)
@@ -257,13 +260,14 @@ def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
     )
     np.random.seed(seed)
     controller.reset()
-    obs, _ = main_env.reset()
+    obs, _ = main_env.reset(options={"fgear_target_roll": target_roll, "fgear_target_pitch": target_pitch})
 
     target_roll_rad  = np.deg2rad(target_roll)
     target_pitch_rad = np.deg2rad(target_pitch)
     va_weight        = mppi_cfg.get('va_weight', 0.1)
+    main_env.unwrapped.set_target_state(np.array([target_roll_rad, target_pitch_rad]))
 
-    roll_hist, pitch_hist, p_hist, q_hist, r_hist = [], [], [], [], []
+    roll_hist, pitch_hist, va_hist, p_hist, q_hist, r_hist = [], [], [], [], [], []
     actions_hist, step_times = [], []
     terminated = False
 
@@ -271,11 +275,10 @@ def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
         for _ in range(max_steps):
             t0 = time.time()
             saved     = get_env_state(main_env)
-            target_va = saved['airspeed_kts'] * 1.852
 
             sampled = controller.sample_actions()
             costs   = _rollout_env(rollout_env, saved, sampled,
-                                   target_roll_rad, target_pitch_rad, target_va, va_weight)
+                                   target_roll_rad, target_pitch_rad, TARGET_VA_KPH, va_weight)
 
             valid = np.isfinite(costs)
             if not valid.any():
@@ -297,6 +300,7 @@ def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
 
             roll_hist.append(np.rad2deg(obs[0]))
             pitch_hist.append(np.rad2deg(obs[1]))
+            va_hist.append(obs[2])
             p_hist.append(obs[3])
             q_hist.append(obs[4])
             r_hist.append(obs[5])
@@ -314,7 +318,7 @@ def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
     restore()
     main_env.close()
     rollout_env.close()
-    return dict(label='JSBSim_env', roll=roll_hist, pitch=pitch_hist,
+    return dict(label='JSBSim_env', roll=roll_hist, pitch=pitch_hist, va=va_hist,
                 p=p_hist, q=q_hist, r=r_hist,
                 actions=np.array(actions_hist), step_times=step_times,
                 steps=len(roll_hist), terminated=terminated)
@@ -361,12 +365,14 @@ def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
     )
     np.random.seed(seed)
     controller.reset()
-    obs, _ = env.reset()
+    obs, _ = env.reset(options={"fgear_target_roll": target_roll, "fgear_target_pitch": target_pitch})
 
     target_roll_rad  = np.deg2rad(target_roll)
     target_pitch_rad = np.deg2rad(target_pitch)
+    va_weight        = mppi_cfg.get('va_weight', 0.1)
+    env.unwrapped.set_target_state(np.array([target_roll_rad, target_pitch_rad]))
 
-    roll_hist, pitch_hist, p_hist, q_hist, r_hist = [], [], [], [], []
+    roll_hist, pitch_hist, va_hist, p_hist, q_hist, r_hist = [], [], [], [], [], []
     actions_hist, step_times = [], []
     terminated = False
 
@@ -383,7 +389,9 @@ def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
 
             roll_errs  = np.abs(trajectories[:, :, 0] - target_roll_rad)
             pitch_errs = np.abs(trajectories[:, :, 1] - target_pitch_rad)
-            costs      = np.sum(roll_errs + pitch_errs, axis=1)
+            va_errs    = np.abs(trajectories[:, :, 2] - TARGET_VA_KPH) / TARGET_VA_KPH
+            # Normalize by π/2 so attitude errors are dimensionless on [0,1] scale.
+            costs = np.sum((roll_errs + pitch_errs) / (np.pi / 2) + va_weight * va_errs, axis=1)
 
             valid = np.isfinite(costs)
             if not valid.any():
@@ -405,6 +413,7 @@ def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
 
             roll_hist.append(np.rad2deg(obs[0]))
             pitch_hist.append(np.rad2deg(obs[1]))
+            va_hist.append(obs[2])
             p_hist.append(obs[3])
             q_hist.append(obs[4])
             r_hist.append(obs[5])
@@ -420,7 +429,7 @@ def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
 
     restore()
     env.close()
-    return dict(label=label, roll=roll_hist, pitch=pitch_hist,
+    return dict(label=label, roll=roll_hist, pitch=pitch_hist, va=va_hist,
                 p=p_hist, q=q_hist, r=r_hist,
                 actions=np.array(actions_hist), step_times=step_times,
                 steps=len(roll_hist), terminated=terminated)
@@ -439,10 +448,10 @@ def main():
     parser.add_argument('--steps',            type=int,   default=STEPS_20S,
                         help='Steps per run (default 2000 = 20 s)')
     parser.add_argument('--mppi-samples',     type=int,   default=1000)
-    parser.add_argument('--mppi-horizon',     type=int,   default=40)
+    parser.add_argument('--mppi-horizon',     type=int,   default=80)
     parser.add_argument('--mppi-temperature', type=float, default=0.5)
     parser.add_argument('--mppi-noise-std',   type=float, default=0.5)
-    parser.add_argument('--mppi-va-weight',   type=float, default=0.1)
+    parser.add_argument('--mppi-va-weight',   type=float, default=1)
     parser.add_argument('--seed',             type=int,   default=42)
     parser.add_argument('--device',           type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -502,7 +511,8 @@ def main():
     print(f"\nSaving plots to {SAVE_DIR}/")
     for res in results:
         fname = f"{_safe_label(res['label'])}_{tag}_plots.png"
-        plot_model_result(res, args.target_roll, args.target_pitch, SAVE_DIR / fname)
+        plot_model_result(res, args.target_roll, args.target_pitch, SAVE_DIR / fname,
+                          target_va=TARGET_VA_KPH)
 
     save_metrics(results, args.target_roll, args.target_pitch,
                  SAVE_DIR / f"metrics_{tag}.csv")

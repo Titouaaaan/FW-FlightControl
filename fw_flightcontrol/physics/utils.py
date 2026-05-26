@@ -674,18 +674,24 @@ def plot_model_result(
     save_path: Path,
     dt: float = 0.01,
     tolerance_deg: float = 5.0,
+    target_va: float = 60.0,
 ) -> None:
-    """Save a 4-panel figure: roll control, pitch control, commands, angular velocities."""
+    """Save a 5-panel figure: roll, pitch, commands, angular velocities, airspeed."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
 
     t = np.arange(res['steps']) * dt
     actions = res['actions']
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-    ax_roll, ax_pitch = axes[0, 0], axes[0, 1]
-    ax_cmd,  ax_rates = axes[1, 0], axes[1, 1]
+    fig = plt.figure(figsize=(14, 10))
+    gs  = GridSpec(3, 2, figure=fig, hspace=0.4, wspace=0.3)
+    ax_roll  = fig.add_subplot(gs[0, 0])
+    ax_pitch = fig.add_subplot(gs[0, 1])
+    ax_cmd   = fig.add_subplot(gs[1, 0])
+    ax_rates = fig.add_subplot(gs[1, 1])
+    ax_va    = fig.add_subplot(gs[2, :])
 
     ax_roll.plot(t, res['roll'], color='steelblue', linewidth=1.1, label='roll')
     ax_roll.axhline(target_roll, color='red', linestyle='--', linewidth=1.2, label='roll_ref')
@@ -723,7 +729,14 @@ def plot_model_result(
     ax_rates.legend(loc='upper right', fontsize=8)
     ax_rates.grid(True, alpha=0.3)
 
-    fig.tight_layout()
+    ax_va.plot(t, res['va'], color='mediumpurple', linewidth=1.1, label='airspeed')
+    ax_va.axhline(target_va, color='red', linestyle='--', linewidth=1.2, label=f'target {target_va:.0f} km/h')
+    ax_va.set_title('airspeed')
+    ax_va.set_ylabel('airspeed [km/h]')
+    ax_va.set_xlabel('time [s]')
+    ax_va.legend(loc='upper right', fontsize=8)
+    ax_va.grid(True, alpha=0.3)
+
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
