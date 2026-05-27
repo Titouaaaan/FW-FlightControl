@@ -68,7 +68,7 @@ MODELS_DIR    = _PHYSICS_DIR / 'models'
 CONFIG_DIR    = str(_FC_DIR / 'config')
 NOATMO_YAML   = str(_FC_DIR / 'config' / 'env' / 'jsbsim' / 'noatmo.yaml')
 TRAINING_YAML = str(_PHYSICS_DIR / 'training_params.yaml')
-SAVE_DIR      = _FC_DIR / 'data' / 'mppi_easytarget_H80_temp0.5_noise0.5_samples1000'
+SAVE_DIR      = _FC_DIR / 'data' / 'iterative_mppi_easytarget_H20_samples1000'
 
 DT           = 0.01
 STEPS_20S    = 2000   # 20 s at 0.01 s/step
@@ -271,20 +271,22 @@ def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
     actions_hist, step_times = [], []
     terminated = False
 
+    n_iters = mppi_cfg.get('iters') or 1
+
     with tqdm(total=max_steps, desc='MPPI env', unit='step', leave=True) as pbar:
         for _ in range(max_steps):
-            t0 = time.time()
-            saved     = get_env_state(main_env)
+            t0    = time.time()
+            saved = get_env_state(main_env)
+            best  = np.zeros(3)
 
-            sampled = controller.sample_actions()
-            costs   = _rollout_env(rollout_env, saved, sampled,
-                                   target_roll_rad, target_pitch_rad, TARGET_VA_KPH, va_weight)
+            for _ in range(n_iters):
+                sampled = controller.sample_actions()
+                costs   = _rollout_env(rollout_env, saved, sampled,
+                                       target_roll_rad, target_pitch_rad, TARGET_VA_KPH, va_weight)
 
-            valid = np.isfinite(costs)
-            if not valid.any():
-                controller._shift_mean()
-                best = np.zeros(3)
-            else:
+                valid = np.isfinite(costs)
+                if not valid.any():
+                    continue
                 nan_pen = np.nanmax(costs[valid]) * 10.0
                 cs = np.where(valid, costs, nan_pen)
                 w  = np.exp(-(cs - cs.min()) / controller.temperature)
@@ -293,7 +295,8 @@ def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
                 best = controller.mean_actions[0].copy()
                 best[:2] = np.clip(best[:2], -1.0, 1.0)
                 best[2]  = np.clip(best[2],  0.0,  1.0)
-                controller._shift_mean()
+
+            controller._shift_mean()
 
             throttle_ref[0] = float(best[2])
             obs, _, term, trunc, _ = main_env.step(best[:2])
@@ -376,28 +379,31 @@ def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
     actions_hist, step_times = [], []
     terminated = False
 
+    n_iters = mppi_cfg.get('iters') or 1
+
     with tqdm(total=max_steps, desc=label, unit='step', leave=True) as pbar:
         for _ in range(max_steps):
-            t0      = time.time()
-            sampled = controller.sample_actions()
+            t0   = time.time()
+            best = np.zeros(3)
 
-            trajectories = rollout_trajectories(
-                obs, sampled, hybrid, config,
-                denorm_factors, min_bounds, norm_type, device,
-                residual_clamp=residual_clamp,
-            )
+            for _ in range(n_iters):
+                sampled = controller.sample_actions()
 
-            roll_errs  = np.abs(trajectories[:, :, 0] - target_roll_rad)
-            pitch_errs = np.abs(trajectories[:, :, 1] - target_pitch_rad)
-            va_errs    = np.abs(trajectories[:, :, 2] - TARGET_VA_KPH) / TARGET_VA_KPH
-            # Normalize by π/2 so attitude errors are dimensionless on [0,1] scale.
-            costs = np.sum((roll_errs + pitch_errs) / (np.pi / 2) + va_weight * va_errs, axis=1)
+                trajectories = rollout_trajectories(
+                    obs, sampled, hybrid, config,
+                    denorm_factors, min_bounds, norm_type, device,
+                    residual_clamp=residual_clamp,
+                )
 
-            valid = np.isfinite(costs)
-            if not valid.any():
-                controller._shift_mean()
-                best = np.zeros(3)
-            else:
+                roll_errs  = np.abs(trajectories[:, :, 0] - target_roll_rad)
+                pitch_errs = np.abs(trajectories[:, :, 1] - target_pitch_rad)
+                va_errs    = np.abs(trajectories[:, :, 2] - TARGET_VA_KPH / 3.6) / (TARGET_VA_KPH / 3.6)
+                # Normalize by π/2 so attitude errors are dimensionless on [0,1] scale.
+                costs = np.sum((roll_errs + pitch_errs) / (np.pi / 2) + va_weight * va_errs, axis=1)
+
+                valid = np.isfinite(costs)
+                if not valid.any():
+                    continue
                 nan_pen = np.nanmax(costs[valid]) * 10.0
                 cs = np.where(valid, costs, nan_pen)
                 w  = np.exp(-(cs - cs.min()) / controller.temperature)
@@ -406,7 +412,8 @@ def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
                 best = controller.mean_actions[0].copy()
                 best[:2] = np.clip(best[:2], -1.0, 1.0)
                 best[2]  = np.clip(best[2],  0.0,  1.0)
-                controller._shift_mean()
+
+            controller._shift_mean()
 
             throttle_ref[0] = float(best[2])
             obs, _, term, trunc, _ = env.step(best[:2])
@@ -452,6 +459,9 @@ def main():
     parser.add_argument('--mppi-temperature', type=float, default=0.5)
     parser.add_argument('--mppi-noise-std',   type=float, default=0.5)
     parser.add_argument('--mppi-va-weight',   type=float, default=1)
+    parser.add_argument('--mppi-iters',       type=int,   default=None,
+                        help='Iterative MPPI: number of refinement passes per timestep (TD-MPC style). '
+                             'Omit for vanilla single-pass MPPI.')
     parser.add_argument('--seed',             type=int,   default=42)
     parser.add_argument('--device',           type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -467,7 +477,7 @@ def main():
     mppi_cfg = dict(
         samples=args.mppi_samples, horizon=args.mppi_horizon,
         temperature=args.mppi_temperature, noise_std=args.mppi_noise_std,
-        va_weight=args.mppi_va_weight,
+        va_weight=args.mppi_va_weight, iters=args.mppi_iters,
     )
     tag = f"r{args.target_roll:.0f}_p{args.target_pitch:.0f}"
 
