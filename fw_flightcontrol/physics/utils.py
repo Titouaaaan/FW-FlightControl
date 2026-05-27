@@ -503,8 +503,8 @@ def set_env_state(env, state: dict) -> None:
     from fw_jsbgym.utils import jsbsim_properties as prp
     sim = env.unwrapped.sim
     sim[prp.ic_roll_rad]     = state['roll_rad']
-    sim[prp.ic_pitch_rad]    = state['pitch_rad']
-    sim[prp.ic_heading_rad]  = state['heading_rad']
+    sim[prp.ic_pitch_rad]    = state['pitch_rad']   - state['alpha_rad']
+    sim[prp.ic_heading_rad]  = state['heading_rad'] + state['beta_rad']
     sim[prp.ic_airspeed_kts] = state['airspeed_kts']
     sim[prp.ic_p_radps]      = state['p_radps']
     sim[prp.ic_q_radps]      = state['q_radps']
