@@ -1,71 +1,74 @@
 #!/usr/bin/env python3
 """
-MPPI with JSBSim as the World Model (Ground-Truth Upper Bound)
+MPPI Oracle — JSBSim as World Model
+=====================================
+Uses JSBSim itself as the dynamics model for MPPI rollouts.
+This is the theoretical upper bound: the world model IS the simulator.
 
-Standalone version of the env-model run from full_mppi_analysis.py.
-All code is taken verbatim from that script — same paths, constants,
-make_env, _rollout_env, and run_mppi_env — so results are directly comparable.
+Clone strategy
+--------------
+Each rollout needs an independent copy of the simulator at its current state.
+The hard problem: JSBSim's Adams–Bashforth 4 integrator maintains internal
+history deques (dqUVWidot, dqPQRidot) that are NOT accessible via the property
+interface — so property-based cloning always produces a deque mismatch that
+makes the first integration step behave like Euler.
 
-Usage:
-    cd fw_flightcontrol/physics/tests/
-    python mppi_env_only.py
-    python mppi_env_only.py --target-roll 55 --target-pitch 28 --steps 200
+Solution: os.fork().  Forking copies the entire process memory including all
+C++ internals.  The child inherits a bit-perfect snapshot → zero divergence.
+Verified via --sanity: every obs channel is exactly 0.000e+00 across H=20 steps.
+
+Fallback (--use-replay, non-Linux):
+  Maintains a 4-entry buffer of (snapshot, action) pairs.  Each rollout
+  restores from 4 steps ago then replays those 4 actions, rebuilding the
+  deque.  p/r error ~30× better than raw deep_clone; small Va offset (~0.22 kph)
+  that is action-independent and cancels in MPPI's softmax.
+
+Usage
+-----
+    python mppi_env_only.py --sanity                    # clone sanity check
+    python mppi_env_only.py                             # run oracle (fork)
+    python mppi_env_only.py --use-replay                # replay fallback
+    python mppi_env_only.py --steps 2000 --mppi-samples 100
 """
 
+import os, sys, struct, time, pickle, argparse
 import numpy as np
-import sys
-import argparse
-import time
+from collections import deque as Deque
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from tqdm import tqdm
+from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
-from omegaconf import OmegaConf
-
-import fw_jsbgym  # noqa: F401 — registers gym environments
+import fw_jsbgym                                           # registers gym envs
 import gymnasium as gym
-import torch
-
 from fw_jsbgym.utils import jsbsim_properties as prp
-from fw_jsbgym.trim.trim_point import TrimPoint
+
 from fw_flightcontrol.physics.utils import (
-    get_env_state,
-    set_env_state,
-    get_norm_type,
-    clean_state_dict_for_compilation,
-    suppress_output,
-    _throttle_patch,
-    _safe_label,
-    plot_model_result,
-    save_metrics,
+    get_env_state, set_env_state,
+    suppress_output, _throttle_patch, _safe_label,
+    plot_model_result, save_metrics, compute_convergence_stats,
 )
 from fw_flightcontrol.physics.tests.mppi_test import MPPIController
 
-# ============================================================================
-# PATHS
-# ============================================================================
-_TESTS_DIR    = Path(__file__).parent
-_PHYSICS_DIR  = _TESTS_DIR.parent
-_FC_DIR       = _PHYSICS_DIR.parent
-MODELS_DIR    = _PHYSICS_DIR / 'models'
+
+# ── Paths & constants ──────────────────────────────────────────────────────────
+_FC_DIR       = Path(__file__).parent.parent.parent
 CONFIG_DIR    = str(_FC_DIR / 'config')
 NOATMO_YAML   = str(_FC_DIR / 'config' / 'env' / 'jsbsim' / 'noatmo.yaml')
-TRAINING_YAML = str(_PHYSICS_DIR / 'training_params.yaml')
-SAVE_DIR      = _FC_DIR / 'data' / 'fixing_sim_env'
+SAVE_DIR      = _FC_DIR / 'data' / 'oracle_mppi'
 
-DT           = 0.01
-STEPS_20S    = 2000   # 20 s at 0.01 s/step
-TARGET_VA_KPH = 60.0  # fixed cruise-speed target [km/h]
+DT            = 0.01      # s per simulation step
+TARGET_VA_KPH = 60.0      # cruise airspeed target [kph]
+STEPS_20S     = 2000      # 20 s run
 
 
-# ============================================================================
-# ENVIRONMENT FACTORY
-# ============================================================================
+# ── Environment ────────────────────────────────────────────────────────────────
 
 def make_env(render_mode: str = 'none', telemetry_file: str = '') -> gym.Env:
+    """Create and initialise one JSBSim gymnasium environment."""
     try:
         from hydra import compose, initialize_config_dir
         with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
@@ -73,7 +76,6 @@ def make_env(render_mode: str = 'none', telemetry_file: str = '') -> gym.Env:
     except Exception:
         cfg = OmegaConf.create({'env': {}})
     cfg.env.jsbsim = OmegaConf.load(NOATMO_YAML)
-    import os
     if render_mode != 'none' and not telemetry_file:
         os.makedirs('telemetry', exist_ok=True)
         telemetry_file = 'telemetry/telemetry.csv'
@@ -83,139 +85,263 @@ def make_env(render_mode: str = 'none', telemetry_file: str = '') -> gym.Env:
     return env
 
 
-# ============================================================================
-# STATE DIAGNOSTICS
-# ============================================================================
+# ── Rollout: fork (primary, Linux/WSL2) ───────────────────────────────────────
 
-# How many MPPI steps (from step 0) to run full state diagnostics on.
-_DIAG_STEPS = 2
+def _rollout_fork(main_env, thr_ref, actions: np.ndarray,
+                  roll_rad: float, pitch_rad: float,
+                  va_kph: float, va_weight: float) -> np.ndarray:
+    """Run N rollouts via os.fork() — bit-perfect clone of all JSBSim state.
+
+    For each sample the child process inherits an exact copy of main_env
+    (including the AB4 deque history), runs H steps, and returns a scalar
+    cost.  main_env in the parent is never modified.
+    """
+    n, horizon, _ = actions.shape
+    costs = np.zeros(n)
+    for k in range(n):
+        r_fd, w_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:                                   # ── child ──
+            os.close(r_fd)
+            cost = 0.0
+            for h in range(horizon):
+                thr_ref[0] = float(actions[k, h, 2])
+                with suppress_output():
+                    obs, _, term, trunc, _ = main_env.step(actions[k, h, :2])
+                cost += (abs(obs[0] - roll_rad)
+                         + abs(obs[1] - pitch_rad)
+                         + va_weight * abs(obs[2] - va_kph))
+                if term or trunc:
+                    cost += 100.0
+                    break
+            os.write(w_fd, struct.pack('d', cost))
+            os.close(w_fd)
+            os._exit(0)
+        os.close(w_fd)                                 # ── parent ──
+        os.waitpid(pid, 0)
+        costs[k] = struct.unpack('d', os.read(r_fd, 8))[0]
+        os.close(r_fd)
+    return costs
 
 
-def _dump_full_state(label: str, env) -> None:
-    """Print all JSBSim physical + extended + Python-wrapper state for one env."""
-    sim = env.unwrapped.sim
-    uw  = env.unwrapped
-    print(f"\n  [{label}]")
+# ── Rollout: deep-clone + optional replay (fallback) ──────────────────────────
+# Property-based clone cannot access the AB4 deques, so the first step after
+# cloning is Euler-like.  The 4-step replay partially rebuilds the deque.
 
-    print(f"    ── JSBSim physical state (saved/restored by get/set_env_state) ──")
-    print(f"    roll         : {sim[prp.roll_rad]:+.5f} rad  ({np.rad2deg(sim[prp.roll_rad]):+.2f}°)")
-    print(f"    pitch        : {sim[prp.pitch_rad]:+.5f} rad  ({np.rad2deg(sim[prp.pitch_rad]):+.2f}°)")
-    print(f"    heading      : {sim[prp.heading_rad]:+.5f} rad")
-    print(f"    airspeed     : {sim[prp.airspeed_kts]:.5f} kts  ({sim[prp.airspeed_kph]:.5f} kph)")
-    print(f"    p / q / r    : {sim[prp.p_radps]:+.5f} / {sim[prp.q_radps]:+.5f} / {sim[prp.r_radps]:+.5f} rad/s")
-    print(f"    altitude     : {sim[prp.altitude_sl_ft]:.3f} ft")
-    print(f"    alpha / beta : {sim[prp.alpha_rad]:+.5f} / {sim[prp.beta_rad]:+.5f} rad")
-    print(f"    aileron_cmd  : {sim[prp.aileron_cmd]:+.5f}")
-    print(f"    elevator_cmd : {sim[prp.elevator_cmd]:+.5f}")
-    print(f"    throttle_cmd : {sim[prp.throttle_cmd]:+.5f}")
+_IC_VEL_SKIP = {
+    'ic/vn-fps', 'ic/ve-fps', 'ic/vd-fps',
+    'ic/u-fps',  'ic/v-fps',  'ic/w-fps',
+    'ic/vt-fps', 'ic/vt-kts', 'ic/vc-fps', 'ic/vc-kts',
+    'ic/vg-fps', 'ic/vg-kts', 'ic/ve-kts', 'ic/mach',
+}
 
-    print(f"    ── Extended JSBSim state (NOT saved/restored) ──────────────────")
-    print(f"    target_roll  : {sim[prp.target_roll_rad]:+.5f} rad  ({np.rad2deg(sim[prp.target_roll_rad]):+.2f}°)")
-    print(f"    target_pitch : {sim[prp.target_pitch_rad]:+.5f} rad  ({np.rad2deg(sim[prp.target_pitch_rad]):+.2f}°)")
-    print(f"    roll_err     : {sim[prp.roll_err]:+.5f} rad")
-    print(f"    pitch_err    : {sim[prp.pitch_err]:+.5f} rad")
-    print(f"    roll_integ   : {sim[prp.roll_integ_err]:+.7f} rad")
-    print(f"    pitch_integ  : {sim[prp.pitch_integ_err]:+.7f} rad")
-    if hasattr(uw, 'current_step'):
+
+def deep_clone_state(src_env, dst_env) -> None:
+    """Clone JSBSim state via run_ic() + all read-write properties.
+
+    Note: AB4 deques are inaccessible through the property interface and will
+    be wrong.  Use os.fork() for a guaranteed bit-perfect copy.
+    """
+    src_fdm = src_env.unwrapped.sim.fdm
+    dst_fdm = dst_env.unwrapped.sim.fdm
+    src_sim = src_env.unwrapped.sim
+    dst_sim = dst_env.unwrapped.sim
+    src_uw  = src_env.unwrapped
+    dst_uw  = dst_env.unwrapped
+    s0      = get_env_state(src_env)
+
+    def _copy_rw():
+        for entry in src_fdm.get_property_catalog():
+            entry = entry.strip()
+            if not entry.endswith('(RW)'):
+                continue
+            name = entry[:-5].strip()
+            if name in _IC_VEL_SKIP:
+                continue
+            try:
+                dst_fdm.set_property_value(name, src_fdm.get_property_value(name))
+            except Exception:
+                pass
+
+    def _apply_ic():
+        dst_sim[prp.ic_roll_rad]     = s0['roll_rad']
+        dst_sim[prp.ic_pitch_rad]    = s0['pitch_rad']   - s0['alpha_rad']
+        dst_sim[prp.ic_heading_rad]  = s0['heading_rad'] + s0['beta_rad']
+        dst_sim[prp.ic_airspeed_kts] = s0['airspeed_kts']
+        dst_sim[prp.ic_p_radps]      = s0['p_radps']
+        dst_sim[prp.ic_q_radps]      = s0['q_radps']
+        dst_sim[prp.ic_r_radps]      = s0['r_radps']
+        dst_sim[prp.ic_altitude_ft]  = s0['altitude_ft']
+        dst_fdm['ic/alpha-rad']      = s0['alpha_rad']
+        dst_fdm['ic/beta-rad']       = s0['beta_rad']
+        dst_sim[prp.throttle_cmd]    = s0['throttle']
+        dst_sim[prp.aileron_cmd]     = s0['aileron_cmd']
+        dst_sim[prp.elevator_cmd]    = s0['elevator_cmd']
+        dst_fdm['fcs/left-aileron-pos-rad']  = s0.get('fcs_aileron_pos_rad', 0.0)
+        dst_fdm['fcs/right-aileron-pos-rad'] = s0.get('fcs_aileron_pos_rad', 0.0)
+        dst_fdm['fcs/elevator-pos-rad']      = s0.get('fcs_elevator_pos_rad', 0.0)
+        dst_fdm['fcs/throttle-pos-norm']     = s0.get('fcs_throttle_pos_norm', s0['throttle'])
+
+    set_env_state(dst_env, s0)
+    _copy_rw(); _apply_ic(); dst_fdm.run_ic()
+    dst_sim[prp.throttle_cmd] = s0['throttle']
+    dst_sim[prp.aileron_cmd]  = s0['aileron_cmd']
+    dst_sim[prp.elevator_cmd] = s0['elevator_cmd']
+    _copy_rw()
+
+    for prop in (prp.target_roll_rad, prp.target_pitch_rad,
+                 prp.roll_err, prp.pitch_err,
+                 prp.roll_integ_err, prp.pitch_integ_err):
         try:
-            print(f"    current_step : {sim[uw.current_step]:.0f}")
+            dst_sim[prop] = src_sim[prop]
         except Exception:
             pass
+    if hasattr(src_uw, 'pid_airspeed') and hasattr(dst_uw, 'pid_airspeed'):
+        dst_uw.pid_airspeed.integral   = src_uw.pid_airspeed.integral
+        dst_uw.pid_airspeed.prev_error = src_uw.pid_airspeed.prev_error
+        dst_uw.pid_airspeed.ref        = src_uw.pid_airspeed.ref
+    if hasattr(src_uw, 'action_hist') and hasattr(dst_uw, 'action_hist'):
+        dst_uw.action_hist.clear()
+        for a in src_uw.action_hist:
+            dst_uw.action_hist.append(a.copy() if hasattr(a, 'copy') else a)
+    if hasattr(src_uw, 'observation_deque') and hasattr(dst_uw, 'observation_deque'):
+        dst_uw.observation_deque.clear()
+        for o in src_uw.observation_deque:
+            dst_uw.observation_deque.append(o.copy() if hasattr(o, 'copy') else o)
+    for attr in ('prev_target_roll', 'prev_target_pitch'):
+        if hasattr(src_uw, attr):
+            setattr(dst_uw, attr, getattr(src_uw, attr))
 
-    print(f"    ── Python wrapper state (NOT saved/restored) ───────────────────")
+
+def _save_snapshot(env) -> dict:
+    """Capture the complete env state into a dict (for replay mode)."""
+    fdm = env.unwrapped.sim.fdm
+    sim = env.unwrapped.sim
+    uw  = env.unwrapped
+    snap = get_env_state(env)
+    rw = {}
+    for entry in fdm.get_property_catalog():
+        entry = entry.strip()
+        if not entry.endswith('(RW)'):
+            continue
+        name = entry[:-5].strip()
+        if name in _IC_VEL_SKIP:
+            continue
+        try:
+            rw[name] = fdm.get_property_value(name)
+        except Exception:
+            pass
+    snap['_rw'] = rw
+    for prop, key in [(prp.target_roll_rad, '_tgt_roll'),
+                      (prp.target_pitch_rad, '_tgt_pitch'),
+                      (prp.roll_err, '_rerr'), (prp.pitch_err, '_perr'),
+                      (prp.roll_integ_err, '_rint'), (prp.pitch_integ_err, '_pint')]:
+        try:
+            snap[key] = float(sim[prop])
+        except Exception:
+            snap[key] = 0.0
     if hasattr(uw, 'pid_airspeed'):
-        print(f"    pid_Va.integ : {uw.pid_airspeed.integral:+.7f}")
-        print(f"    pid_Va.ref   : {uw.pid_airspeed.ref:+.5f}")
-    if hasattr(uw, 'action_hist') and len(uw.action_hist) > 0:
-        last = np.array(uw.action_hist)[-1]
-        last_str = '  '.join(f'{v:+.4f}' for v in last)
-        print(f"    action_hist  : len={len(uw.action_hist)}  last=[{last_str}]")
-    else:
-        print(f"    action_hist  : (empty)")
+        snap['_pid'] = {'integral': uw.pid_airspeed.integral,
+                        'prev_error': uw.pid_airspeed.prev_error,
+                        'ref': uw.pid_airspeed.ref}
+    if hasattr(uw, 'action_hist'):
+        snap['_act'] = [a.copy() if hasattr(a, 'copy') else a for a in uw.action_hist]
     if hasattr(uw, 'observation_deque'):
-        print(f"    obs_deque    : len={len(uw.observation_deque)}")
+        snap['_obs'] = [o.copy() if hasattr(o, 'copy') else o for o in uw.observation_deque]
+    return snap
 
 
-def _print_state_diff(main_env, rollout_env) -> None:
-    """Compare main_env vs rollout_env state field by field and flag mismatches."""
-    sim_m = main_env.unwrapped.sim
-    sim_r = rollout_env.unwrapped.sim
-    uw_m  = main_env.unwrapped
-    uw_r  = rollout_env.unwrapped
-    tol   = 1e-4
+def _restore_snapshot(dst_env, snap: dict) -> None:
+    """Restore dst_env from a snapshot dict (double run_ic protocol)."""
+    dst_fdm = dst_env.unwrapped.sim.fdm
+    dst_sim = dst_env.unwrapped.sim
+    dst_uw  = dst_env.unwrapped
 
-    def _row(name, mv, rv):
-        diff  = abs(mv - rv)
-        flag  = "  ← MISMATCH" if diff > tol else ""
-        print(f"    {name:<18}: main={mv:+.5f}  rollout={rv:+.5f}  |diff|={diff:.2e}{flag}")
+    def _apply_rw():
+        for name, val in snap.get('_rw', {}).items():
+            try:
+                dst_fdm.set_property_value(name, val)
+            except Exception:
+                pass
 
-    print(f"\n  [DIFF main_env vs rollout_env after set_env_state]")
-    print(f"    ── physical (expect zero diff) ─────────────────────────────────")
-    _row("roll_rad",      sim_m[prp.roll_rad],      sim_r[prp.roll_rad])
-    _row("pitch_rad",     sim_m[prp.pitch_rad],     sim_r[prp.pitch_rad])
-    _row("heading_rad",   sim_m[prp.heading_rad],   sim_r[prp.heading_rad])
-    _row("airspeed_kts",  sim_m[prp.airspeed_kts],  sim_r[prp.airspeed_kts])
-    _row("p_radps",       sim_m[prp.p_radps],       sim_r[prp.p_radps])
-    _row("q_radps",       sim_m[prp.q_radps],       sim_r[prp.q_radps])
-    _row("r_radps",       sim_m[prp.r_radps],       sim_r[prp.r_radps])
-    _row("altitude_ft",   sim_m[prp.altitude_sl_ft], sim_r[prp.altitude_sl_ft])
-    _row("alpha_rad",     sim_m[prp.alpha_rad],     sim_r[prp.alpha_rad])
-    _row("beta_rad",      sim_m[prp.beta_rad],      sim_r[prp.beta_rad])
-    _row("aileron_cmd",   sim_m[prp.aileron_cmd],   sim_r[prp.aileron_cmd])
-    _row("elevator_cmd",  sim_m[prp.elevator_cmd],  sim_r[prp.elevator_cmd])
-    _row("throttle_cmd",  sim_m[prp.throttle_cmd],  sim_r[prp.throttle_cmd])
-    print(f"    ── extended JSBSim (expect diff — not restored) ────────────────")
-    _row("target_roll",   sim_m[prp.target_roll_rad],  sim_r[prp.target_roll_rad])
-    _row("target_pitch",  sim_m[prp.target_pitch_rad], sim_r[prp.target_pitch_rad])
-    _row("roll_err",      sim_m[prp.roll_err],      sim_r[prp.roll_err])
-    _row("pitch_err",     sim_m[prp.pitch_err],     sim_r[prp.pitch_err])
-    _row("roll_integ",    sim_m[prp.roll_integ_err],  sim_r[prp.roll_integ_err])
-    _row("pitch_integ",   sim_m[prp.pitch_integ_err], sim_r[prp.pitch_integ_err])
-    print(f"    ── Python wrapper (expect diff — not restored) ─────────────────")
-    if hasattr(uw_m, 'pid_airspeed') and hasattr(uw_r, 'pid_airspeed'):
-        _row("pid_Va.integ",  uw_m.pid_airspeed.integral, uw_r.pid_airspeed.integral)
-    if hasattr(uw_m, 'action_hist') and hasattr(uw_r, 'action_hist'):
-        last_m = np.array(uw_m.action_hist)[-1] if len(uw_m.action_hist) else np.zeros(2)
-        last_r = np.array(uw_r.action_hist)[-1] if len(uw_r.action_hist) else np.zeros(2)
-        for i, name in enumerate([f"action_hist[-1][{i}]" for i in range(len(last_m))]):
-            _row(name, last_m[i], last_r[i])
+    def _apply_ic():
+        dst_sim[prp.ic_roll_rad]     = snap['roll_rad']
+        dst_sim[prp.ic_pitch_rad]    = snap['pitch_rad']   - snap['alpha_rad']
+        dst_sim[prp.ic_heading_rad]  = snap['heading_rad'] + snap['beta_rad']
+        dst_sim[prp.ic_airspeed_kts] = snap['airspeed_kts']
+        dst_sim[prp.ic_p_radps]      = snap['p_radps']
+        dst_sim[prp.ic_q_radps]      = snap['q_radps']
+        dst_sim[prp.ic_r_radps]      = snap['r_radps']
+        dst_sim[prp.ic_altitude_ft]  = snap['altitude_ft']
+        dst_fdm['ic/alpha-rad']      = snap['alpha_rad']
+        dst_fdm['ic/beta-rad']       = snap['beta_rad']
+        dst_sim[prp.throttle_cmd]    = snap['throttle']
+        dst_sim[prp.aileron_cmd]     = snap['aileron_cmd']
+        dst_sim[prp.elevator_cmd]    = snap['elevator_cmd']
+        dst_fdm['fcs/left-aileron-pos-rad']  = snap.get('fcs_aileron_pos_rad', 0.0)
+        dst_fdm['fcs/right-aileron-pos-rad'] = snap.get('fcs_aileron_pos_rad', 0.0)
+        dst_fdm['fcs/elevator-pos-rad']      = snap.get('fcs_elevator_pos_rad', 0.0)
+        dst_fdm['fcs/throttle-pos-norm']     = snap.get('fcs_throttle_pos_norm', snap['throttle'])
+
+    set_env_state(dst_env, snap); _apply_rw(); _apply_ic(); dst_fdm.run_ic()
+    dst_sim[prp.throttle_cmd] = snap['throttle']
+    dst_sim[prp.aileron_cmd]  = snap['aileron_cmd']
+    dst_sim[prp.elevator_cmd] = snap['elevator_cmd']
+    _apply_rw()
+    for prop, key in [(prp.target_roll_rad, '_tgt_roll'),
+                      (prp.target_pitch_rad, '_tgt_pitch'),
+                      (prp.roll_err, '_rerr'), (prp.pitch_err, '_perr'),
+                      (prp.roll_integ_err, '_rint'), (prp.pitch_integ_err, '_pint')]:
+        if key in snap:
+            try:
+                dst_sim[prop] = snap[key]
+            except Exception:
+                pass
+    if hasattr(dst_uw, 'pid_airspeed') and '_pid' in snap:
+        dst_uw.pid_airspeed.integral   = snap['_pid']['integral']
+        dst_uw.pid_airspeed.prev_error = snap['_pid']['prev_error']
+        dst_uw.pid_airspeed.ref        = snap['_pid']['ref']
+    if hasattr(dst_uw, 'action_hist') and '_act' in snap:
+        dst_uw.action_hist.clear()
+        for a in snap['_act']:
+            dst_uw.action_hist.append(a.copy() if hasattr(a, 'copy') else a)
+    if hasattr(dst_uw, 'observation_deque') and '_obs' in snap:
+        dst_uw.observation_deque.clear()
+        for o in snap['_obs']:
+            dst_uw.observation_deque.append(o.copy() if hasattr(o, 'copy') else o)
 
 
-# ============================================================================
-# ENV-BASED MPPI RUN
-# ============================================================================
+def _rollout_clone(rollout_env, main_env, actions: np.ndarray,
+                   roll_rad: float, pitch_rad: float,
+                   va_kph: float, va_weight: float,
+                   replay_buf: Optional[Deque] = None) -> np.ndarray:
+    """Run N rollouts via deep_clone_state or 4-step replay (fallback)."""
+    n, horizon, _ = actions.shape
+    costs = np.zeros(n)
+    thr_ref, restore = _throttle_patch(rollout_env)
+    use_replay = replay_buf is not None and len(replay_buf) >= 4
 
-def _rollout_env(rollout_env, saved_state, actions, target_roll_rad, target_pitch_rad,
-                 target_va_kmh, va_weight, _diag_main_env=None, _diag_mppi_step=-1):
-    num_samples, horizon, _ = actions.shape
-    costs = np.zeros(num_samples)
-    throttle_ref, restore = _throttle_patch(rollout_env)
-
-    for k in range(num_samples):
-        #with suppress_output():
-        rollout_env.reset()
-
-        if _diag_main_env is not None and k == 0:
-            print(f"\n{'='*70}")
-            print(f"STATE RESTORE DIAGNOSTIC — MPPI step {_diag_mppi_step}, sample {k}")
-            print(f"{'='*70}")
-            _dump_full_state("MAIN ENV (state at save time)", _diag_main_env)
-            _dump_full_state("ROLLOUT ENV — after reset(), before set_env_state()", rollout_env)
-
-        set_env_state(rollout_env, saved_state)
-
-        if _diag_main_env is not None and k == 0:
-            _dump_full_state("ROLLOUT ENV — after set_env_state()", rollout_env)
-            _print_state_diff(_diag_main_env, rollout_env)
-            print(f"\n{'='*70}\n")
+    for k in range(n):
+        with suppress_output():
+            rollout_env.reset()
+        if use_replay:
+            with suppress_output():
+                _restore_snapshot(rollout_env, replay_buf[0][0])
+            for _, past_act in replay_buf:
+                thr_ref[0] = float(past_act[2])
+                with suppress_output():
+                    rollout_env.step(past_act[:2])
+        else:
+            with suppress_output():
+                deep_clone_state(main_env, rollout_env)
 
         cost = 0.0
         for h in range(horizon):
-            throttle_ref[0] = float(actions[k, h, 2])
+            thr_ref[0] = float(actions[k, h, 2])
             obs, _, term, trunc, _ = rollout_env.step(actions[k, h, :2])
-            cost += (abs(obs[0] - target_roll_rad)
-                     + abs(obs[1] - target_pitch_rad)
-                     + va_weight * abs(obs[2] - target_va_kmh))
+            cost += (abs(obs[0] - roll_rad)
+                     + abs(obs[1] - pitch_rad)
+                     + va_weight * abs(obs[2] - va_kph))
             if term or trunc:
                 cost += 100.0
                 break
@@ -225,403 +351,363 @@ def _rollout_env(rollout_env, saved_state, actions, target_roll_rad, target_pitc
     return costs
 
 
-def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
-                 mppi_cfg: dict, seed: int, render_mode: str = 'none') -> dict:
-    with suppress_output():
-        main_env    = make_env(render_mode=render_mode, telemetry_file='telemetry/mppi_env.csv')
-        rollout_env = make_env()
+# ── MPPI loop ──────────────────────────────────────────────────────────────────
 
-    throttle_ref, restore = _throttle_patch(main_env)
+def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
+                 mppi_cfg: dict, seed: int,
+                 render_mode: str = 'none',
+                 use_fork: bool = True,
+                 use_replay: bool = False,
+                 log_every: int = 100) -> dict:
+    """Run the MPPI oracle controller.
+
+    Args:
+        target_roll/pitch : attitude setpoints [°]
+        max_steps         : total simulation steps (1 step = DT seconds)
+        mppi_cfg          : samples, horizon, temperature, noise_std, va_weight,
+                            iters (all keys)
+        seed              : numpy RNG seed for reproducibility
+        render_mode       : JSBSim render mode
+        use_fork          : os.fork() clone — bit-perfect, Linux/WSL2 only
+        use_replay        : 4-step replay clone — fallback, any OS
+        log_every         : print a progress row every N steps (0 = silent)
+
+    Returns a dict with roll/pitch/va/p/q/r histories, actions, step_times,
+    steps, terminated — compatible with plot_model_result / save_metrics.
+    """
+    with suppress_output():
+        main_env    = make_env(render_mode=render_mode,
+                               telemetry_file='telemetry/mppi_env.csv')
+        rollout_env = None if use_fork else make_env()
+
+    thr_ref, restore_patch = _throttle_patch(main_env)
     controller = MPPIController(
         horizon=mppi_cfg['horizon'], action_dim=3,
-        num_samples=mppi_cfg['samples'], temperature=mppi_cfg['temperature'],
+        num_samples=mppi_cfg['samples'],
+        temperature=mppi_cfg['temperature'],
         noise_std=mppi_cfg['noise_std'],
     )
     np.random.seed(seed)
     controller.reset()
-    obs, _ = main_env.reset(options={"fgear_target_roll": target_roll, "fgear_target_pitch": target_pitch})
 
-    target_roll_rad  = np.deg2rad(target_roll)
-    target_pitch_rad = np.deg2rad(target_pitch)
-    va_weight        = mppi_cfg.get('va_weight', 0.1)
-    main_env.unwrapped.set_target_state(np.array([target_roll_rad, target_pitch_rad]))
+    with suppress_output():
+        obs, _ = main_env.reset(options={"fgear_target_roll":  target_roll,
+                                          "fgear_target_pitch": target_pitch})
 
-    roll_hist, pitch_hist, va_hist, p_hist, q_hist, r_hist = [], [], [], [], [], []
-    actions_hist, step_times = [], []
+    roll_rad  = np.deg2rad(target_roll)
+    pitch_rad = np.deg2rad(target_pitch)
+    va_weight = mppi_cfg.get('va_weight', 0.1)
+    n_iters   = mppi_cfg.get('iters') or 1
+    main_env.unwrapped.set_target_state(np.array([roll_rad, pitch_rad]))
+
+    replay_buf: Deque = Deque(maxlen=4)   # used only when use_replay=True
+
+    roll_h, pitch_h, va_h, p_h, q_h, r_h = [], [], [], [], [], []
+    act_h, times = [], []
     terminated = False
 
-    n_iters = mppi_cfg.get('iters') or 1
+    clone_mode = 'fork' if use_fork else ('replay' if use_replay else 'deep_clone')
 
-    with tqdm(total=max_steps, desc='MPPI env', unit='step', leave=True) as pbar:
-        for step_number in range(max_steps):
-            t0    = time.time()
-            saved = get_env_state(main_env)
-            best  = np.zeros(3)
+    # ── Header (printed once, above the tqdm bar) ─────────────────────────────
+    print(f"\n{'─'*68}")
+    print(f"  Oracle MPPI | roll={target_roll:+.1f}° pitch={target_pitch:+.1f}° "
+          f"Va={TARGET_VA_KPH:.0f} kph | clone={clone_mode}")
+    print(f"  N={mppi_cfg['samples']} H={mppi_cfg['horizon']} "
+          f"λ={mppi_cfg['temperature']} σ={mppi_cfg['noise_std']} "
+          f"va_w={va_weight} seed={seed}")
+    print(f"{'─'*68}")
+    if log_every > 0:
+        print(f"  {'step':>5}  {'roll(°)':>8}  {'err_r(°)':>9}  "
+              f"{'pitch(°)':>9}  {'err_p(°)':>9}  {'Va(kph)':>8}  {'ms':>6}")
+        print(f"  {'─'*63}")
 
-            _diag = main_env if step_number < _DIAG_STEPS else None
+    with tqdm(total=max_steps, desc='MPPI', unit='step', leave=True) as pbar:
+        for step in range(max_steps):
+            t0   = time.time()
+            best = np.zeros(3)
+
+            rbuf_arg = replay_buf if (use_replay and len(replay_buf) >= 4) else None
 
             for _ in range(n_iters):
                 sampled = controller.sample_actions()
-                costs   = _rollout_env(rollout_env, saved, sampled,
-                                       target_roll_rad, target_pitch_rad, TARGET_VA_KPH, va_weight,
-                                       _diag_main_env=_diag, _diag_mppi_step=step_number)
-
+                costs = (_rollout_fork(main_env, thr_ref, sampled,
+                                       roll_rad, pitch_rad, TARGET_VA_KPH, va_weight)
+                         if use_fork else
+                         _rollout_clone(rollout_env, main_env, sampled,
+                                        roll_rad, pitch_rad, TARGET_VA_KPH, va_weight,
+                                        rbuf_arg))
                 valid = np.isfinite(costs)
                 if not valid.any():
                     continue
-                nan_pen = np.nanmax(costs[valid]) * 10.0
-                cs = np.where(valid, costs, nan_pen)
+                cs = np.where(valid, costs, np.nanmax(costs[valid]) * 10.0)
                 w  = np.exp(-(cs - cs.min()) / controller.temperature)
                 w /= w.sum()
                 controller.mean_actions = np.einsum('k,khd->hd', w, sampled)
-                best = controller.mean_actions[0].copy()
+                best  = controller.mean_actions[0].copy()
                 best[:2] = np.clip(best[:2], -1.0, 1.0)
                 best[2]  = np.clip(best[2],  0.0,  1.0)
 
             controller._shift_mean()
 
-            throttle_ref[0] = float(best[2])
+            if use_replay:
+                replay_buf.append((_save_snapshot(main_env), best.copy()))
+
+            thr_ref[0] = float(best[2])
             obs, _, term, trunc, _ = main_env.step(best[:2])
+            dt_ms = (time.time() - t0) * 1000
 
-            roll_hist.append(np.rad2deg(obs[0]))
-            pitch_hist.append(np.rad2deg(obs[1]))
-            va_hist.append(obs[2])
-            p_hist.append(obs[3])
-            q_hist.append(obs[4])
-            r_hist.append(obs[5])
-            actions_hist.append(best.copy())
-            step_times.append(time.time() - t0)
+            r_deg, p_deg = np.rad2deg(obs[0]), np.rad2deg(obs[1])
+            roll_h.append(r_deg);  pitch_h.append(p_deg);  va_h.append(obs[2])
+            p_h.append(obs[3]);    q_h.append(obs[4]);      r_h.append(obs[5])
+            act_h.append(best.copy()); times.append(time.time() - t0)
 
-            pbar.set_postfix(roll=f'{roll_hist[-1]:+.1f}°', pitch=f'{pitch_hist[-1]:+.1f}°',
-                             t=f'{step_times[-1]:.1f}s')
+            # Update live tqdm bar with current errors
+            pbar.set_postfix(
+                roll=f'{r_deg:+.1f}°',
+                err_r=f'{abs(r_deg-target_roll):.1f}°',
+                pitch=f'{p_deg:+.1f}°',
+                err_p=f'{abs(p_deg-target_pitch):.1f}°',
+                Va=f'{obs[2]:.1f}',
+                ms=f'{dt_ms:.0f}',
+            )
             pbar.update(1)
+
+            # Periodic detailed row above the bar
+            if log_every > 0 and (step % log_every == 0 or step == max_steps - 1):
+                pbar.write(
+                    f"  {step+1:>5}  {r_deg:>+8.2f}  "
+                    f"{abs(r_deg - target_roll):>9.2f}  "
+                    f"{p_deg:>+9.2f}  "
+                    f"{abs(p_deg - target_pitch):>9.2f}  "
+                    f"{obs[2]:>8.2f}  {dt_ms:>6.0f}"
+                )
 
             if term or trunc:
                 terminated = True
                 break
 
-    restore()
+    restore_patch()
     main_env.close()
-    rollout_env.close()
-    return dict(label='JSBSim_env', roll=roll_hist, pitch=pitch_hist, va=va_hist,
-                p=p_hist, q=q_hist, r=r_hist,
-                actions=np.array(actions_hist), step_times=step_times,
-                steps=len(roll_hist), terminated=terminated)
+    if rollout_env is not None:
+        rollout_env.close()
+
+    # ── End-of-run summary ─────────────────────────────────────────────────────
+    if times:
+        ra = np.array(roll_h);  pa = np.array(pitch_h)
+        rc = compute_convergence_stats(roll_h,  target_roll)
+        pc = compute_convergence_stats(pitch_h, target_pitch)
+        n  = len(times)
+        print(f"\n  {'─'*63}")
+        print(f"  Summary  ({n} steps, {sum(times):.0f} s wall-clock)")
+        r_conv = f"{rc['convergence_step']*DT:.1f} s" if rc['convergence_step'] else 'never'
+        p_conv = f"{pc['convergence_step']*DT:.1f} s" if pc['convergence_step'] else 'never'
+        print(f"  Roll  : mean err={np.mean(np.abs(ra-target_roll)):.2f}°  "
+              f"converge={r_conv}  "
+              f"ss={rc['steady_mean_error']:.2f}°±{rc['steady_std']:.2f}°")
+        print(f"  Pitch : mean err={np.mean(np.abs(pa-target_pitch)):.2f}°  "
+              f"converge={p_conv}  "
+              f"ss={pc['steady_mean_error']:.2f}°±{pc['steady_std']:.2f}°")
+        print(f"  Step  : mean={np.mean(times)*1000:.0f} ms  "
+              f"min={np.min(times)*1000:.0f} ms  max={np.max(times)*1000:.0f} ms")
+        print(f"  {'─'*63}\n")
+
+    return dict(label=f'JSBSim_{clone_mode}',
+                roll=roll_h, pitch=pitch_h, va=va_h,
+                p=p_h, q=q_h, r=r_h,
+                actions=np.array(act_h), step_times=times,
+                steps=len(roll_h), terminated=terminated)
 
 
-# ============================================================================
-# DEEP STATE CLONE
-# ============================================================================
+# ── Sanity check ───────────────────────────────────────────────────────────────
 
-def deep_clone_state(src_env, dst_env) -> dict:
+def sanity_check(n_warmup: int = 50, n_test: int = 20,
+                 target_roll: float = 55.0, target_pitch: float = 28.0) -> bool:
+    """Verify that os.fork() produces a bit-perfect clone at a mid-run state.
+
+    Protocol:
+      1. Warm up one env for n_warmup steps (builds non-trivial deque history).
+      2. os.fork(): child and parent each run the same n_test actions.
+      3. Compare obs step by step — fork diff must be exactly zero.
+      4. Also run deep_clone_state for contrast, showing the AB4 deque error.
+
+    Prints a full step-by-step comparison table and timing.
+    Returns True if fork diff is identically zero.
     """
-    Fully clone src_env into dst_env.
+    t0 = time.time()
+    print(f"\n{'═'*65}")
+    print(f"  SANITY CHECK — os.fork() clone fidelity at mid-run state")
+    print(f"  Warm-up: {n_warmup} steps    Test seq: {n_test} actions    seed=0")
+    print(f"{'═'*65}")
 
-    Three layers applied in order:
-      1. set_env_state() via run_ic() — restores physical state (attitude,
-         rates, airspeed, alpha, beta).  The alpha/beta IC correction in
-         utils.py ensures pitch and heading land correctly.
-      2. All read-write JSBSim FDM properties copied directly on top —
-         overrides engine state, FCS internals, trim settings, etc.
-         These are R/O from JSBSim's perspective (can't set via IC) but
-         ARE settable as live properties.
-      3. Custom JSBSim properties not in the standard catalog (target state,
-         error accumulators, integral errors) + Python wrapper state
-         (pid_airspeed, action_hist, observation_deque).
-
-    Returns a dict with copy statistics.
-    """
-    src_fdm = src_env.unwrapped.sim.fdm
-    dst_fdm = dst_env.unwrapped.sim.fdm
-    src_sim = src_env.unwrapped.sim
-    dst_sim = dst_env.unwrapped.sim
-    src_uw  = src_env.unwrapped
-    dst_uw  = dst_env.unwrapped
-
-    # 1. Physical state via run_ic() (attitude, rates, airspeed, alpha, beta) -
-    set_env_state(dst_env, get_env_state(src_env))
-
-    # 2. All RW FDM properties on top (engine, FCS, etc.) --------------------
-    n_ok = n_fail = 0
-    failed = []
-    for entry in src_fdm.get_property_catalog():
-        entry = entry.strip()
-        if not entry.endswith('(RW)'):
-            continue
-        name = entry[:-5].strip()
-        try:
-            dst_fdm.set_property_value(name, src_fdm.get_property_value(name))
-            n_ok += 1
-        except Exception as e:
-            failed.append((name, str(e)))
-            n_fail += 1
-
-    # 3. Custom JSBSim properties + Python wrapper state ---------------------
-    for prop in [prp.target_roll_rad, prp.target_pitch_rad,
-                 prp.roll_err,        prp.pitch_err,
-                 prp.roll_integ_err,  prp.pitch_integ_err]:
-        try:
-            dst_sim[prop] = src_sim[prop]
-        except Exception:
-            pass
-
-    if hasattr(src_uw, 'pid_airspeed') and hasattr(dst_uw, 'pid_airspeed'):
-        dst_uw.pid_airspeed.integral   = src_uw.pid_airspeed.integral
-        dst_uw.pid_airspeed.prev_error = src_uw.pid_airspeed.prev_error
-        dst_uw.pid_airspeed.ref        = src_uw.pid_airspeed.ref
-
-    if hasattr(src_uw, 'action_hist') and hasattr(dst_uw, 'action_hist'):
-        dst_uw.action_hist.clear()
-        for a in src_uw.action_hist:
-            dst_uw.action_hist.append(a.copy() if hasattr(a, 'copy') else a)
-
-    if hasattr(src_uw, 'observation_deque') and hasattr(dst_uw, 'observation_deque'):
-        dst_uw.observation_deque.clear()
-        for o in src_uw.observation_deque:
-            dst_uw.observation_deque.append(o.copy() if hasattr(o, 'copy') else o)
-
-    for attr in ('prev_target_roll', 'prev_target_pitch'):
-        if hasattr(src_uw, attr):
-            setattr(dst_uw, attr, getattr(src_uw, attr))
-
-    return {'n_copied': n_ok, 'n_failed': n_fail, 'failed_props': failed}
-
-
-# ============================================================================
-# DETERMINISM TEST
-# ============================================================================
-
-def test_state_restore_determinism(n_warmup: int = 30, n_test: int = 15,
-                                   target_roll: float = 55.0,
-                                   target_pitch: float = 28.0) -> bool:
-    """
-    Verify that reset() + set_env_state() produces an env that is functionally
-    identical to the original at state s0.
-
-    Protocol
-    --------
-    1. Warm up main_env for n_warmup steps with fixed actions to reach s0.
-    2. Save s0 = get_env_state(main_env).
-    3. Create rollout_env, call reset() + set_env_state(s0) → clone at s0'.
-    4. CHECK A: compare every field of s0 vs s0' (should be zero diff).
-    5. Define a fixed action sequence of length n_test.
-    6. Play it in main_env  → record obs[0..n_test] and final JSBSim state.
-    7. Play it in rollout_env from s0' → record obs[0..n_test] and final JSBSim state.
-    8. CHECK B: compare obs step-by-step and final JSBSim state (should be zero diff).
-
-    Returns True if all checks pass within tolerance.
-    """
-    TOL = 1e-4
-    passed = True
-
-    print(f"\n{'='*70}")
-    print("DETERMINISM TEST — reset()+set_env_state() clone fidelity")
-    print(f"  Warm-up steps : {n_warmup}")
-    print(f"  Test actions  : {n_test}")
-    print(f"  Target        : roll={target_roll:+.1f}°  pitch={target_pitch:+.1f}°")
-    print(f"{'='*70}")
-
-    # ── Build both envs ───────────────────────────────────────────────────
-    print("\n[1/5] Creating environments...")
-    with suppress_output():
-        main_env    = make_env()
-        rollout_env = make_env()
-
-    throttle_ref_main,    restore_main    = _throttle_patch(main_env)
-    throttle_ref_rollout, restore_rollout = _throttle_patch(rollout_env)
-
-    target_roll_rad  = np.deg2rad(target_roll)
-    target_pitch_rad = np.deg2rad(target_pitch)
+    target_r = np.deg2rad(target_roll)
+    target_p = np.deg2rad(target_pitch)
 
     with suppress_output():
-        main_env.reset(options={"fgear_target_roll": target_roll,
+        env_main  = make_env()
+        env_clone = make_env()        # only for deep_clone comparison
+
+    thr_main,  _ = _throttle_patch(env_main)
+    thr_clone, _ = _throttle_patch(env_clone)
+
+    with suppress_output():
+        env_main.reset(options={"fgear_target_roll":  target_roll,
                                 "fgear_target_pitch": target_pitch})
-    main_env.unwrapped.set_target_state(np.array([target_roll_rad, target_pitch_rad]))
+    env_main.unwrapped.set_target_state(np.array([target_r, target_p]))
 
-    # ── Warm-up: ramp aileron/elevator toward target, vary throttle ───────
-    print(f"[2/5] Warming up main_env for {n_warmup} steps...")
-    warmup_actions = []
+    # ── Warm-up ───────────────────────────────────────────────────────────────
+    print(f"\n  [1/3] Warming up {n_warmup} steps ...", end='', flush=True)
+    t_wu = time.time()
     for i in range(n_warmup):
-        t = i / max(n_warmup - 1, 1)
-        ail = np.clip(0.3 * np.sin(2 * np.pi * t), -1.0, 1.0)
-        ele = np.clip(-0.2 + 0.4 * t, -1.0, 1.0)
-        thr = np.clip(0.3 + 0.2 * t, 0.0, 1.0)
-        warmup_actions.append([ail, ele, thr])
-        throttle_ref_main[0] = thr
+        t   = i / max(n_warmup - 1, 1)
+        ail = float(np.clip(0.3 * np.sin(2 * np.pi * t), -1, 1))
+        ele = float(np.clip(-0.2 + 0.4 * t, -1, 1))
+        thr = float(np.clip(0.3 + 0.2 * t, 0, 1))
+        thr_main[0] = thr
         with suppress_output():
-            main_env.step(np.array([ail, ele]))
+            env_main.step(np.array([ail, ele]))
+    sim = env_main.unwrapped.sim
+    print(f" {time.time()-t_wu:.2f} s")
+    print(f"        State at s{n_warmup}: "
+          f"roll={np.rad2deg(sim[prp.roll_rad]):+.2f}°  "
+          f"pitch={np.rad2deg(sim[prp.pitch_rad]):+.2f}°  "
+          f"Va={sim[prp.airspeed_kts]*1.852:.2f} kph  "
+          f"p={sim[prp.p_radps]:+.4f} rad/s")
 
-    # ── Save s0 ───────────────────────────────────────────────────────────
-    s0 = get_env_state(main_env)
-    print(f"       s0 saved:  roll={np.rad2deg(s0['roll_rad']):+.3f}°  "
-          f"pitch={np.rad2deg(s0['pitch_rad']):+.3f}°  "
-          f"Va={s0['airspeed_kts']*1.852:.2f} kph  "
-          f"q={s0['q_radps']:+.4f} rad/s")
+    # ── Test actions ──────────────────────────────────────────────────────────
+    rng  = np.random.default_rng(seed=0)
+    acts = np.column_stack([rng.uniform(-0.8, 0.8, n_test),
+                             rng.uniform(-0.6, 0.6, n_test),
+                             rng.uniform( 0.2, 0.7, n_test)])
 
-    # ── Clone s0 into rollout_env ─────────────────────────────────────────
-    print(f"\n[3/5] Cloning s0 into rollout_env via reset()+deep_clone_state()...")
+    # ── os.fork() ─────────────────────────────────────────────────────────────
+    print(f"\n  [2/3] os.fork() rollout ...", end='', flush=True)
+    t_fork = time.time()
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:                                    # child
+        os.close(r_fd)
+        child_obs = []
+        for k in range(n_test):
+            thr_main[0] = float(acts[k, 2])
+            with suppress_output():
+                obs, *_ = env_main.step(acts[k, :2])
+            child_obs.append(obs.copy())
+        data = pickle.dumps(child_obs)
+        sent = 0
+        while sent < len(data):
+            sent += os.write(w_fd, data[sent:sent+65536])
+        os.close(w_fd)
+        os._exit(0)
+
+    os.close(w_fd)
+    parent_obs = []
+    for k in range(n_test):                         # parent = ground truth
+        thr_main[0] = float(acts[k, 2])
+        with suppress_output():
+            obs, *_ = env_main.step(acts[k, :2])
+        parent_obs.append(obs.copy())
+
+    os.waitpid(pid, 0)
+    chunks = []
+    while True:
+        c = os.read(r_fd, 65536)
+        if not c: break
+        chunks.append(c)
+    os.close(r_fd)
+    fork_obs = pickle.loads(b''.join(chunks))
+    t_fork_done = time.time() - t_fork
+    print(f" {t_fork_done:.2f} s  (≈{t_fork_done/n_test*1000:.0f} ms/sample)")
+
+    # ── deep_clone_state comparison ───────────────────────────────────────────
+    print(f"  [3/3] deep_clone_state rollout ...", end='', flush=True)
+    t_dc = time.time()
     with suppress_output():
-        rollout_env.reset()
-    stats = deep_clone_state(main_env, rollout_env)
-    print(f"       FDM properties copied: {stats['n_copied']}  failed: {stats['n_failed']}")
-    if stats['failed_props']:
-        print(f"       Failed: {[n for n,_ in stats['failed_props']]}")
-
-    # ── CHECK A: state immediately after clone ────────────────────────────
-    print(f"\n[CHECK A] s0 vs s0\' — physical state after clone (before any actions)")
-    print(f"{'  Field':<22}  {'main':>12}  {'rollout':>12}  {'|diff|':>10}  result")
-    print(f"  {'-'*70}")
-
-    def _check(name, mv, rv):
-        nonlocal passed
-        diff = abs(mv - rv)
-        ok   = diff <= TOL
-        if not ok:
-            passed = False
-        status = "PASS" if ok else "FAIL ←"
-        print(f"  {name:<22}  {mv:>12.6f}  {rv:>12.6f}  {diff:>10.2e}  {status}")
-
-    sim_m = main_env.unwrapped.sim
-    sim_r = rollout_env.unwrapped.sim
-    _check("roll_rad",      sim_m[prp.roll_rad],      sim_r[prp.roll_rad])
-    _check("pitch_rad",     sim_m[prp.pitch_rad],     sim_r[prp.pitch_rad])
-    _check("heading_rad",   sim_m[prp.heading_rad],   sim_r[prp.heading_rad])
-    _check("airspeed_kts",  sim_m[prp.airspeed_kts],  sim_r[prp.airspeed_kts])
-    _check("p_radps",       sim_m[prp.p_radps],       sim_r[prp.p_radps])
-    _check("q_radps",       sim_m[prp.q_radps],       sim_r[prp.q_radps])
-    _check("r_radps",       sim_m[prp.r_radps],       sim_r[prp.r_radps])
-    _check("altitude_ft",   sim_m[prp.altitude_sl_ft], sim_r[prp.altitude_sl_ft])
-    _check("alpha_rad",     sim_m[prp.alpha_rad],     sim_r[prp.alpha_rad])
-    _check("beta_rad",      sim_m[prp.beta_rad],      sim_r[prp.beta_rad])
-    _check("aileron_cmd",   sim_m[prp.aileron_cmd],   sim_r[prp.aileron_cmd])
-    _check("elevator_cmd",  sim_m[prp.elevator_cmd],  sim_r[prp.elevator_cmd])
-    _check("throttle_cmd",  sim_m[prp.throttle_cmd],  sim_r[prp.throttle_cmd])
-
-    # ── Define fixed test action sequence ─────────────────────────────────
-    rng = np.random.default_rng(seed=0)
-    test_actions = np.column_stack([
-        rng.uniform(-0.8, 0.8,  n_test),   # aileron
-        rng.uniform(-0.6, 0.6,  n_test),   # elevator
-        rng.uniform( 0.2, 0.7,  n_test),   # throttle
-    ])
-
-    # ── Play test actions in main_env ─────────────────────────────────────
-    print(f"\n[4/5] Playing {n_test} fixed actions in main_env...")
-    main_obs_hist = []
+        env_clone.reset()
+    deep_clone_state(env_main, env_clone)
+    clone_obs = []
     for k in range(n_test):
-        throttle_ref_main[0] = test_actions[k, 2]
+        thr_clone[0] = float(acts[k, 2])
         with suppress_output():
-            obs, _, term, trunc, _ = main_env.step(test_actions[k, :2])
-        main_obs_hist.append(obs.copy())
-        if term or trunc:
-            print(f"       main_env terminated at step {k+1}!")
-            break
-    main_final = get_env_state(main_env)
+            obs, *_ = env_clone.step(acts[k, :2])
+        clone_obs.append(obs.copy())
+    print(f" {time.time()-t_dc:.2f} s")
+    env_main.close(); env_clone.close()
 
-    # ── Play same test actions in rollout_env from s0' ────────────────────
-    print(f"       Playing {n_test} fixed actions in rollout_env from s0\'...")
-    rollout_obs_hist = []
+    # ── Print table ───────────────────────────────────────────────────────────
+    OBS   = ['roll(rad)', 'pitch(rad)', 'Va(kph)', 'p(rad/s)', 'r(rad/s)']
+    IDX   = [0, 1, 2, 3, 5]
+    W     = 10
+    hdr   = "  ".join(f"{n:^{W}}" for n in OBS)
+    sep   = "─" * (8 + len(OBS) * (W + 2))
+
+    fork_d  = [np.abs(np.array(parent_obs[k]) - np.array(fork_obs[k]))  for k in range(n_test)]
+    clone_d = [np.abs(np.array(parent_obs[k]) - np.array(clone_obs[k])) for k in range(n_test)]
+
+    print(f"\n  ── os.fork() | diff vs ground truth (expect all zeros) ──")
+    print(f"  {'step':>4}  {hdr}")
+    print(f"  {sep}")
     for k in range(n_test):
-        throttle_ref_rollout[0] = test_actions[k, 2]
-        with suppress_output():
-            obs, _, term, trunc, _ = rollout_env.step(test_actions[k, :2])
-        rollout_obs_hist.append(obs.copy())
-        if term or trunc:
-            print(f"       rollout_env terminated at step {k+1}!")
-            break
+        row = "  ".join(f"{fork_d[k][i]:>{W}.2e}" for i in IDX)
+        print(f"  {k+1:>4}  {row}")
+    fork_max = max(fork_d[k][i] for k in range(n_test) for i in IDX)
+    print(f"  MAX over all channels: {fork_max:.2e}")
 
-    rollout_final = get_env_state(rollout_env)
+    print(f"\n  ── deep_clone_state | diff vs ground truth (AB4 deque error) ──")
+    print(f"  {'step':>4}  {hdr}")
+    print(f"  {sep}")
+    for k in range(n_test):
+        row = "  ".join(f"{clone_d[k][i]:>{W}.2e}" for i in IDX)
+        print(f"  {k+1:>4}  {row}")
+    cmax_va = max(clone_d[k][2] for k in range(n_test))
+    cmax_p  = max(clone_d[k][3] for k in range(n_test))
+    print(f"  MAX: Va={cmax_va:.2e} kph  p={cmax_p:.2e} rad/s")
 
-    # ── CHECK B: obs at every step ────────────────────────────────────────
-    n_steps = min(len(main_obs_hist), len(rollout_obs_hist))
-    obs_names = ["roll_rad", "pitch_rad", "airspeed_kph", "p_radps",
-                 "q_radps", "r_radps", "roll_err", "pitch_err",
-                 "alpha_rad", "beta_rad", "aileron_cmd", "elevator_cmd"]
-
-    print(f"\n[CHECK B] obs trajectory divergence — step-by-step max |diff| per channel")
-    print(f"  {'step':>5}  {'roll':>10}  {'pitch':>10}  {'Va':>10}  "
-          f"{'p':>10}  {'q':>10}  {'r':>10}  result")
-    print(f"  {'-'*80}")
-
-    step_ok = True
-    for k in range(n_steps):
-        mo = main_obs_hist[k]
-        ro = rollout_obs_hist[k]
-        diffs = np.abs(mo - ro)
-        ok = np.all(diffs[:6] <= TOL)
-        if not ok:
-            passed = False
-            step_ok = False
-        status = "ok" if ok else "FAIL ←"
-        print(f"  {k+1:>5}  {diffs[0]:>10.2e}  {diffs[1]:>10.2e}  {diffs[2]:>10.2e}  "
-              f"{diffs[3]:>10.2e}  {diffs[4]:>10.2e}  {diffs[5]:>10.2e}  {status}")
-
-    if step_ok:
-        print(f"  → All {n_steps} obs steps match within tolerance {TOL:.0e}")
-
-    # ── CHECK B cont.: final JSBSim physical state ─────────────────────────
-    print(f"\n  Final JSBSim physical state after {n_steps} actions:")
-    print(f"  {'Field':<22}  {'main':>12}  {'rollout':>12}  {'|diff|':>10}  result")
-    print(f"  {'-'*70}")
-    for field in ['roll_rad', 'pitch_rad', 'airspeed_kts', 'p_radps',
-                  'q_radps', 'r_radps', 'alpha_rad', 'beta_rad',
-                  'aileron_cmd', 'elevator_cmd', 'throttle_cmd']:
-        _check(field, main_final[field], rollout_final[field])
-
-    # ── Cleanup & verdict ─────────────────────────────────────────────────
-    restore_main()
-    restore_rollout()
-    main_env.close()
-    rollout_env.close()
-
-    print(f"\n{'='*70}")
-    verdict = "PASS — envs are deterministically equivalent" if passed \
-              else "FAIL — state diverges after clone (see FAIL rows above)"
-    print(f"VERDICT: {verdict}")
-    print(f"{'='*70}\n")
+    # ── Verdict ───────────────────────────────────────────────────────────────
+    passed = fork_max == 0.0
+    print(f"\n{'═'*65}")
+    if passed:
+        print(f"  RESULT: PASS — os.fork() is bit-perfect (max diff = 0.0)")
+    else:
+        print(f"  RESULT: FAIL — unexpected divergence in fork clone ({fork_max:.2e})")
+    print(f"  Total time: {time.time()-t0:.1f} s")
+    print(f"{'═'*65}\n")
     return passed
 
 
-# ============================================================================
-# MAIN
-# ============================================================================
+# ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description='MPPI with JSBSim as world model (ground-truth upper bound)'
-    )
+        description='MPPI Oracle — JSBSim as world model')
     parser.add_argument('--target-roll',      type=float, default=55.0)
     parser.add_argument('--target-pitch',     type=float, default=28.0)
-    parser.add_argument('--steps',            type=int,   default=STEPS_20S,
-                        help='Steps per run (default 2000 = 20 s)')
-    parser.add_argument('--mppi-samples',     type=int,   default=100)
-    parser.add_argument('--mppi-horizon',     type=int,   default=20)
-    parser.add_argument('--mppi-temperature', type=float, default=0.5)
+    parser.add_argument('--steps',            type=int,   default=STEPS_20S)
+    parser.add_argument('--mppi-samples',     type=int,   default=256)
+    parser.add_argument('--mppi-horizon',     type=int,   default=40)
+    parser.add_argument('--mppi-temperature', type=float, default=0.3)
     parser.add_argument('--mppi-noise-std',   type=float, default=0.5)
     parser.add_argument('--mppi-va-weight',   type=float, default=1)
     parser.add_argument('--mppi-iters',       type=int,   default=None,
-                        help='Iterative MPPI: number of refinement passes per timestep (TD-MPC style). '
-                             'Omit for vanilla single-pass MPPI.')
+                        help='MPPI refinement passes per step (default: 1)')
     parser.add_argument('--seed',             type=int,   default=42)
     parser.add_argument('--render-mode',      type=str,   default='none',
-                        choices=['none', 'plot_anim', 'plot_end', 'ext_log', 'fgear', 'fgear_plot'],
-                        help='Visualization mode for the main env (default: none). '
-                             'plot_anim requires: sudo apt install python3-tk')
-    parser.add_argument('--test-determinism', action='store_true',
-                        help='Run the state-restore determinism test and exit')
-    parser.add_argument('--test-warmup',      type=int,   default=30,
-                        help='Warm-up steps for --test-determinism (default: 30)')
-    parser.add_argument('--test-actions',     type=int,   default=15,
-                        help='Fixed test actions for --test-determinism (default: 15)')
+                        choices=['none', 'plot_anim', 'plot_end',
+                                 'ext_log', 'fgear', 'fgear_plot'])
+    parser.add_argument('--use-fork',         action='store_true',
+                        help='os.fork() cloning — bit-perfect (Linux/WSL2)')
+    parser.add_argument('--use-replay',       action='store_true',
+                        help='4-step replay cloning — fallback, any OS')
+    parser.add_argument('--log-every',        type=int,   default=1,
+                        help='Print progress row every N steps (0=silent)')
+    parser.add_argument('--sanity',           action='store_true',
+                        help='Run clone sanity check and exit')
+    parser.add_argument('--sanity-warmup',    type=int,   default=50)
+    parser.add_argument('--sanity-steps',     type=int,   default=20)
     args = parser.parse_args()
 
-    if args.test_determinism:
-        test_state_restore_determinism(
-            n_warmup=args.test_warmup,
-            n_test=args.test_actions,
-            target_roll=args.target_roll,
-            target_pitch=args.target_pitch,
-        )
+    if args.sanity:
+        sanity_check(args.sanity_warmup, args.sanity_steps,
+                     args.target_roll, args.target_pitch)
         return
 
     mppi_cfg = dict(
@@ -629,28 +715,23 @@ def main():
         temperature=args.mppi_temperature, noise_std=args.mppi_noise_std,
         va_weight=args.mppi_va_weight, iters=args.mppi_iters,
     )
-    tag = f"r{args.target_roll:.0f}_p{args.target_pitch:.0f}"
-
-    print(f"\nMPPI Env-Model Run")
-    print(f"  Target : Roll={args.target_roll:+.1f}°  Pitch={args.target_pitch:+.1f}°")
-    print(f"  Steps  : {args.steps} ({args.steps * DT:.0f} s)")
-    print(f"  MPPI   : samples={args.mppi_samples}  horizon={args.mppi_horizon}  "
-          f"temp={args.mppi_temperature}  noise={args.mppi_noise_std}")
-    print(f"  Seed   : {args.seed}")
-    print(f"  Render : {args.render_mode}")
 
     result = run_mppi_env(
-        args.target_roll, args.target_pitch, args.steps, mppi_cfg, args.seed,
+        args.target_roll, args.target_pitch, args.steps,
+        mppi_cfg, args.seed,
         render_mode=args.render_mode,
+        use_fork=args.use_fork,
+        use_replay=args.use_replay,
+        log_every=args.log_every,
     )
 
-    print(f"\nSaving plots to {SAVE_DIR}/")
-    fname = f"{_safe_label(result['label'])}_{tag}_plots.png"
-    plot_model_result(result, args.target_roll, args.target_pitch, SAVE_DIR / fname,
+    tag  = f"r{args.target_roll:.0f}_p{args.target_pitch:.0f}"
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    plot_model_result(result, args.target_roll, args.target_pitch,
+                      SAVE_DIR / f"{_safe_label(result['label'])}_{tag}.png",
                       target_va=TARGET_VA_KPH)
-
     save_metrics([result], args.target_roll, args.target_pitch,
-                 SAVE_DIR / f"metrics_{tag}.csv")
+                 SAVE_DIR / f"metrics_{tag}_{_safe_label(result['label'])}.csv")
 
 
 if __name__ == '__main__':

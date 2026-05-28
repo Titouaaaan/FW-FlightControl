@@ -476,32 +476,44 @@ def get_env_state(env) -> dict:
     from fw_jsbgym.utils import jsbsim_properties as prp
     sim = env.unwrapped.sim
     return {
-        'roll_rad':     float(sim[prp.roll_rad]),
-        'pitch_rad':    float(sim[prp.pitch_rad]),
-        'heading_rad':  float(sim[prp.heading_rad]),
-        'airspeed_kts': float(sim[prp.airspeed_kts]),
-        'p_radps':      float(sim[prp.p_radps]),
-        'q_radps':      float(sim[prp.q_radps]),
-        'r_radps':      float(sim[prp.r_radps]),
-        'altitude_ft':  float(sim[prp.altitude_sl_ft]),
-        'throttle':     float(sim[prp.throttle_cmd]),
-        'alpha_rad':    float(sim.fdm['aero/alpha-rad']),
-        'beta_rad':     float(sim.fdm['aero/beta-rad']),
-        'aileron_cmd':  float(sim[prp.aileron_cmd]),
-        'elevator_cmd': float(sim[prp.elevator_cmd]),
+        'roll_rad':              float(sim[prp.roll_rad]),
+        'pitch_rad':             float(sim[prp.pitch_rad]),
+        'heading_rad':           float(sim[prp.heading_rad]),
+        'airspeed_kts':          float(sim[prp.airspeed_kts]),
+        'p_radps':               float(sim[prp.p_radps]),
+        'q_radps':               float(sim[prp.q_radps]),
+        'r_radps':               float(sim[prp.r_radps]),
+        'altitude_ft':           float(sim[prp.altitude_sl_ft]),
+        'throttle':              float(sim[prp.throttle_cmd]),
+        'alpha_rad':             float(sim.fdm['aero/alpha-rad']),
+        'beta_rad':              float(sim.fdm['aero/beta-rad']),
+        'aileron_cmd':           float(sim[prp.aileron_cmd]),
+        'elevator_cmd':          float(sim[prp.elevator_cmd]),
+        # Actual FCS surface positions (after actuator lag dynamics).
+        # Must be set BEFORE run_ic() so JSBSim's force evaluation uses the
+        # correct actuation state and stores the right prev-acceleration in its
+        # internal multi-step integrator buffers (dqUVWidot / dqPQRidot).
+        'fcs_aileron_pos_rad':   float(sim.fdm['fcs/left-aileron-pos-rad']),
+        'fcs_elevator_pos_rad':  float(sim.fdm['fcs/elevator-pos-rad']),
+        'fcs_throttle_pos_norm': float(sim.fdm['fcs/throttle-pos-norm']),
     }
 
 
 def set_env_state(env, state: dict) -> None:
     """Restore a JSBSim env to a previously snapshotted state.
 
-    Writes all physical state into JSBSim's IC slots then calls run_ic() so
-    the FDM (including its internal integrators) re-initialises from those
-    values.  Throttle is written directly after run_ic() since it is a
-    command property, not an IC property.
+    Writes all physical state into JSBSim's IC slots, then sets throttle,
+    control commands, and actual FCS surface positions BEFORE calling run_ic().
+    This ensures the IC force evaluation uses the correct actuation state so
+    that JSBSim's internal multi-step integrator history buffers
+    (dqUVWidot / dqPQRidot) are populated with the right prev-acceleration.
+    Without this, the first post-restore step diverges because the stored
+    acceleration was computed at trim rather than at s0.
     """
     from fw_jsbgym.utils import jsbsim_properties as prp
     sim = env.unwrapped.sim
+
+    # IC attitude / velocity / position
     sim[prp.ic_roll_rad]     = state['roll_rad']
     sim[prp.ic_pitch_rad]    = state['pitch_rad']   - state['alpha_rad']
     sim[prp.ic_heading_rad]  = state['heading_rad'] + state['beta_rad']
@@ -512,10 +524,23 @@ def set_env_state(env, state: dict) -> None:
     sim[prp.ic_altitude_ft]  = state['altitude_ft']
     sim.fdm['ic/alpha-rad']  = state['alpha_rad']
     sim.fdm['ic/beta-rad']   = state['beta_rad']
+
+    # Set actuation state BEFORE run_ic() so the IC force evaluation uses s0
+    # values and stores the correct prev-acceleration in the integrator deques.
+    sim[prp.throttle_cmd]  = state['throttle']
+    sim[prp.aileron_cmd]   = state['aileron_cmd']
+    sim[prp.elevator_cmd]  = state['elevator_cmd']
+    sim.fdm['fcs/left-aileron-pos-rad']  = state.get('fcs_aileron_pos_rad', 0.0)
+    sim.fdm['fcs/right-aileron-pos-rad'] = state.get('fcs_aileron_pos_rad', 0.0)
+    sim.fdm['fcs/elevator-pos-rad']      = state.get('fcs_elevator_pos_rad', 0.0)
+    sim.fdm['fcs/throttle-pos-norm']     = state.get('fcs_throttle_pos_norm', state['throttle'])
+
     sim.fdm.run_ic()
-    sim[prp.throttle_cmd]    = state['throttle']
-    sim[prp.aileron_cmd]     = state['aileron_cmd']
-    sim[prp.elevator_cmd]    = state['elevator_cmd']
+
+    # Restore commands after run_ic() (run_ic may reset some cmd properties)
+    sim[prp.throttle_cmd]  = state['throttle']
+    sim[prp.aileron_cmd]   = state['aileron_cmd']
+    sim[prp.elevator_cmd]  = state['elevator_cmd']
 
 
 def plot_tracking_performance(
