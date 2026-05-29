@@ -1,2 +1,2 @@
 label,steps,terminated,avg_step_time_ms,roll_mean_err_deg,roll_converged_step,roll_converged_s,roll_ss_mean_err_deg,roll_ss_std_deg,pitch_mean_err_deg,pitch_converged_step,pitch_converged_s,pitch_ss_mean_err_deg,pitch_ss_std_deg
-JSBSim_fork,2000,True,13137.43,1.86,103,1.03,0.31,0.29,2.76,never,never,1.66,0.69
+JSBSim_fork,1500,False,2739.84,2.48,237,2.37,0.12,0.12,3.22,never,never,1.73,0.32
