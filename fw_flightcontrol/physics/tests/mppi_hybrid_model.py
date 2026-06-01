@@ -178,7 +178,7 @@ def main():
     parser.add_argument('--mppi-samples',      type=int,   default=1000)
     parser.add_argument('--mppi-horizon',      type=int,   default=40)
     parser.add_argument('--mppi-temperature',  type=float, default=0.5)
-    parser.add_argument('--mppi-noise-std',    type=float, default=0.5)
+    parser.add_argument('--mppi-noise-std',    type=float, default=0.2)
     parser.add_argument('--residual-clamp',    type=float, default=None,
                         help='Clamp residual output to [-x, x] to prevent OOD explosion')
     parser.add_argument('--seed',              type=int,   default=42)

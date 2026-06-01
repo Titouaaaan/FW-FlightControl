@@ -23,7 +23,7 @@ from fw_flightcontrol.physics.mppi import MPPIController, compute_costs
 _FC_DIR       = Path(__file__).parent.parent.parent
 CONFIG_DIR    = str(_FC_DIR / 'config')
 NOATMO_YAML   = str(_FC_DIR / 'config' / 'env' / 'jsbsim' / 'noatmo.yaml')
-SAVE_DIR      = _FC_DIR / 'data' / 'oracle_mppi'
+SAVE_DIR      = _FC_DIR / 'data' / 'oracle_mppi_highnoise'
 
 DT            = 0.01
 TARGET_VA_KPH = 60.0
@@ -359,7 +359,7 @@ def main():
     parser.add_argument('--mppi-samples',     type=int,   default=256)
     parser.add_argument('--mppi-horizon',     type=int,   default=40)
     parser.add_argument('--mppi-temperature', type=float, default=0.5)
-    parser.add_argument('--mppi-noise-std',   type=float, default=0.5)
+    parser.add_argument('--mppi-noise-std',   type=float, default=0.2)
     parser.add_argument('--mppi-iters',       type=int,   default=None,
                         help='MPPI refinement passes per step (default: 1)')
     parser.add_argument('--seed',             type=int,   default=42)

@@ -248,9 +248,9 @@ def compute_costs(
     target_pitch_rad = np.deg2rad(target_pitch)
     target_va_ms     = 60.0 / 3.6  # 60 km/h in m/s
 
-    c_roll  = np.nansum(np.abs(trajectories[:, :, 0] - target_roll_rad),  axis=1)
-    c_pitch = np.nansum(np.abs(trajectories[:, :, 1] - target_pitch_rad), axis=1)
-    c_va    = np.nansum(np.abs(trajectories[:, :, 2] - target_va_ms),     axis=1)
+    c_roll  = np.sqrt(np.nanmean((trajectories[:, :, 0] - target_roll_rad)**2,  axis=1))
+    c_pitch = np.sqrt(np.nanmean((trajectories[:, :, 1] - target_pitch_rad)**2, axis=1))
+    c_va    = np.sqrt(np.nanmean((trajectories[:, :, 2] - target_va_ms)**2,     axis=1))
 
     has_nan = ~np.isfinite(trajectories[:, :, :3]).all(axis=(1, 2))
 
