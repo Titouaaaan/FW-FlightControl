@@ -23,12 +23,10 @@ from fw_flightcontrol.physics.mppi import MPPIController, compute_costs
 _FC_DIR       = Path(__file__).parent.parent.parent
 CONFIG_DIR    = str(_FC_DIR / 'config')
 NOATMO_YAML   = str(_FC_DIR / 'config' / 'env' / 'jsbsim' / 'noatmo.yaml')
-SAVE_DIR      = _FC_DIR / 'data' / 'oracle_mppi_highnoise'
+SAVE_DIR      = _FC_DIR / 'data' / 'new_oracle_mppi'
 
 DT            = 0.01
 TARGET_VA_KPH = 60.0
-STEPS_20S     = 2000
-
 
 # ── Environment ────────────────────────────────────────────────────────────────
 
@@ -131,6 +129,9 @@ def run_mppi_oracle(target_roll: float, target_pitch: float, max_steps: int,
         num_samples=mppi_cfg['samples'],
         temperature=mppi_cfg['temperature'],
         noise_std=mppi_cfg['noise_std'],
+        min_std=mppi_cfg.get('min_std', 0.05),
+        num_elites=mppi_cfg.get('num_elites', 64),
+        momentum=mppi_cfg.get('momentum', 0.1),
     )
     np.random.seed(seed)
     controller.reset()
@@ -164,11 +165,11 @@ def run_mppi_oracle(target_roll: float, target_pitch: float, max_steps: int,
             t0   = time.time()
             best = np.zeros(3)
 
-            for _ in range(n_iters):
+            for i in range(n_iters):
                 sampled      = controller.sample_actions()
                 trajectories = _rollout_fork(main_env, thr_ref, sampled)
                 costs        = compute_costs(trajectories, target_roll, target_pitch)
-                best         = controller.update(costs, sampled)
+                best         = controller.update(costs, sampled, shift=(i == n_iters - 1))
 
             thr_ref[0] = float(best[2])
             obs, _, term, trunc, _ = main_env.step(best[:2])
@@ -353,15 +354,21 @@ def sanity_check(n_warmup: int = 50, n_test: int = 20,
 
 def main():
     parser = argparse.ArgumentParser(description='MPPI Oracle — JSBSim as world model')
-    parser.add_argument('--target-roll',      type=float, default=55.0)
-    parser.add_argument('--target-pitch',     type=float, default=28.0)
-    parser.add_argument('--steps',            type=int,   default=STEPS_20S)
-    parser.add_argument('--mppi-samples',     type=int,   default=256)
+    parser.add_argument('--target-roll',      type=float, default=20.0)
+    parser.add_argument('--target-pitch',     type=float, default=10.0)
+    parser.add_argument('--steps',            type=int,   default=2000)
+    parser.add_argument('--mppi-samples',     type=int,   default=512)
     parser.add_argument('--mppi-horizon',     type=int,   default=40)
     parser.add_argument('--mppi-temperature', type=float, default=0.5)
-    parser.add_argument('--mppi-noise-std',   type=float, default=0.2)
-    parser.add_argument('--mppi-iters',       type=int,   default=None,
-                        help='MPPI refinement passes per step (default: 1)')
+    parser.add_argument('--mppi-noise-std',   type=float, default=0.4)
+    parser.add_argument('--min-std',          type=float, default=0.05,
+                        help='σ floor — prevents over-exploitation (eq. 5 of TD-MPC)')
+    parser.add_argument('--mppi-iters',       type=int,   default=6,
+                        help='MPPI refinement passes per step (default: 6)')
+    parser.add_argument('--num-elites',       type=int,   default=64,
+                        help='Top-k trajectories used for μ/σ update (TD-MPC: 64 of 512)')
+    parser.add_argument('--momentum',         type=float, default=0.1,
+                        help='Mean momentum across iterations (TD-MPC: 0.1)')
     parser.add_argument('--seed',             type=int,   default=42)
     parser.add_argument('--render-mode',      type=str,   default='none',
                         choices=['none', 'plot_anim', 'plot_end',
@@ -381,7 +388,8 @@ def main():
     mppi_cfg = dict(
         samples=args.mppi_samples, horizon=args.mppi_horizon,
         temperature=args.mppi_temperature, noise_std=args.mppi_noise_std,
-        iters=args.mppi_iters,
+        min_std=args.min_std, num_elites=args.num_elites,
+        momentum=args.momentum, iters=args.mppi_iters,
     )
 
     result = run_mppi_oracle(

@@ -11,7 +11,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 import fw_jsbgym  # noqa: F401
 
-from fw_flightcontrol.physics.mppi import MPPIController, load_config_and_model, initialize_environment
+from fw_flightcontrol.physics.mppi import (
+    MPPIController, load_config_and_model, initialize_environment,
+    rollout_trajectories, compute_costs,
+)
 from fw_flightcontrol.physics.utils import (
     _throttle_patch, _safe_label,
     plot_model_result, save_metrics, compute_convergence_stats,
@@ -20,7 +23,7 @@ from fw_flightcontrol.physics.utils import (
 
 DT            = 0.01
 TARGET_VA_KPH = 60.0
-SAVE_DIR      = Path(__file__).parent.parent.parent / 'data' / 'hybrid_mppi'
+SAVE_DIR      = Path(__file__).parent.parent.parent / 'data' / 'test_hybrid_mppi_topk_highernoise'
 
 
 # ── Control loop ───────────────────────────────────────────────────────────────
@@ -64,6 +67,9 @@ def run_mppi_hybrid(
         num_samples=mppi_cfg['samples'],
         temperature=mppi_cfg['temperature'],
         noise_std=mppi_cfg['noise_std'],
+        min_std=mppi_cfg.get('min_std', 0.05),
+        num_elites=mppi_cfg.get('num_elites', 64),
+        momentum=mppi_cfg.get('momentum', 0.1),
     )
     np.random.seed(seed)
     controller.reset()
@@ -74,6 +80,7 @@ def run_mppi_hybrid(
         np.array([np.deg2rad(target_roll), np.deg2rad(target_pitch)])
     )
 
+    n_iters = mppi_cfg.get('iters') or 1
     roll_h, pitch_h, va_h, p_h, q_h, r_h = [], [], [], [], [], []
     act_h, times = [], []
     terminated = False
@@ -81,7 +88,8 @@ def run_mppi_hybrid(
     print(f"\n{'─'*68}")
     print(f"  Hybrid MPPI | roll={target_roll:+.1f}° pitch={target_pitch:+.1f}°")
     print(f"  N={mppi_cfg['samples']} H={mppi_cfg['horizon']} "
-          f"λ={mppi_cfg['temperature']} σ={mppi_cfg['noise_std']} seed={seed}")
+          f"λ={mppi_cfg['temperature']} σ={mppi_cfg['noise_std']} "
+          f"iters={n_iters} seed={seed}")
     print(f"{'─'*68}")
     if log_every > 0:
         print(f"  {'step':>5}  {'roll(°)':>8}  {'err_r(°)':>9}  "
@@ -92,12 +100,15 @@ def run_mppi_hybrid(
         for step in range(max_steps):
             t0 = time.time()
 
-            best, info = controller.optimize(
-                obs, target_roll, target_pitch,
-                hybrid_model, model_config,
-                norm_scale, norm_offset, norm_type, device,
-                residual_clamp=mppi_cfg.get('residual_clamp'),
-            )
+            for i in range(n_iters):
+                sampled = controller.sample_actions()
+                trajs   = rollout_trajectories(
+                    obs, sampled, hybrid_model, model_config,
+                    norm_scale, norm_offset, norm_type, device,
+                    residual_clamp=mppi_cfg.get('residual_clamp'),
+                )
+                costs = compute_costs(trajs, target_roll, target_pitch)
+                best  = controller.update(costs, sampled, shift=(i == n_iters - 1))
 
             thr_ref[0] = float(best[2])
             obs, _, term, trunc, _ = env.step(best[:2])
@@ -175,10 +186,18 @@ def main():
     parser.add_argument('--target-roll',       type=float, default=20.0)
     parser.add_argument('--target-pitch',      type=float, default=10.0)
     parser.add_argument('--steps',             type=int,   default=2000)
-    parser.add_argument('--mppi-samples',      type=int,   default=1000)
-    parser.add_argument('--mppi-horizon',      type=int,   default=40)
+    parser.add_argument('--mppi-samples',      type=int,   default=512)
+    parser.add_argument('--mppi-horizon',      type=int,   default=20)
     parser.add_argument('--mppi-temperature',  type=float, default=0.5)
-    parser.add_argument('--mppi-noise-std',    type=float, default=0.2)
+    parser.add_argument('--mppi-noise-std',    type=float, default=0.4)
+    parser.add_argument('--min-std',           type=float, default=0.05,
+                        help='sig floor — prevents over-exploitation (eq. 5 of TD-MPC)')
+    parser.add_argument('--mppi-iters',        type=int,   default=1,
+                        help='MPPI refinement passes per step (default: 1)')
+    parser.add_argument('--num-elites',        type=int,   default=64,
+                        help='Top-k trajectories used for mu/sig update (TD-MPC: 64 of 512)')
+    parser.add_argument('--momentum',          type=float, default=0.1,
+                        help='Mean momentum across iterations (TD-MPC: 0.1)')
     parser.add_argument('--residual-clamp',    type=float, default=None,
                         help='Clamp residual output to [-x, x] to prevent OOD explosion')
     parser.add_argument('--seed',              type=int,   default=42)
@@ -211,6 +230,10 @@ def main():
         horizon=args.mppi_horizon,
         temperature=args.mppi_temperature,
         noise_std=args.mppi_noise_std,
+        min_std=args.min_std,
+        num_elites=args.num_elites,
+        momentum=args.momentum,
+        iters=args.mppi_iters,
         residual_clamp=args.residual_clamp,
     )
 
@@ -236,3 +259,20 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+'''
+Notes:
+
+for hybrid model: iterations seems to hurt the model, 
+higher noise (0.5) allows to reach the target but we get oscillations and model cant
+seem to converge
+with low noise it converges but always to a value slightly lower (2.5° lower than the target)
+low noise also gives less action oscillation
+
+for temperature 0.5 seems best
+
+concerning top k candidates (testing rn need to update)
+
+concenrining horizon, 40 works best, 20 degrades only slightly
+
+'''

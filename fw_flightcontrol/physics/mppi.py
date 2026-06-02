@@ -233,8 +233,10 @@ def compute_costs(
     Trajectories must have [roll_rad, pitch_rad, Va_ms, ...] in the last dim.
     NaN trajectories (diverged or terminated early) receive NaN cost.
 
-    Normalizes each component by its std across samples so all three terms
-    have equal variance and equal influence on the MPPI weighting.
+    Each channel is normalised by its tolerance before RMSE. Each term is then
+    capped at 5× tolerance to prevent a single far-off objective from dominating
+    the sum and causing MPPI to sacrifice an already-met objective. The three
+    terms are summed (not averaged) so temperature λ acts on the raw total.
 
     Args:
         trajectories: (N, H, >=3) — roll [rad], pitch [rad], Va [m/s]
@@ -246,22 +248,27 @@ def compute_costs(
     """
     target_roll_rad  = np.deg2rad(target_roll)
     target_pitch_rad = np.deg2rad(target_pitch)
-    target_va_ms     = 60.0 / 3.6  # 60 km/h in m/s
-
-    c_roll  = np.sqrt(np.nanmean((trajectories[:, :, 0] - target_roll_rad)**2,  axis=1))
-    c_pitch = np.sqrt(np.nanmean((trajectories[:, :, 1] - target_pitch_rad)**2, axis=1))
-    c_va    = np.sqrt(np.nanmean((trajectories[:, :, 2] - target_va_ms)**2,     axis=1))
+    target_va_ms     = 60.0 / 3.6
 
     has_nan = ~np.isfinite(trajectories[:, :, :3]).all(axis=(1, 2))
-
-    valid_roll  = c_roll[~has_nan]
-    valid_pitch = c_pitch[~has_nan]
-    valid_va    = c_va[~has_nan]
+    valid = ~has_nan
 
     eps = 1e-6
-    costs = (c_roll  / (np.std(valid_roll)  + eps) +
-             c_pitch / (np.std(valid_pitch) + eps) +
-             c_va    / (np.std(valid_va)    + eps))
+
+    err_roll  = trajectories[:, :, 0] - target_roll_rad   # (N, H)
+    err_pitch = trajectories[:, :, 1] - target_pitch_rad
+    err_va    = trajectories[:, :, 2] - target_va_ms
+
+    # std of raw errors across all valid samples and horizon steps (per channel)
+    scale_roll  = np.std(err_roll [valid]) + eps
+    scale_pitch = np.std(err_pitch[valid]) + eps
+    scale_va    = np.std(err_va   [valid]) + eps
+
+    c_roll  = np.sqrt(np.nanmean((err_roll  / scale_roll) **2, axis=1))
+    c_pitch = np.sqrt(np.nanmean((err_pitch / scale_pitch)**2, axis=1))
+    c_va    = np.sqrt(np.nanmean((err_va    / scale_va)   **2, axis=1))
+
+    costs = c_roll + c_pitch + c_va
     costs[has_nan] = np.nan
     return costs
 
@@ -291,76 +298,99 @@ class MPPIController:
         num_samples: int,
         temperature: float,
         noise_std:   float,
+        min_std:     float = 0.0,
+        num_elites:  int   = 64,
+        momentum:    float = 0.1,
     ):
-        self.horizon     = horizon
-        self.action_dim  = action_dim
-        self.num_samples = num_samples
-        self.temperature = temperature  # λ
-        self.noise_std   = noise_std
-        self.mean_actions = np.zeros((horizon, action_dim))
+        self.horizon      = horizon
+        self.action_dim   = action_dim
+        self.num_samples  = num_samples
+        self.temperature  = temperature  # λ
+        self.noise_std    = noise_std    # initial / maximum σ, reset each decision step
+        self.min_std      = min_std      # σ floor — prevents over-exploitation (eq. 5)
+        self.num_elites   = num_elites   # top-k for eq. 4 (TD-MPC: 64 of 512)
+        self.momentum     = momentum     # mean momentum across iterations (TD-MPC: 0.1)
+        self.mean_actions  = np.zeros((horizon, action_dim))
+        self.current_sigma = noise_std   # adaptive σ, updated by update()
 
     def reset(self) -> None:
-        """Reset the warm-started mean sequence to neutral."""
-        self.mean_actions         = np.zeros((self.horizon, self.action_dim))
-        self.mean_actions[:, 2]   = 0.3  # throttle warm-start
+        """Reset the warm-started mean sequence and σ to initial values."""
+        self.mean_actions          = np.zeros((self.horizon, self.action_dim))
+        self.mean_actions[:, 2]    = 0.3  # throttle warm-start
+        self.current_sigma         = self.noise_std
 
     def sample_actions(self) -> np.ndarray:
         """Sample N candidate action sequences around the current mean.
 
-        75% exploitative (Gaussian noise around mean), 25% fully random.
-        Throttle uses half noise_std to avoid pile-up at the [0,1] boundary.
+        All N trajectories are sampled from N(μ, σ²I) as in TD-MPC (eq. 3/4).
+        Throttle uses half sigma to avoid pile-up at the [0,1] boundary.
 
         Returns:
             actions: (N, H, action_dim)
         """
-        n_random = self.num_samples // 4
-        n_noise  = self.num_samples - n_random
+        noise_ae = np.random.normal(0, self.current_sigma,       (self.num_samples, self.horizon, 2))
+        noise_t  = np.random.normal(0, self.current_sigma * 0.5, (self.num_samples, self.horizon))
 
-        noise_ae = np.random.normal(0, self.noise_std,       (n_noise, self.horizon, 2))
-        noise_t  = np.random.normal(0, self.noise_std * 0.5, (n_noise, self.horizon))
+        actions = np.empty((self.num_samples, self.horizon, self.action_dim))
+        actions[:, :, :2] = np.clip(self.mean_actions[None, :, :2] + noise_ae, -1.0, 1.0)
+        actions[:, :,  2] = np.clip(self.mean_actions[None, :,  2] + noise_t,   0.0, 1.0)
+        return actions
 
-        exploit = np.empty((n_noise, self.horizon, self.action_dim))
-        exploit[:, :, :2] = np.clip(self.mean_actions[None, :, :2] + noise_ae, -1.0, 1.0)
-        exploit[:, :,  2] = np.clip(self.mean_actions[None, :,  2] + noise_t,   0.0, 1.0)
+    def update(self, costs: np.ndarray, sampled_actions: np.ndarray,
+               shift: bool = True) -> np.ndarray:
+        """Apply MPPI weighting, update μ and σ, and return the best action.
 
-        explore = np.empty((n_random, self.horizon, self.action_dim))
-        explore[:, :, :2] = np.random.uniform(-1.0, 1.0, (n_random, self.horizon, 2))
-        explore[:, :,  2] = np.random.uniform( 0.0, 1.0, (n_random, self.horizon))
-
-        return np.concatenate([exploit, explore], axis=0)
-
-    def update(self, costs: np.ndarray, sampled_actions: np.ndarray) -> np.ndarray:
-        """Apply MPPI weighting and return the best action.
-
-        This is the backend-agnostic core: it does not care how costs were
-        computed (JSBSim oracle, hybrid model, or any other source).
+        Matches TD-MPC (eq. 4 + eq. 5): updates both mean and sigma after
+        each iteration. sigma is clamped to min_std to prevent over-exploitation.
 
         Args:
             costs:           (N,) scalar cost per trajectory. Non-finite values
                              are replaced with a large penalty (10× max valid cost).
             sampled_actions: (N, H, action_dim)
+            shift:           if True (default), advance the mean sequence by one
+                             step (warm-start for next decision step). Pass False
+                             for intermediate iterations within a single step so
+                             the plan is not advanced prematurely.
 
         Returns:
-            best_action: (action_dim,) first step of the weighted mean sequence,
+            best_action: (action_dim,) first step of the updated mean sequence,
                          clipped to valid control ranges. Returns zeros if all
                          costs are non-finite.
         """
         valid = np.isfinite(costs)
         if not valid.any():
-            self._shift_mean()
+            if shift:
+                self._shift_mean()
             return np.zeros(self.action_dim)
 
         costs_safe = np.where(valid, costs, np.nanmax(costs[valid]) * 10.0)
-        w = np.exp(-(costs_safe - costs_safe.min()) / self.temperature)
+
+        # ── Top-k elite filtering (eq. 4) ─────────────────────────────────
+        k = min(self.num_elites, int(valid.sum()), len(costs_safe) - 1)
+        elite_idx     = np.argpartition(costs_safe, k)[:k]
+        elite_costs   = costs_safe[elite_idx]
+        elite_actions = sampled_actions[elite_idx]
+
+        w = np.exp(-(elite_costs - elite_costs.min()) / self.temperature)
         w /= w.sum()
 
-        self.mean_actions = np.einsum('k,khd->hd', w, sampled_actions)
+        # ── μ update with momentum (eq. 4) ────────────────────────────────
+        weighted_mean     = np.einsum('k,khd->hd', w, elite_actions)
+        self.mean_actions = (1.0 - self.momentum) * weighted_mean + self.momentum * self.mean_actions
 
-        best       = self.mean_actions[0].copy()
-        best[:2]   = np.clip(best[:2], -1.0, 1.0)
-        best[2]    = np.clip(best[2],   0.0, 1.0)
+        # ── σ update (eq. 4 + eq. 5) ──────────────────────────────────────
+        # Weighted std of elite actions around the new mean, then clamp to
+        # min_std to prevent σ from collapsing and locking into a local optimum.
+        diff         = elite_actions - self.mean_actions[None, :, :]
+        weighted_var = np.einsum('k,khd->hd', w, diff ** 2)
+        self.current_sigma = float(max(np.sqrt(np.mean(weighted_var)), self.min_std))
 
-        self._shift_mean()
+        best     = self.mean_actions[0].copy()
+        best[:2] = np.clip(best[:2], -1.0, 1.0)
+        best[2]  = np.clip(best[2],   0.0, 1.0)
+
+        if shift:
+            self._shift_mean()
         return best
 
     def optimize(
@@ -415,7 +445,8 @@ class MPPIController:
         return best, info
 
     def _shift_mean(self) -> None:
-        """Shift the mean sequence one step forward (warm-start for next call)."""
-        self.mean_actions        = np.roll(self.mean_actions, -1, axis=0)
-        self.mean_actions[-1, :2] = 0.0  # aileron/elevator neutral
-        self.mean_actions[-1, 2]  = 0.3  # throttle near cruise
+        """Shift the mean one step forward and reset σ for the next decision step."""
+        self.mean_actions         = np.roll(self.mean_actions, -1, axis=0)
+        self.mean_actions[-1, :2] = 0.0           # aileron/elevator neutral
+        self.mean_actions[-1, 2]  = 0.3           # throttle near cruise
+        self.current_sigma        = self.noise_std # reset σ to initial for next step
