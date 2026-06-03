@@ -359,9 +359,12 @@ class MPPIController:
         """
         valid = np.isfinite(costs)
         if not valid.any():
+            best = self.mean_actions[0].copy()
+            best[:2] = np.clip(best[:2], -1.0, 1.0)
+            best[2]  = np.clip(best[2],   0.0, 1.0)
             if shift:
                 self._shift_mean()
-            return np.zeros(self.action_dim)
+            return best
 
         costs_safe = np.where(valid, costs, np.nanmax(costs[valid]) * 10.0)
 
