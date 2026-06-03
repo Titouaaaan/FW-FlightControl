@@ -23,7 +23,7 @@ from fw_flightcontrol.physics.mppi import MPPIController, compute_costs
 _FC_DIR       = Path(__file__).parent.parent.parent
 CONFIG_DIR    = str(_FC_DIR / 'config')
 NOATMO_YAML   = str(_FC_DIR / 'config' / 'env' / 'jsbsim' / 'noatmo.yaml')
-SAVE_DIR      = _FC_DIR / 'data' / 'new_oracle_mppi'
+SAVE_DIR      = _FC_DIR / 'data' / 'oracle_mppi_topk'
 
 DT            = 0.01
 TARGET_VA_KPH = 60.0
