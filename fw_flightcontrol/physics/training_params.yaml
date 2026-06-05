@@ -11,7 +11,7 @@ network:
   
   # Residual network hidden layers
   hidden_dims: [256,256]
-  activation: relu
+  activation: elu
   use_batch_norm: false
 
 
@@ -32,10 +32,10 @@ training:
   # Learning rate scheduler (optional)
   scheduler:
     enabled: true
-    type: 'steplr'        # Options: 'steplr', 'exponential', 'cosine'
-    step_size: 10         # Decay every N epochs
-    gamma: 0.7            # Multiply LR by this factor (0.7 = 30% reduction per step)
-    min_lr: 0.0001        # Floor - don't go below this
+    type: 'cosine'        # Options: 'steplr', 'exponential', 'cosine'
+    step_size: 10         # Unused for cosine, kept for reference
+    gamma: 0.7            # Unused for cosine, kept for reference
+    min_lr: 0.0001        # Floor - cosine anneals down to this over num_epochs
   
   # Gradient clipping for stability
   grad_clip_norm: 2.0
@@ -87,7 +87,7 @@ integration:
 # ============================================================================
 data:
   # CSV file located in fw_flightcontrol/data/
-  file: 'trajectory_data_mppi_prior.csv'
+  file: 'trajectory_data_pid_converged.csv'
 
   # Train/val/test split
   train_fraction: 0.85
@@ -176,5 +176,5 @@ logging:
   
   # Output directories
   checkpoint_dir: ./checkpoints
-  checkpoint_subdirectory: mppi_data_model # per_state_norm_expv.0.8    
+  checkpoint_subdirectory: converged_data_elu_cosine
   log_dir: ./logs

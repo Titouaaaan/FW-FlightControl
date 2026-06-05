@@ -165,15 +165,23 @@ def create_optimizer(residual_network: PhysicsAugmented, config: Dict):
 
     scheduler_config = train_config.get('scheduler', {})
     if scheduler_config.get('enabled', False):
+        min_lr = scheduler_config.get('min_lr', 1e-5)
         if scheduler_config.get('type') == 'steplr':
             scheduler = torch.optim.lr_scheduler.StepLR(
                 optimizer,
                 step_size=scheduler_config.get('step_size', 20),
                 gamma=scheduler_config.get('gamma', 0.7)
             )
-            min_lr = scheduler_config.get('min_lr', 1e-5)
             print(f"Created StepLR scheduler: step_size={scheduler_config.get('step_size', 20)}, "
                   f"gamma={scheduler_config.get('gamma', 0.7)}, min_lr={min_lr}")
+        elif scheduler_config.get('type') == 'cosine':
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=train_config['num_epochs'],
+                eta_min=min_lr,
+            )
+            print(f"Created CosineAnnealingLR scheduler: T_max={train_config['num_epochs']}, "
+                  f"eta_min={min_lr}")
 
     return optimizer, scheduler, min_lr
 
