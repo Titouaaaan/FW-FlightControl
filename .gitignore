@@ -25,7 +25,6 @@ fw_flightcontrol/eval/waypoint_tracking/outputs/trajectories/*
 
 fw_flightcontrol/physics/plots
 
-fw_flightcontrol/data/updated_trajectory_data_noatmo.csv
 fw_flightcontrol/data/updated_trajectory_data_progressive_noatmo_2.0.csv
 fw_flightcontrol/data/trajectory_data_nominal_and_hard_targets.csv
 fw_flightcontrol/data/trajectory_data_pid_pe.csv
