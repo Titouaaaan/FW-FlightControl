@@ -619,6 +619,7 @@ def main(resume_checkpoint: Optional[str] = None):
                 lambda_current, train_history, val_history,
                 norm_scale=denorm_factors if norm_type is not None else None,
                 norm_offset=min_bounds    if norm_type is not None else None,
+                arch_config=net_config,
             )
 
     print("\n" + "="*80)
@@ -635,6 +636,7 @@ def main(resume_checkpoint: Optional[str] = None):
         lambda_current, train_history, val_history,
         norm_scale=denorm_factors if norm_type is not None else None,
         norm_offset=min_bounds    if norm_type is not None else None,
+        arch_config=net_config,
     )
 
     writer.close()

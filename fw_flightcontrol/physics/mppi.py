@@ -91,6 +91,22 @@ def load_config_and_model(
         print(f"  ⚠ Architecture mismatch: config={net_config['hidden_dims']}, "
               f"checkpoint={inferred_hidden}. Using checkpoint.")
 
+    # Prefer activation embedded in the checkpoint; old checkpoints default to 'relu'.
+    if isinstance(raw, dict) and 'arch_config' in raw:
+        ckpt_activation = raw['arch_config'].get('activation', 'relu')
+        if ckpt_activation != net_config.get('activation'):
+            print(f"  ⚠ Activation override: checkpoint={ckpt_activation!r}, "
+                  f"config={net_config.get('activation')!r}. Using checkpoint.")
+        net_config = dict(net_config)
+        net_config['activation'] = ckpt_activation
+        print(f"  ✓ Architecture loaded from checkpoint (activation={ckpt_activation!r})")
+    else:
+        # Old checkpoint with no embedded arch_config — default to relu to be safe.
+        net_config = dict(net_config)
+        net_config['activation'] = 'relu'
+        print(f"  ⚠ No arch_config in checkpoint — defaulting activation to 'relu'. "
+              f"Re-save the checkpoint with arch_config to avoid this.")
+
     residual_network = PhysicsAugmented(
         state_dim=net_config['state_dim'],
         action_dim=net_config['action_dim'],

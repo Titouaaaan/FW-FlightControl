@@ -401,6 +401,7 @@ def save_checkpoint(
     val_history: Dict,
     norm_scale: Optional[np.ndarray] = None,
     norm_offset: Optional[np.ndarray] = None,
+    arch_config: Optional[Dict] = None,
 ) -> None:
     """Save a training checkpoint to disk."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -417,6 +418,14 @@ def save_checkpoint(
     if norm_scale is not None:
         checkpoint['norm_scale']  = norm_scale.tolist()
         checkpoint['norm_offset'] = norm_offset.tolist()
+    if arch_config is not None:
+        checkpoint['arch_config'] = {
+            'activation':   arch_config.get('activation', 'relu'),
+            'hidden_dims':  arch_config.get('hidden_dims', []),
+            'state_dim':    arch_config.get('state_dim', 8),
+            'action_dim':   arch_config.get('action_dim', 3),
+            'use_batch_norm': arch_config.get('use_batch_norm', False),
+        }
     torch.save(checkpoint, path)
     print(f"Saved checkpoint to {path}")
 
