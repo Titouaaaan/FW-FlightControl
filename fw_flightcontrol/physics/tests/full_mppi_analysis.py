@@ -133,14 +133,11 @@ def load_model(model_path: str, device: torch.device):
     residual = PhysicsAugmented(
         state_dim=net['state_dim'], action_dim=net['action_dim'],
         hidden_dims=hidden, activation=net['activation'],
-        use_batch_norm=net['use_batch_norm'],
     )
     residual.load_state_dict(residual_state)
 
-    method = config.get('integration', {}).get('method', 'rk4')
     hybrid = HybridDynamicsModel(
         physics_prior=physics_prior, residual_network=residual,
-        with_prior=True, with_residual=True, integration_method=method,
     ).to(device).eval()
 
     norm_type = get_norm_type(config)
@@ -347,12 +344,9 @@ def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
         residual = PhysicsAugmented(
             state_dim=net['state_dim'], action_dim=net['action_dim'],
             hidden_dims=net['hidden_dims'], activation=net['activation'],
-            use_batch_norm=net['use_batch_norm'],
         )
-        method = config.get('integration', {}).get('method', 'rk4')
         hybrid = HybridDynamicsModel(
             physics_prior=physics_prior, residual_network=residual,
-            with_prior=True, with_residual=True, integration_method=method,
         ).to(device).eval()
         denorm_factors = min_bounds = norm_type = None
         residual_clamp = 0.0

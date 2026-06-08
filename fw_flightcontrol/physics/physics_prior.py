@@ -3,10 +3,6 @@ import torch
 import yaml
 from pathlib import Path
 
-
-
-
-
 class PhysicsPrior(torch.nn.Module):
     """Deterministic physics prior using aerodynamic equations."""
 
@@ -76,17 +72,21 @@ class PhysicsPrior(torch.nn.Module):
         delta_a = action[:, 0]   # aileron deflection [-1, 1]
         delta_e = action[:, 1]   # elevator deflection [-1, 1]
         throttle = action[:, 2]  # throttle command [0, 1]
+
+        # Convert normalized commands to radians.
+        # Aerodynamic coefficients are dimensionless per RADIAN of deflection.
+        # x8.xml aerosurface_scale maps [-1,1] → [-30°,+30°] with gain 0.01745 (π/180),
+        # giving max deflection = 0.5235 rad. Source: x8.xml lines 156-160 (elevator),
+        # 211-215 (left aileron), 239-243 (right aileron).
+        delta_a_rad = delta_a * 0.5235
+        delta_e_rad = delta_e * 0.5235
         
-        # ===================== ATTITUDE KINEMATICS =====================
-        # Eq: phi_dot = p + sin(phi)*tan(theta)*q + cos(phi)*tan(theta)*r
         phi_dot = (p + 
                    torch.sin(phi) * torch.tan(theta) * q + 
                    torch.cos(phi) * torch.tan(theta) * r)
         
-        # Eq: theta_dot = cos(phi)*q - sin(phi)*r
         theta_dot = torch.cos(phi) * q - torch.sin(phi) * r
         
-        # ===================== AIRSPEED DYNAMICS =====================
         # Body frame velocities from airspeed and angles
         u = Va * torch.cos(alpha) * torch.cos(beta)
         v = Va * torch.sin(beta)
@@ -96,8 +96,6 @@ class PhysicsPrior(torch.nn.Module):
         u_dot_kin = r * v - q * w
         v_dot_kin = p * w - r * u
         w_dot_kin = q * u - p * v
-        
-        # ===================== FORCES (Gravity + Aero + Propulsion) =====================
         
         # Gravitational forces
         f_x_g = -self.mass * self.g * torch.sin(theta)
@@ -110,26 +108,25 @@ class PhysicsPrior(torch.nn.Module):
         f_y_p = torch.zeros_like(T_p)
         f_z_p = torch.zeros_like(T_p)
         
-        # ===================== AERODYNAMIC FORCES =====================
         q_dyn = 0.5 * self.rho * Va**2 * self.S  # Dynamic pressure * wing area
         
         # Lift and drag (using simple linear model)
-        F_lift = q_dyn * (self.C_L0 + self.C_L_alpha * alpha + 
+        F_lift = q_dyn * (self.C_L0 + self.C_L_alpha * alpha +
                          self.C_L_q * (self.c * q) / (2 * Va + 1e-6) +
-                         self.C_L_delta_e * delta_e)
-        
-        F_drag = q_dyn * (self.C_D0 + self.C_D_alpha * alpha + 
-                         self.C_D_delta_e * delta_e) # we remove the term that depends on C_D_q because it is set to zero
+                         self.C_L_delta_e * delta_e_rad)
+
+        F_drag = q_dyn * (self.C_D0 + self.C_D_alpha * alpha +
+                         self.C_D_delta_e * delta_e_rad) # we remove the term that depends on C_D_q because it is set to zero
         
         # Transform lift/drag to body axes
         f_x_a = (-torch.cos(alpha) * F_drag + torch.sin(alpha) * F_lift)
         f_z_a = (-torch.sin(alpha) * F_drag - torch.cos(alpha) * F_lift)
         
         # Lateral aerodynamic force
-        f_y_a = q_dyn * (self.C_Y0 + self.C_Y_beta * beta + 
+        f_y_a = q_dyn * (self.C_Y0 + self.C_Y_beta * beta +
                         self.C_Y_p * (self.b * p) / (2 * Va + 1e-6) +
                         self.C_Y_r * (self.b * r) / (2 * Va + 1e-6) +
-                        self.C_Y_delta_a * delta_a)
+                        self.C_Y_delta_a * delta_a_rad)
         
         # Total forces
         f_x = f_x_g + f_x_a + f_x_p
@@ -141,42 +138,31 @@ class PhysicsPrior(torch.nn.Module):
         v_dot = v_dot_kin + f_y / self.mass
         w_dot = w_dot_kin + f_z / self.mass
         
-        # ===================== AIRSPEED DERIVATIVE =====================
-        # Va_dot = (u*u_dot + v*v_dot + w*w_dot) / Va
         Va_dot = (u * u_dot + v * v_dot + w * w_dot) / (Va + 1e-6)
-        
-        # ===================== ANGLE OF ATTACK DERIVATIVE =====================
-        # alpha_dot = (u*w_dot - w*u_dot) / (u^2 + w^2)
+
         denom_alpha = u**2 + w**2 + 1e-6
         alpha_dot = (u * w_dot - w * u_dot) / denom_alpha
         
-        # ===================== SIDESLIP ANGLE DERIVATIVE =====================
-        # beta_dot = (Va*v_dot - v*Va_dot) / (Va * sqrt(Va^2 - v^2))
         denom_beta = Va * torch.sqrt(Va**2 - v**2 + 1e-6) + 1e-6
         beta_dot = (Va * v_dot - v * Va_dot) / denom_beta
         
-        # ===================== ANGULAR RATE DERIVATIVES =====================
-        
-        # Aerodynamic moments
-        # NOTE: JSBSim coefficients C_l, C_m, C_n contain pre-scaled dynamic pressure factors
-        # So we divide by q_dyn instead of multiplying. This ensures moment = coeff / q_dyn
-        # BUT IDK IF WE CAN DO THIS, LIKE THERE IS NO PROOF FOR IT T_T
+        # Aerodynamic moments.
         q_dyn_b = 0.5 * self.rho * Va**2 * self.S * self.b
         q_dyn_c = 0.5 * self.rho * Va**2 * self.S * self.c
-        
+
         l = (self.C_l0 + self.C_l_beta * beta +
              self.C_l_p * (self.b * p) / (2 * Va + 1e-6) +
              self.C_l_r * (self.b * r) / (2 * Va + 1e-6) +
-             self.C_l_delta_a * delta_a) * (q_dyn_b + 1e-6)
-        
+             self.C_l_delta_a * delta_a_rad) * (q_dyn_b + 1e-6)
+
         m = (self.C_m0 + self.C_m_alpha * alpha +
              self.C_m_q * (self.c * q) / (2 * Va + 1e-6) +
-             self.C_m_delta_e * delta_e) * (q_dyn_c + 1e-6)
-        
+             self.C_m_delta_e * delta_e_rad) * (q_dyn_c + 1e-6)
+
         n = (self.C_n0 + self.C_n_beta * beta +
              self.C_n_p * (self.b * p) / (2 * Va + 1e-6) +
              self.C_n_r * (self.b * r) / (2 * Va + 1e-6) +
-             self.C_n_delta_a * delta_a) * (q_dyn_b + 1e-6)
+             self.C_n_delta_a * delta_a_rad) * (q_dyn_b + 1e-6)
         
         # Angular rate derivatives (Gamma buffers precomputed in __init__)
         p_dot = (self.Gamma1 * p * q - self.Gamma2 * q * r +
@@ -187,7 +173,6 @@ class PhysicsPrior(torch.nn.Module):
         r_dot = (self.Gamma7 * p * q - self.Gamma1 * q * r +
                  self.Gamma4 * l + self.Gamma8 * n)
         
-        # ===================== STACK STATE DERIVATIVES =====================
         # Output: [phi_dot, theta_dot, Va_dot, p_dot, q_dot, r_dot, alpha_dot, beta_dot]
         dx_dt = torch.stack([
             phi_dot, theta_dot, Va_dot, 

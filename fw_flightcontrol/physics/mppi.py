@@ -34,7 +34,6 @@ from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridD
 from fw_flightcontrol.physics.training_objective import HybridDynamicsODE
 from fw_flightcontrol.physics.utils import (
     load_config, get_norm_type,
-    extract_bounds_from_config, compute_denorm_factors,
     clean_state_dict_for_compilation,
 )
 
@@ -96,7 +95,6 @@ def load_config_and_model(
         action_dim=net_config['action_dim'],
         hidden_dims=inferred_hidden or net_config['hidden_dims'],
         activation=net_config['activation'],
-        use_batch_norm=net_config['use_batch_norm'],
     )
     residual_network.load_state_dict(residual_state)
     print(f"  ✓ Residual network: {sum(p.numel() for p in residual_network.parameters()):,} params "
@@ -105,9 +103,6 @@ def load_config_and_model(
     hybrid_model = HybridDynamicsModel(
         physics_prior=physics_prior,
         residual_network=residual_network,
-        with_prior=True,
-        with_residual=True,
-        integration_method=config.get('integration', {}).get('method', 'rk4'),
     ).to(device).eval()
     print(f"  ✓ Hybrid model ready on {device}")
 

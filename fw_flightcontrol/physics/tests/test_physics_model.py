@@ -22,13 +22,12 @@ import pandas as pd
 from torchdiffeq import odeint
 
 # Add project to path
-sys.path.insert(0, '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl')
 
 from fw_flightcontrol.physics.physics_prior import PhysicsPrior
 from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel
 from fw_flightcontrol.physics.training_objective import HybridDynamicsODE
 from fw_flightcontrol.physics.utils import (
-    load_config, load_trajectory_data, compute_actual_scales, STATE_NAMES,
+    load_config, load_trajectory_data, STATE_NAMES,
     get_norm_type, normalize_state_torch, denormalize_state_torch,
     clean_state_dict_for_compilation
 )
@@ -67,9 +66,9 @@ def initialize_models(config: Dict, checkpoint_path: str, device: torch.device,
     residual_network = PhysicsAugmented(
         state_dim=net_config['state_dim'],
         action_dim=net_config['action_dim'],
+        prev_action_dim=net_config.get('prev_action_dim', 0),
         hidden_dims=net_config['hidden_dims'],
         activation=net_config['activation'],
-        use_batch_norm=net_config['use_batch_norm'],
     )
 
     print(f"\n  Loading weights from: {checkpoint_path}")
@@ -110,13 +109,11 @@ def initialize_models(config: Dict, checkpoint_path: str, device: torch.device,
             min_bounds = torch.tensor(p['norm_offset'], dtype=torch.float32, device=device)
             print(f"  ✓ Loaded normalization parameters from config")
 
-    integration_method = config.get('integration', {}).get('method', 'rk4')
     hybrid_model = HybridDynamicsModel(
         physics_prior=physics_prior,
         residual_network=residual_network,
         with_prior=with_prior,
         with_residual=with_residual,
-        integration_method=integration_method,
     )
     hybrid_model = hybrid_model.to(device)
     hybrid_model.eval()
@@ -132,8 +129,7 @@ def initialize_models(config: Dict, checkpoint_path: str, device: torch.device,
 @torch.no_grad()
 def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: torch.device,
              split_name: str = "eval", norm_type: str = None,
-             denorm_factors: torch.Tensor = None, min_bounds: torch.Tensor = None,
-             per_state_scales: torch.Tensor = None) -> Dict:
+             denorm_factors: torch.Tensor = None, min_bounds: torch.Tensor = None) -> Dict:
     """Evaluate model on a dataset split, computing compounded errors."""
     horizon    = config['training']['horizon']
     ode_method = config['integration']['method']
@@ -178,32 +174,34 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
             norm_type=norm_type,
         ).to(device)
 
+        batch_prev_actions = batch_data.get('prev_actions')
+        if batch_prev_actions is not None:
+            batch_prev_actions = batch_prev_actions.to(device)
+
         for step in range(horizon):
-            action = batch_actions[:, step, :]
+            action      = batch_actions[:, step, :]
+            prev_action = batch_prev_actions[:, step, :] if batch_prev_actions is not None else None
 
             if hybrid_model.with_residual:
-                residual_output = hybrid_model.residual_network(current_state, action)
+                residual_output = hybrid_model.residual_network(current_state, action, prev_action)
                 if norm_type is not None:
-                    # Regularization in raw space: multiply normalized residual by scale
-                    residual_output_raw = residual_output * denorm_factors
-                    residual_norm = torch.norm(residual_output_raw, p=2, dim=1).mean()
+                    residual_norm = torch.norm(residual_output * denorm_factors, p=2, dim=1).mean()
                 else:
                     residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
                 residual_norms.append(residual_norm)
 
             ode_module.set_action(action)
+            ode_module.set_prev_action(prev_action)
             t_eval = torch.tensor([0.0, dt], dtype=current_state.dtype, device=device)
-            # Denormalize to raw space for ODE integration
             if norm_type is not None:
                 current_state_raw = denormalize_state_torch(current_state, denorm_factors, min_bounds, norm_type)
             else:
                 current_state_raw = current_state
             solution = odeint(ode_module, current_state_raw, t_eval,
                               method=ode_method, rtol=ode_rtol, atol=ode_atol)
-            next_state_raw = solution[-1].clamp(-100.0, 100.0)
-            # Renormalize back to normalized space
+            next_state_raw = solution[-1].clamp(-1000.0, 1000.0)
             if norm_type is not None:
-                next_state = normalize_state_torch(next_state_raw, denorm_factors, min_bounds, norm_type)
+                next_state = normalize_state_torch(next_state_raw, denorm_factors, min_bounds, norm_type).clamp(-10.0, 10.0)
             else:
                 next_state = next_state_raw
             predicted_states.append(next_state)
@@ -222,7 +220,7 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
         # Raw-space error: always used for per-state MAE/RMSE/rel-err reporting
         prediction_error_raw = (predicted_trajectory_raw - batch_states_raw).detach()
 
-        # Loss-space error mirrors train_aphynity_epoch exactly:
+        # Loss-space error:
         #   data_driven_normalization → normalized space
         #   bounds_normalization / no normalization → raw space
         if norm_type == 'data_driven_normalization':
@@ -230,10 +228,7 @@ def evaluate(hybrid_model: HybridDynamicsModel, loader, config: Dict, device: to
         else:
             prediction_error_for_loss = prediction_error_raw
 
-        if per_state_scales is not None:
-            prediction_error_for_loss = prediction_error_for_loss / (per_state_scales ** 2)
-
-        traj_loss  = torch.norm(prediction_error_for_loss, p=2, dim=2).mean().item()
+        traj_loss  = (prediction_error_for_loss ** 2).mean().item()
         reg_loss   = torch.stack(residual_norms).mean().item() if residual_norms else 0.0
         total_loss = reg_loss + lambda_val * traj_loss
 
@@ -394,14 +389,14 @@ def main():
     print(f"  Physics prior    : {args.with_prior}")
     print(f"  Residual network : {args.with_residual}")
 
-    config_path = Path(__file__).parent / 'training_params.yaml'
+    config_path = Path(__file__).parent.parent / 'training_params.yaml'
     config = load_config(str(config_path))
     print(f"  Config           : {config_path}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"  Device           : {device}")
 
-    csv_path = Path(__file__).parent.parent / "data" / "trajectory_data_nominal_and_hard_targets.csv" #"updated_trajectory_data_progressive_noatmo_2.0.csv" 
+    csv_path = Path(__file__).parent.parent.parent / "data" / config['data']['file']
     train_loader, val_loader, test_loader, denorm_factors_computed, min_bounds_computed = load_trajectory_data(str(csv_path), config)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -448,24 +443,13 @@ def main():
     else:
         min_bounds_torch = torch.tensor(min_bounds, dtype=torch.float32, device=device) if min_bounds is not None else None
 
-    per_state_scales_torch = None
-    if config['data'].get('per_state_loss_norm', False):
-        print("\n  Computing actual per-state scales from training data (for consistent evaluation)...")
-        df = pd.read_csv(str(csv_path))
-        actual_scales = compute_actual_scales(df)
-        per_state_scales_torch = torch.tensor(actual_scales, dtype=torch.float32, device=device)
-        print(f"  Using actual scales for loss computation: {actual_scales}")
-    else:
-        print("\n  per_state_loss_norm disabled - evaluating with raw loss (no scaling)")
-
     loader_map    = {'train': train_loader, 'val': val_loader, 'test': test_loader}
     target_loader = loader_map[args.split]
 
     evaluate(hybrid_model, target_loader, config, device, split_name=args.split,
              norm_type=norm_type,
              denorm_factors=denorm_factors_torch if norm_type is not None else None,
-             min_bounds=min_bounds_torch if norm_type is not None else None,
-             per_state_scales=per_state_scales_torch)
+             min_bounds=min_bounds_torch if norm_type is not None else None)
 
 
 '''

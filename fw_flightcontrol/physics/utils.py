@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 
 STATE_INDICES = [0, 1, 2, 3, 4, 5, 8, 9]
+PREV_ACTION_COLS = ['s_t_10', 's_t_11']  # prev aileron_cmd, prev elevator_cmd
 
 STATE_NAMES = [
     "roll  (s0) [rad]",
@@ -69,36 +70,8 @@ def clean_state_dict_for_compilation(state_dict: Dict) -> Dict:
 # ============================================================================
 
 def get_norm_type(config: Dict) -> Optional[str]:
-    """Return the normalization type string, or None if normalization is disabled.
-
-    Reads `data.normalization_type` first. Falls back to the legacy `data.normalize`
-    boolean (True → 'bounds_normalization') for backward compatibility.
-
-    Supported values: 'bounds_normalization', 'data_driven_normalization', None.
-    """
-    norm_type = config['data'].get('normalization_type')
-    if norm_type is not None:
-        return norm_type
-    if config['data'].get('normalize', False):
-        return 'bounds_normalization'
-    return None
-
-
-def extract_bounds_from_config(config: Dict) -> Tuple[np.ndarray, np.ndarray]:
-    """Extract state bounds from config as (min_bounds, max_bounds) arrays of shape (state_dim,).
-
-    Order: [roll, pitch, airspeed_mps, p, q, r, alpha, beta]
-    """
-    bounds = config['state_bounds']
-    keys = ['roll', 'pitch', 'airspeed_mps', 'p', 'q', 'r', 'alpha', 'beta']
-    min_bounds = np.array([bounds[f'{k}_min'] for k in keys], dtype=np.float32)
-    max_bounds = np.array([bounds[f'{k}_max'] for k in keys], dtype=np.float32)
-    return min_bounds, max_bounds
-
-
-def compute_denorm_factors(min_bounds: np.ndarray, max_bounds: np.ndarray) -> np.ndarray:
-    """Return (max - min) / 2 per state — the scale for bounds normalization."""
-    return (max_bounds - min_bounds) / 2.0
+    """Return 'data_driven_normalization', 'bounds_normalization', or None."""
+    return config['data'].get('normalization_type')
 
 
 def compute_data_norm_params(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
@@ -119,29 +92,9 @@ def compute_data_norm_params(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     return np.array(means, dtype=np.float32), np.array(stds, dtype=np.float32)
 
 
-def compute_actual_scales(df: pd.DataFrame) -> np.ndarray:
-    """Compute per-state mean |value| from training data, used for per-state loss scaling."""
-    state_cols = [f's_t_{i}' for i in STATE_INDICES]
-    scales = []
-    for col in state_cols:
-        values = df[col].values.copy()
-        if col == 's_t_2':  # airspeed: km/h → m/s
-            values = values / 3.6
-        scales.append(np.mean(np.abs(values)))
-    return np.array(scales, dtype=np.float32)
-
-
-def normalize_state_np(
-    state: np.ndarray,
-    scale: np.ndarray,
-    offset: np.ndarray,
-    norm_type: str,
-) -> np.ndarray:
-    """Normalize a numpy state array.
-
-    bounds_normalization:      s_norm = (s - offset) / scale - 1   (offset=min, scale=(max-min)/2)
-    data_driven_normalization: s_norm = (s - offset) / scale        (offset=mean, scale=std)
-    """
+def normalize_state_np(state: np.ndarray, scale: np.ndarray, offset: np.ndarray,
+                       norm_type: str) -> np.ndarray:
+    """Normalize a numpy state array: (s - offset) / scale."""
     if norm_type == 'bounds_normalization':
         return (state - offset) / scale - 1.0
     if norm_type == 'data_driven_normalization':
@@ -199,6 +152,8 @@ class TrajectoryDataset(torch.utils.data.Dataset):
                 'initial_states': torch.tensor(seq['initial_state'], dtype=torch.float32),
                 'actions':        torch.tensor(seq['actions'],        dtype=torch.float32),
                 'states':         torch.tensor(seq['states'],         dtype=torch.float32),
+                **({'prev_actions': torch.tensor(seq['prev_actions'], dtype=torch.float32)}
+                   if 'prev_actions' in seq else {}),
             }
             for seq in sequences
         ]
@@ -211,11 +166,14 @@ class TrajectoryDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def collate_fn(batch: List[Dict]) -> Dict:
-        return {
+        result = {
             'initial_states': torch.stack([b['initial_states'] for b in batch]),
             'actions':        torch.stack([b['actions']        for b in batch]),
             'states':         torch.stack([b['states']         for b in batch]),
         }
+        if 'prev_actions' in batch[0]:
+            result['prev_actions'] = torch.stack([b['prev_actions'] for b in batch])
+        return result
 
 
 def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
@@ -254,30 +212,17 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     val_ids   = set(trajectories[n_train:n_train + n_val])
     test_ids  = set(trajectories[n_train + n_val:])
 
-    # ── Normalization parameters ──────────────────────────────────────────────
+    # ── Normalization parameters (computed from training split only) ─────────────
     norm_type = get_norm_type(config)
-    min_bounds, max_bounds = extract_bounds_from_config(config)
-
-    if norm_type == 'data_driven_normalization':
-        train_df = df[df['trajectory_id'].isin(train_ids)]
-        norm_offset, norm_scale = compute_data_norm_params(train_df)
-        print(f"\nData-driven normalization (computed from {len(train_df)} training rows):")
-        print(f"  Mean (norm_offset): {norm_offset}")
-        print(f"  Std  (norm_scale):  {norm_scale}")
-    elif norm_type == 'bounds_normalization':
-        norm_offset = min_bounds
-        norm_scale  = compute_denorm_factors(min_bounds, max_bounds)
-        print(f"\nBounds normalization (from config):")
-        print(f"  Min (norm_offset): {norm_offset}")
-        print(f"  Max:               {max_bounds}")
-        print(f"  Scale (max-min)/2: {norm_scale}")
-    else:
-        # No normalization — return bounds params for reference (used by ODE but not for norm)
-        norm_offset = min_bounds
-        norm_scale  = compute_denorm_factors(min_bounds, max_bounds)
+    train_df = df[df['trajectory_id'].isin(train_ids)]
+    norm_offset, norm_scale = compute_data_norm_params(train_df)
+    print(f"Normalization — std:  {norm_scale.tolist()}")
+    print(f"             — mean: {norm_offset.tolist()}")
 
     # ── Build sequences ───────────────────────────────────────────────────────
     trajectory_sequences_by_traj: Dict = {}
+
+    has_prev_actions = all(c in df.columns for c in PREV_ACTION_COLS)
 
     for traj_id, group in df.groupby('trajectory_id'):
         group = group.sort_values('step_id').reset_index(drop=True)
@@ -285,6 +230,7 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
         states      = group[state_cols].values.copy()
         actions     = group[action_cols].values
         next_states = group[next_state_cols].values.copy()
+        prev_actions = group[PREV_ACTION_COLS].values if has_prev_actions else None
 
         states[:, 2]      = states[:, 2] / 3.6   # km/h → m/s
         next_states[:, 2] = next_states[:, 2] / 3.6
@@ -299,11 +245,14 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
                 seq_states      = normalize_state_np(seq_states,      norm_scale, norm_offset, norm_type)
                 seq_next_states = normalize_state_np(seq_next_states, norm_scale, norm_offset, norm_type)
 
-            traj_sequences.append({
+            seq = {
                 'initial_state': seq_states[0].copy(),
                 'actions':       seq_actions.copy(),
                 'states':        seq_next_states.copy(),
-            })
+            }
+            if prev_actions is not None:
+                seq['prev_actions'] = prev_actions[start_idx:start_idx + horizon].copy()
+            traj_sequences.append(seq)
 
         trajectory_sequences_by_traj[traj_id] = traj_sequences
 
@@ -324,7 +273,7 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
             TrajectoryDataset(seqs),
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=0,
+            num_workers=4,
             pin_memory=True,
             collate_fn=TrajectoryDataset.collate_fn,
         )
@@ -364,7 +313,7 @@ def log_tensorboard_epoch(
     train_metrics: Dict,
     val_metrics: Optional[Dict] = None,
     lambda_current: float = 0.0,
-    grad_metrics: Optional[Dict] = None,
+    grad_norm: Optional[float] = None,
     current_lr: Optional[float] = None,
 ) -> None:
     """Write all epoch-level scalars to TensorBoard in a single call."""
@@ -378,9 +327,8 @@ def log_tensorboard_epoch(
         writer.add_scalar('Epoch/val_loss_trajectory',     val_metrics['loss_trajectory'],      epoch)
         writer.add_scalar('Epoch/val_loss_regularization', val_metrics['loss_regularization'],  epoch)
 
-    if grad_metrics is not None:
-        writer.add_scalar('Gradients/norm_before_clipping', grad_metrics['grad_norm_before_clipping'], epoch)
-        writer.add_scalar('Gradients/norm_after_clipping',  grad_metrics['grad_norm_after_clipping'],  epoch)
+    if grad_norm is not None:
+        writer.add_scalar('Gradients/norm', grad_norm, epoch)
 
     if current_lr is not None:
         writer.add_scalar('Training/learning_rate', current_lr, epoch)
@@ -541,110 +489,6 @@ def set_env_state(env, state: dict) -> None:
     sim[prp.throttle_cmd]  = state['throttle']
     sim[prp.aileron_cmd]   = state['aileron_cmd']
     sim[prp.elevator_cmd]  = state['elevator_cmd']
-
-
-def plot_tracking_performance(
-    target_roll: float,
-    target_pitch: float,
-    filename: str = 'tracking_performance.png',
-    mppi_roll: Optional[List[float]] = None,
-    mppi_pitch: Optional[List[float]] = None,
-    pid_roll: Optional[List[float]] = None,
-    pid_pitch: Optional[List[float]] = None,
-    dt: float = 0.01,
-) -> None:
-    """Save a 2-subplot tracking performance figure (roll top, pitch bottom).
-
-    Always saves to FW-FlightControl/fw_flightcontrol/data/mppi-performance/,
-    creating the folder if it does not exist.
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    save_dir = Path(__file__).parent.parent / 'data' / 'mppi-performance'
-    save_dir.mkdir(parents=True, exist_ok=True)
-    save_path = save_dir / filename
-
-    fig, (ax_roll, ax_pitch) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-
-    def time_axis(history):
-        return np.arange(len(history)) * dt
-
-    # --- Roll subplot ---
-    if mppi_roll is not None:
-        t = time_axis(mppi_roll)
-        ax_roll.plot(t, mppi_roll, color='steelblue', linewidth=1.2, label='MPPI')
-        ax_roll.axhline(target_roll, color='red', linestyle='--', linewidth=1.2, label='Target')
-    if pid_roll is not None:
-        t = time_axis(pid_roll)
-        ax_roll.plot(t, pid_roll, color='darkorange', linewidth=1.2, label='PID')
-        if mppi_roll is None:
-            ax_roll.axhline(target_roll, color='red', linestyle='--', linewidth=1.2, label='Target')
-    ax_roll.set_ylabel('Roll angle [°]')
-    ax_roll.legend(loc='upper right')
-    ax_roll.grid(True, alpha=0.3)
-
-    # --- Pitch subplot ---
-    if mppi_pitch is not None:
-        t = time_axis(mppi_pitch)
-        ax_pitch.plot(t, mppi_pitch, color='steelblue', linewidth=1.2, label='MPPI')
-        ax_pitch.axhline(target_pitch, color='red', linestyle='--', linewidth=1.2, label='Target')
-    if pid_pitch is not None:
-        t = time_axis(pid_pitch)
-        ax_pitch.plot(t, pid_pitch, color='darkorange', linewidth=1.2, label='PID')
-        if mppi_pitch is None:
-            ax_pitch.axhline(target_pitch, color='red', linestyle='--', linewidth=1.2, label='Target')
-    ax_pitch.set_ylabel('Pitch angle [°]')
-    ax_pitch.set_xlabel('Time [s]')
-    ax_pitch.legend(loc='upper right')
-    ax_pitch.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Tracking plot saved to {save_path}")
-
-
-def plot_action_history(
-    filename: str = 'action_history.png',
-    mppi_actions: Optional[np.ndarray] = None,
-    pid_actions: Optional[np.ndarray] = None,
-    dt: float = 0.01,
-) -> None:
-    """Save a 3-subplot action history figure (aileron, elevator, throttle).
-
-    mppi_actions / pid_actions: arrays of shape (N, 3) — columns are
-    [aileron, elevator, throttle]. Either may be None.
-    Saved to FW-FlightControl/fw_flightcontrol/data/mppi-performance/.
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    save_dir = Path(__file__).parent.parent / 'data' / 'mppi-performance'
-    save_dir.mkdir(parents=True, exist_ok=True)
-    save_path = save_dir / filename
-
-    labels   = ['Aileron command [-]', 'Elevator command [-]', 'Throttle command [-]']
-    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-
-    for i, (ax, ylabel) in enumerate(zip(axes, labels)):
-        if mppi_actions is not None:
-            t = np.arange(len(mppi_actions)) * dt
-            ax.plot(t, mppi_actions[:, i], color='steelblue', linewidth=1.0, label='MPPI')
-        if pid_actions is not None:
-            t = np.arange(len(pid_actions)) * dt
-            ax.plot(t, pid_actions[:, i], color='darkorange', linewidth=1.0, label='PID')
-        ax.set_ylabel(ylabel)
-        ax.legend(loc='upper right')
-        ax.grid(True, alpha=0.3)
-
-    axes[-1].set_xlabel('Time [s]')
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Action history plot saved to {save_path}")
 
 
 # ============================================================================
