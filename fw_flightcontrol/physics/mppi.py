@@ -33,9 +33,7 @@ from fw_flightcontrol.physics.physics_prior import PhysicsPrior
 from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel
 from fw_flightcontrol.physics.training_objective import HybridDynamicsODE
 from fw_flightcontrol.physics.utils import (
-    load_config, get_norm_type,
-    extract_bounds_from_config, compute_denorm_factors,
-    clean_state_dict_for_compilation,
+    load_config, get_norm_type, clean_state_dict_for_compilation,
 )
 
 
@@ -101,33 +99,36 @@ def load_config_and_model(
         net_config['activation'] = ckpt_activation
         print(f"  ✓ Architecture loaded from checkpoint (activation={ckpt_activation!r})")
     else:
-        # Old checkpoint with no embedded arch_config — default to relu to be safe.
         net_config = dict(net_config)
         net_config['activation'] = 'relu'
-        print(f"  ⚠ No arch_config in checkpoint — defaulting activation to 'relu'. "
-              f"Re-save the checkpoint with arch_config to avoid this.")
+        print(f"  ⚠ No arch_config in checkpoint — defaulting activation to 'relu'.")
+
+    # Infer prev_action_dim from first-layer input width
+    first_layer_in  = residual_state.get('network.0.weight', torch.empty(0, net_config['state_dim'] + net_config['action_dim'])).shape[1]
+    prev_action_dim = max(0, first_layer_in - net_config['state_dim'] - net_config['action_dim'])
+
+    # Prefer norm_type embedded in the checkpoint; fall back to config
+    if isinstance(raw, dict) and 'norm_type' in raw:
+        norm_type = raw['norm_type']
+    else:
+        norm_type = get_norm_type(config)
 
     residual_network = PhysicsAugmented(
         state_dim=net_config['state_dim'],
         action_dim=net_config['action_dim'],
         hidden_dims=inferred_hidden or net_config['hidden_dims'],
         activation=net_config['activation'],
-        use_batch_norm=net_config['use_batch_norm'],
+        prev_action_dim=prev_action_dim,
     )
     residual_network.load_state_dict(residual_state)
     print(f"  ✓ Residual network: {sum(p.numel() for p in residual_network.parameters()):,} params "
-          f"(epoch={saved_epoch}, λ={saved_lambda})")
+          f"(epoch={saved_epoch}, λ={saved_lambda}, prev_action_dim={prev_action_dim})")
 
     hybrid_model = HybridDynamicsModel(
         physics_prior=physics_prior,
         residual_network=residual_network,
-        with_prior=True,
-        with_residual=True,
-        integration_method=config.get('integration', {}).get('method', 'rk4'),
     ).to(device).eval()
     print(f"  ✓ Hybrid model ready on {device}")
-
-    norm_type = get_norm_type(config)
     print(f"  Normalization: {norm_type or 'none (raw space)'}")
 
     if norm_type is not None and norm_scale is None:
@@ -210,6 +211,14 @@ def rollout_trajectories(
         norm_type=norm_type, residual_clamp=residual_clamp,
     )
 
+    # If the residual network uses prev_action, seed it from obs indices 10, 11
+    # (s_t_10, s_t_11 = prev aileron, prev elevator — matches PREV_ACTION_COLS)
+    prev_action_dim = getattr(hybrid_model.residual_network, 'prev_action_dim', 0)
+    if prev_action_dim > 0:
+        prev_action_init = torch.tensor(
+            current_state[10:10 + prev_action_dim], dtype=torch.float32, device=device,
+        ).unsqueeze(0).expand(num_samples, -1).clone()
+
     trajectories = torch.empty(num_samples, horizon, states_raw.shape[1], device=device)
     invalid      = torch.zeros(num_samples, dtype=torch.bool, device=device)
 
@@ -219,6 +228,9 @@ def rollout_trajectories(
 
     for step in range(horizon):
         ode.set_action(actions_tensor[:, step, :])
+        if prev_action_dim > 0:
+            pa = prev_action_init if step == 0 else actions_tensor[:, step - 1, :prev_action_dim]
+            ode.set_prev_action(pa)
         k1 = ode(0.0, states_raw)
         k2 = ode(0.0, states_raw + half_dt * k1)
         k3 = ode(0.0, states_raw + half_dt * k2)

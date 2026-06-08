@@ -25,6 +25,8 @@ STATE_NAMES = [
     "AoS   (s9) [rad]",
 ]
 
+PREV_ACTION_COLS = ['s_t_10', 's_t_11']
+
 
 # ============================================================================
 # CONFIG
@@ -37,30 +39,10 @@ def load_config(config_path: str) -> Dict:
 
 
 def clean_state_dict_for_compilation(state_dict: Dict) -> Dict:
-    """
-    Remove torch.compile artifacts from state dict.
-    
-    When models are compiled with torch.compile, the state dict keys are prefixed
-    with '_orig_mod.'. This function strips those prefixes so the state dict can
-    be loaded into an uncompiled model.
-    
-    Args:
-        state_dict: State dict potentially containing '_orig_mod.' prefixes
-    
-    Returns:
-        Cleaned state dict with prefixes removed (if present)
-    """
-    # Check if any key has the _orig_mod prefix
+    """Remove torch.compile '_orig_mod.' key prefixes from a state dict."""
     if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
         print("  ⚠ Detected torch.compile artifacts in state dict, cleaning...")
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('_orig_mod.'):
-                new_key = key.replace('_orig_mod.', '', 1)
-                new_state_dict[new_key] = value
-            else:
-                new_state_dict[key] = value
-        return new_state_dict
+        return {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
     return state_dict
 
 
@@ -69,66 +51,21 @@ def clean_state_dict_for_compilation(state_dict: Dict) -> Dict:
 # ============================================================================
 
 def get_norm_type(config: Dict) -> Optional[str]:
-    """Return the normalization type string, or None if normalization is disabled.
-
-    Reads `data.normalization_type` first. Falls back to the legacy `data.normalize`
-    boolean (True → 'bounds_normalization') for backward compatibility.
-
-    Supported values: 'bounds_normalization', 'data_driven_normalization', None.
-    """
-    norm_type = config['data'].get('normalization_type')
-    if norm_type is not None:
-        return norm_type
-    if config['data'].get('normalize', False):
-        return 'bounds_normalization'
-    return None
-
-
-def extract_bounds_from_config(config: Dict) -> Tuple[np.ndarray, np.ndarray]:
-    """Extract state bounds from config as (min_bounds, max_bounds) arrays of shape (state_dim,).
-
-    Order: [roll, pitch, airspeed_mps, p, q, r, alpha, beta]
-    """
-    bounds = config['state_bounds']
-    keys = ['roll', 'pitch', 'airspeed_mps', 'p', 'q', 'r', 'alpha', 'beta']
-    min_bounds = np.array([bounds[f'{k}_min'] for k in keys], dtype=np.float32)
-    max_bounds = np.array([bounds[f'{k}_max'] for k in keys], dtype=np.float32)
-    return min_bounds, max_bounds
-
-
-def compute_denorm_factors(min_bounds: np.ndarray, max_bounds: np.ndarray) -> np.ndarray:
-    """Return (max - min) / 2 per state — the scale for bounds normalization."""
-    return (max_bounds - min_bounds) / 2.0
+    """Return the normalization type string from config, or None."""
+    return config['data'].get('normalization_type')
 
 
 def compute_data_norm_params(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute per-state mean and std from a (training) dataframe.
-
-    Returns:
-        (mean, std): both of shape (state_dim,), computed on raw physical units.
-        std has a small epsilon added to avoid division by zero.
-    """
+    """Compute per-state mean and std from a (training) dataframe."""
     state_cols = [f's_t_{i}' for i in STATE_INDICES]
     means, stds = [], []
     for col in state_cols:
         values = df[col].values.copy()
-        if col == 's_t_2':  # airspeed: km/h → m/s
+        if col == 's_t_2':
             values = values / 3.6
         means.append(float(np.mean(values)))
         stds.append(float(np.std(values)) + 1e-8)
     return np.array(means, dtype=np.float32), np.array(stds, dtype=np.float32)
-
-
-def compute_actual_scales(df: pd.DataFrame) -> np.ndarray:
-    """Compute per-state mean |value| from training data, used for per-state loss scaling."""
-    state_cols = [f's_t_{i}' for i in STATE_INDICES]
-    scales = []
-    for col in state_cols:
-        values = df[col].values.copy()
-        if col == 's_t_2':  # airspeed: km/h → m/s
-            values = values / 3.6
-        scales.append(np.mean(np.abs(values)))
-    return np.array(scales, dtype=np.float32)
 
 
 def normalize_state_np(
@@ -139,8 +76,8 @@ def normalize_state_np(
 ) -> np.ndarray:
     """Normalize a numpy state array.
 
-    bounds_normalization:      s_norm = (s - offset) / scale - 1   (offset=min, scale=(max-min)/2)
-    data_driven_normalization: s_norm = (s - offset) / scale        (offset=mean, scale=std)
+    bounds_normalization:      s_norm = (s - offset) / scale - 1
+    data_driven_normalization: s_norm = (s - offset) / scale
     """
     if norm_type == 'bounds_normalization':
         return (state - offset) / scale - 1.0
@@ -155,11 +92,6 @@ def normalize_state_torch(
     offset: torch.Tensor,
     norm_type: str,
 ) -> torch.Tensor:
-    """Normalize a torch state tensor.
-
-    bounds_normalization:      s_norm = (s - offset) / scale - 1
-    data_driven_normalization: s_norm = (s - offset) / scale
-    """
     if norm_type == 'bounds_normalization':
         return (state - offset) / scale - 1.0
     if norm_type == 'data_driven_normalization':
@@ -173,11 +105,6 @@ def denormalize_state_torch(
     offset: torch.Tensor,
     norm_type: str,
 ) -> torch.Tensor:
-    """Denormalize a torch state tensor (inverse of normalize_state_torch).
-
-    bounds_normalization:      s_raw = (s_norm + 1) * scale + offset
-    data_driven_normalization: s_raw = s_norm * scale + offset
-    """
     if norm_type == 'bounds_normalization':
         return (state + 1.0) * scale + offset
     if norm_type == 'data_driven_normalization':
@@ -193,12 +120,13 @@ class TrajectoryDataset(torch.utils.data.Dataset):
     """Dataset wrapping trajectory sequences as fixed-length sliding windows."""
 
     def __init__(self, sequences: List[Dict]):
-        # Convert numpy arrays to tensors once at construction; __getitem__ returns pre-built tensors
         self.sequences = [
             {
                 'initial_states': torch.tensor(seq['initial_state'], dtype=torch.float32),
                 'actions':        torch.tensor(seq['actions'],        dtype=torch.float32),
                 'states':         torch.tensor(seq['states'],         dtype=torch.float32),
+                **({'prev_actions': torch.tensor(seq['prev_actions'], dtype=torch.float32)}
+                   if 'prev_actions' in seq else {}),
             }
             for seq in sequences
         ]
@@ -211,23 +139,20 @@ class TrajectoryDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def collate_fn(batch: List[Dict]) -> Dict:
-        return {
+        result = {
             'initial_states': torch.stack([b['initial_states'] for b in batch]),
             'actions':        torch.stack([b['actions']        for b in batch]),
             'states':         torch.stack([b['states']         for b in batch]),
         }
+        if 'prev_actions' in batch[0]:
+            result['prev_actions'] = torch.stack([b['prev_actions'] for b in batch])
+        return result
 
 
 def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     """Load trajectory CSV and return (train_loader, val_loader, test_loader, norm_scale, norm_offset).
 
-    norm_scale and norm_offset encode the normalization parameters:
-      - bounds_normalization:      norm_scale = (max-min)/2, norm_offset = min
-      - data_driven_normalization: norm_scale = std,         norm_offset = mean
-      - no normalization:          norm_scale = (max-min)/2, norm_offset = min  (unused)
-
-    For data-driven normalization the statistics are computed from the training
-    split only to avoid leakage into validation/test data.
+    norm_scale = std, norm_offset = mean (data-driven, computed from training split).
     """
     print(f"\nLoading training data from {csv_path}...")
     df = pd.read_csv(csv_path)
@@ -240,9 +165,8 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     state_cols      = [f's_t_{i}'   for i in STATE_INDICES]
     action_cols     = [f'a_t_{i}'   for i in range(action_dim)]
     next_state_cols = [f's_t+1_{i}' for i in STATE_INDICES]
+    has_prev_action = all(c in df.columns for c in PREV_ACTION_COLS)
 
-    # ── Determine train/val/test split first ─────────────────────────────────
-    # (needed before computing data-driven norm params from training data only)
     trajectories = sorted(df['trajectory_id'].unique().tolist())
     np.random.seed(config['data'].get('random_seed', 42))
     np.random.shuffle(trajectories)
@@ -254,29 +178,13 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     val_ids   = set(trajectories[n_train:n_train + n_val])
     test_ids  = set(trajectories[n_train + n_val:])
 
-    # ── Normalization parameters ──────────────────────────────────────────────
     norm_type = get_norm_type(config)
-    min_bounds, max_bounds = extract_bounds_from_config(config)
+    train_df  = df[df['trajectory_id'].isin(train_ids)]
+    norm_offset, norm_scale = compute_data_norm_params(train_df)
+    print(f"\nData-driven normalization (from {len(train_df)} training rows):")
+    print(f"  Mean (norm_offset): {norm_offset}")
+    print(f"  Std  (norm_scale):  {norm_scale}")
 
-    if norm_type == 'data_driven_normalization':
-        train_df = df[df['trajectory_id'].isin(train_ids)]
-        norm_offset, norm_scale = compute_data_norm_params(train_df)
-        print(f"\nData-driven normalization (computed from {len(train_df)} training rows):")
-        print(f"  Mean (norm_offset): {norm_offset}")
-        print(f"  Std  (norm_scale):  {norm_scale}")
-    elif norm_type == 'bounds_normalization':
-        norm_offset = min_bounds
-        norm_scale  = compute_denorm_factors(min_bounds, max_bounds)
-        print(f"\nBounds normalization (from config):")
-        print(f"  Min (norm_offset): {norm_offset}")
-        print(f"  Max:               {max_bounds}")
-        print(f"  Scale (max-min)/2: {norm_scale}")
-    else:
-        # No normalization — return bounds params for reference (used by ODE but not for norm)
-        norm_offset = min_bounds
-        norm_scale  = compute_denorm_factors(min_bounds, max_bounds)
-
-    # ── Build sequences ───────────────────────────────────────────────────────
     trajectory_sequences_by_traj: Dict = {}
 
     for traj_id, group in df.groupby('trajectory_id'):
@@ -286,8 +194,10 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
         actions     = group[action_cols].values
         next_states = group[next_state_cols].values.copy()
 
-        states[:, 2]      = states[:, 2] / 3.6   # km/h → m/s
+        states[:, 2]      = states[:, 2] / 3.6
         next_states[:, 2] = next_states[:, 2] / 3.6
+
+        prev_actions = group[PREV_ACTION_COLS].values if has_prev_action else None
 
         traj_sequences = []
         for start_idx in range(len(states) - horizon):
@@ -299,11 +209,14 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
                 seq_states      = normalize_state_np(seq_states,      norm_scale, norm_offset, norm_type)
                 seq_next_states = normalize_state_np(seq_next_states, norm_scale, norm_offset, norm_type)
 
-            traj_sequences.append({
+            entry = {
                 'initial_state': seq_states[0].copy(),
                 'actions':       seq_actions.copy(),
                 'states':        seq_next_states.copy(),
-            })
+            }
+            if prev_actions is not None:
+                entry['prev_actions'] = prev_actions[start_idx:start_idx + horizon].copy()
+            traj_sequences.append(entry)
 
         trajectory_sequences_by_traj[traj_id] = traj_sequences
 
@@ -324,13 +237,11 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
             TrajectoryDataset(seqs),
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=0,
+            num_workers=4,
             pin_memory=True,
             collate_fn=TrajectoryDataset.collate_fn,
         )
 
-    # norm_scale / norm_offset replace the old denorm_factors / min_bounds in callers.
-    # Their meaning depends on norm_type; callers must also propagate norm_type.
     return make_loader(train_seqs, shuffle=True), make_loader(val_seqs), make_loader(test_seqs), norm_scale, norm_offset
 
 
@@ -364,7 +275,7 @@ def log_tensorboard_epoch(
     train_metrics: Dict,
     val_metrics: Optional[Dict] = None,
     lambda_current: float = 0.0,
-    grad_metrics: Optional[Dict] = None,
+    grad_norm: Optional[float] = None,
     current_lr: Optional[float] = None,
 ) -> None:
     """Write all epoch-level scalars to TensorBoard in a single call."""
@@ -378,9 +289,8 @@ def log_tensorboard_epoch(
         writer.add_scalar('Epoch/val_loss_trajectory',     val_metrics['loss_trajectory'],      epoch)
         writer.add_scalar('Epoch/val_loss_regularization', val_metrics['loss_regularization'],  epoch)
 
-    if grad_metrics is not None:
-        writer.add_scalar('Gradients/norm_before_clipping', grad_metrics['grad_norm_before_clipping'], epoch)
-        writer.add_scalar('Gradients/norm_after_clipping',  grad_metrics['grad_norm_after_clipping'],  epoch)
+    if grad_norm is not None:
+        writer.add_scalar('Gradients/norm', grad_norm, epoch)
 
     if current_lr is not None:
         writer.add_scalar('Training/learning_rate', current_lr, epoch)
@@ -402,6 +312,7 @@ def save_checkpoint(
     norm_scale: Optional[np.ndarray] = None,
     norm_offset: Optional[np.ndarray] = None,
     arch_config: Optional[Dict] = None,
+    norm_type: Optional[str] = None,
 ) -> None:
     """Save a training checkpoint to disk."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -418,13 +329,14 @@ def save_checkpoint(
     if norm_scale is not None:
         checkpoint['norm_scale']  = norm_scale.tolist()
         checkpoint['norm_offset'] = norm_offset.tolist()
+    if norm_type is not None:
+        checkpoint['norm_type'] = norm_type
     if arch_config is not None:
         checkpoint['arch_config'] = {
-            'activation':   arch_config.get('activation', 'relu'),
-            'hidden_dims':  arch_config.get('hidden_dims', []),
-            'state_dim':    arch_config.get('state_dim', 8),
-            'action_dim':   arch_config.get('action_dim', 3),
-            'use_batch_norm': arch_config.get('use_batch_norm', False),
+            'activation':  arch_config.get('activation', 'relu'),
+            'hidden_dims': arch_config.get('hidden_dims', []),
+            'state_dim':   arch_config.get('state_dim', 8),
+            'action_dim':  arch_config.get('action_dim', 3),
         }
     torch.save(checkpoint, path)
     print(f"Saved checkpoint to {path}")
@@ -440,18 +352,7 @@ def compute_convergence_stats(
     threshold_deg: float = 1.0,
     min_stable_steps: int = 100,
 ) -> Dict:
-    """Detect convergence and measure steady-state stability.
-
-    Convergence is defined as the first step after which the error stays
-    within `threshold_deg` for at least `min_stable_steps` consecutive steps.
-    Steady-state statistics are computed from that point onward (or the last
-    20 % of steps if convergence is never reached).
-
-    Returns a dict with:
-      convergence_step  — step index of first convergence, or None
-      steady_mean_error — mean |angle - target| in steady state [°]
-      steady_std        — std of actual angle in steady state [°] (oscillation measure)
-    """
+    """Detect convergence and measure steady-state stability."""
     errors = np.abs(np.array(history_deg) - target_deg)
     n = len(errors)
 
@@ -476,12 +377,7 @@ def compute_convergence_stats(
 # ============================================================================
 
 def get_env_state(env) -> dict:
-    """Snapshot the physical state of a JSBSim env for later restoration.
-
-    Captures attitude, airspeed, angular rates, altitude and throttle — the
-    variables that fully determine short-horizon dynamics.  Alpha/beta are
-    implicitly encoded in the body-velocity components (u, v, w).
-    """
+    """Snapshot the physical state of a JSBSim env for later restoration."""
     from fw_jsbgym.utils import jsbsim_properties as prp
     sim = env.unwrapped.sim
     return {
@@ -498,10 +394,6 @@ def get_env_state(env) -> dict:
         'beta_rad':              float(sim.fdm['aero/beta-rad']),
         'aileron_cmd':           float(sim[prp.aileron_cmd]),
         'elevator_cmd':          float(sim[prp.elevator_cmd]),
-        # Actual FCS surface positions (after actuator lag dynamics).
-        # Must be set BEFORE run_ic() so JSBSim's force evaluation uses the
-        # correct actuation state and stores the right prev-acceleration in its
-        # internal multi-step integrator buffers (dqUVWidot / dqPQRidot).
         'fcs_aileron_pos_rad':   float(sim.fdm['fcs/left-aileron-pos-rad']),
         'fcs_elevator_pos_rad':  float(sim.fdm['fcs/elevator-pos-rad']),
         'fcs_throttle_pos_norm': float(sim.fdm['fcs/throttle-pos-norm']),
@@ -509,20 +401,10 @@ def get_env_state(env) -> dict:
 
 
 def set_env_state(env, state: dict) -> None:
-    """Restore a JSBSim env to a previously snapshotted state.
-
-    Writes all physical state into JSBSim's IC slots, then sets throttle,
-    control commands, and actual FCS surface positions BEFORE calling run_ic().
-    This ensures the IC force evaluation uses the correct actuation state so
-    that JSBSim's internal multi-step integrator history buffers
-    (dqUVWidot / dqPQRidot) are populated with the right prev-acceleration.
-    Without this, the first post-restore step diverges because the stored
-    acceleration was computed at trim rather than at s0.
-    """
+    """Restore a JSBSim env to a previously snapshotted state."""
     from fw_jsbgym.utils import jsbsim_properties as prp
     sim = env.unwrapped.sim
 
-    # IC attitude / velocity / position
     sim[prp.ic_roll_rad]     = state['roll_rad']
     sim[prp.ic_pitch_rad]    = state['pitch_rad']   - state['alpha_rad']
     sim[prp.ic_heading_rad]  = state['heading_rad'] + state['beta_rad']
@@ -534,8 +416,6 @@ def set_env_state(env, state: dict) -> None:
     sim.fdm['ic/alpha-rad']  = state['alpha_rad']
     sim.fdm['ic/beta-rad']   = state['beta_rad']
 
-    # Set actuation state BEFORE run_ic() so the IC force evaluation uses s0
-    # values and stores the correct prev-acceleration in the integrator deques.
     sim[prp.throttle_cmd]  = state['throttle']
     sim[prp.aileron_cmd]   = state['aileron_cmd']
     sim[prp.elevator_cmd]  = state['elevator_cmd']
@@ -546,114 +426,9 @@ def set_env_state(env, state: dict) -> None:
 
     sim.fdm.run_ic()
 
-    # Restore commands after run_ic() (run_ic may reset some cmd properties)
     sim[prp.throttle_cmd]  = state['throttle']
     sim[prp.aileron_cmd]   = state['aileron_cmd']
     sim[prp.elevator_cmd]  = state['elevator_cmd']
-
-
-def plot_tracking_performance(
-    target_roll: float,
-    target_pitch: float,
-    filename: str = 'tracking_performance.png',
-    mppi_roll: Optional[List[float]] = None,
-    mppi_pitch: Optional[List[float]] = None,
-    pid_roll: Optional[List[float]] = None,
-    pid_pitch: Optional[List[float]] = None,
-    dt: float = 0.01,
-) -> None:
-    """Save a 2-subplot tracking performance figure (roll top, pitch bottom).
-
-    Always saves to FW-FlightControl/fw_flightcontrol/data/mppi-performance/,
-    creating the folder if it does not exist.
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    save_dir = Path(__file__).parent.parent / 'data' / 'mppi-performance'
-    save_dir.mkdir(parents=True, exist_ok=True)
-    save_path = save_dir / filename
-
-    fig, (ax_roll, ax_pitch) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-
-    def time_axis(history):
-        return np.arange(len(history)) * dt
-
-    # --- Roll subplot ---
-    if mppi_roll is not None:
-        t = time_axis(mppi_roll)
-        ax_roll.plot(t, mppi_roll, color='steelblue', linewidth=1.2, label='MPPI')
-        ax_roll.axhline(target_roll, color='red', linestyle='--', linewidth=1.2, label='Target')
-    if pid_roll is not None:
-        t = time_axis(pid_roll)
-        ax_roll.plot(t, pid_roll, color='darkorange', linewidth=1.2, label='PID')
-        if mppi_roll is None:
-            ax_roll.axhline(target_roll, color='red', linestyle='--', linewidth=1.2, label='Target')
-    ax_roll.set_ylabel('Roll angle [°]')
-    ax_roll.legend(loc='upper right')
-    ax_roll.grid(True, alpha=0.3)
-
-    # --- Pitch subplot ---
-    if mppi_pitch is not None:
-        t = time_axis(mppi_pitch)
-        ax_pitch.plot(t, mppi_pitch, color='steelblue', linewidth=1.2, label='MPPI')
-        ax_pitch.axhline(target_pitch, color='red', linestyle='--', linewidth=1.2, label='Target')
-    if pid_pitch is not None:
-        t = time_axis(pid_pitch)
-        ax_pitch.plot(t, pid_pitch, color='darkorange', linewidth=1.2, label='PID')
-        if mppi_pitch is None:
-            ax_pitch.axhline(target_pitch, color='red', linestyle='--', linewidth=1.2, label='Target')
-    ax_pitch.set_ylabel('Pitch angle [°]')
-    ax_pitch.set_xlabel('Time [s]')
-    ax_pitch.legend(loc='upper right')
-    ax_pitch.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Tracking plot saved to {save_path}")
-
-
-def plot_action_history(
-    filename: str = 'action_history.png',
-    mppi_actions: Optional[np.ndarray] = None,
-    pid_actions: Optional[np.ndarray] = None,
-    dt: float = 0.01,
-) -> None:
-    """Save a 3-subplot action history figure (aileron, elevator, throttle).
-
-    mppi_actions / pid_actions: arrays of shape (N, 3) — columns are
-    [aileron, elevator, throttle]. Either may be None.
-    Saved to FW-FlightControl/fw_flightcontrol/data/mppi-performance/.
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    save_dir = Path(__file__).parent.parent / 'data' / 'mppi-performance'
-    save_dir.mkdir(parents=True, exist_ok=True)
-    save_path = save_dir / filename
-
-    labels   = ['Aileron command [-]', 'Elevator command [-]', 'Throttle command [-]']
-    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-
-    for i, (ax, ylabel) in enumerate(zip(axes, labels)):
-        if mppi_actions is not None:
-            t = np.arange(len(mppi_actions)) * dt
-            ax.plot(t, mppi_actions[:, i], color='steelblue', linewidth=1.0, label='MPPI')
-        if pid_actions is not None:
-            t = np.arange(len(pid_actions)) * dt
-            ax.plot(t, pid_actions[:, i], color='darkorange', linewidth=1.0, label='PID')
-        ax.set_ylabel(ylabel)
-        ax.legend(loc='upper right')
-        ax.grid(True, alpha=0.3)
-
-    axes[-1].set_xlabel('Time [s]')
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Action history plot saved to {save_path}")
 
 
 # ============================================================================
@@ -683,7 +458,7 @@ def suppress_output():
 
 
 def _throttle_patch(env) -> Tuple:
-    """Monkey-patch apply_action so MPPI can override throttle. Returns (ref, restore_fn)."""
+    """Monkey-patch apply_action so MPPI can override throttle."""
     from fw_jsbgym.utils import jsbsim_properties as prp
     throttle_ref = [0.3]
     original = env.unwrapped.apply_action
