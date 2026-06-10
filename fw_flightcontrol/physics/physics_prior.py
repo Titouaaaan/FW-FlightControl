@@ -158,9 +158,6 @@ class PhysicsPrior(torch.nn.Module):
         # ===================== ANGULAR RATE DERIVATIVES =====================
         
         # Aerodynamic moments
-        # NOTE: JSBSim coefficients C_l, C_m, C_n contain pre-scaled dynamic pressure factors
-        # So we divide by q_dyn instead of multiplying. This ensures moment = coeff / q_dyn
-        # BUT IDK IF WE CAN DO THIS, LIKE THERE IS NO PROOF FOR IT T_T
         q_dyn_b = 0.5 * self.rho * Va**2 * self.S * self.b
         q_dyn_c = 0.5 * self.rho * Va**2 * self.S * self.c
         

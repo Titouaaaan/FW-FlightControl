@@ -282,11 +282,7 @@ def train_aphynity_epoch(
         prediction_error = prediction_error / (per_state_scales ** 2)
     trajectory_loss = torch.norm(prediction_error, p=2, dim=2).mean()  # Average L2 norm
     
-    # Check for NaN in trajectory loss
     if torch.isnan(trajectory_loss):
-        print(f"NaN detected in trajectory_loss")
-        print(f"  prediction_error range: [{prediction_error.min()}, {prediction_error.max()}]")
-        print(f"  trajectory_loss: {trajectory_loss}")
         raise ValueError("NaN in trajectory loss")
     
     # Regularization loss: keep residual magnitudes small (only if model uses residual)
@@ -297,22 +293,14 @@ def train_aphynity_epoch(
         # No residual component; regularization is zero
         regularization_loss = torch.tensor(0.0, device=initial_states.device, dtype=initial_states.dtype)
     
-    # Check for NaN in regularization loss
     if torch.isnan(regularization_loss):
-        print(f"NaN detected in regularization_loss")
-        print(f"  residual_norms: {torch.stack(residual_norms)}")
         raise ValueError("NaN in regularization loss")
     
     # Combined APHYNITY loss: regularization + λ * trajectory_loss
     # Note: τ_1 is applied to gradients, not the loss itself (see APHYNITY paper)
     total_loss = regularization_loss + lambda_current * trajectory_loss
     
-    # Check for NaN in total loss
     if torch.isnan(total_loss):
-        print(f"NaN detected in total_loss")
-        print(f"  regularization_loss: {regularization_loss}")
-        print(f"  lambda_current: {lambda_current}")
-        print(f"  trajectory_loss: {trajectory_loss}")
         raise ValueError("NaN in total loss")
     
     # ========================================================================
@@ -361,37 +349,3 @@ def train_aphynity_epoch(
     }
 
 
-def train_phihp_epoch(
-    hybrid_model: nn.Module,
-    trajectory_batch: Dict,
-    optimizer: Optimizer,
-    device: torch.device = torch.device('cpu')
-) -> Dict:
-    """
-    PhIHP training: one-step prediction error only (baseline).
-    
-    This approach ignores error compounding and optimizes single-step accuracy.
-    Useful as a simpler baseline for comparison.
-    
-    TODO: Implement this approach
-    """
-    pass
-
-
-def train_hybrid_epoch(
-    hybrid_model: nn.Module,
-    trajectory_batch: Dict,
-    optimizer: Optimizer,
-    device: torch.device = torch.device('cpu')
-) -> Dict:
-    """
-    Hybrid training: H-step prediction with loss only on final state.
-    
-    Balances between APHYNITY (all steps) and PhIHP (single step by doing
-    multi-step prediction but only measuring error at the end.
-    
-    TODO: Implement this approach
-    """
-    pass
-
-    

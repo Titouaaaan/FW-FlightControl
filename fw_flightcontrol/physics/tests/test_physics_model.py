@@ -21,8 +21,7 @@ from tqdm import tqdm
 import pandas as pd
 from torchdiffeq import odeint
 
-# Add project to path
-sys.path.insert(0, '/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl')
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from fw_flightcontrol.physics.physics_prior import PhysicsPrior
 from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel

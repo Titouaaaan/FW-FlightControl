@@ -204,6 +204,8 @@ def main():
     parser.add_argument('--device',            type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--log-every',         type=int,   default=1)
+    parser.add_argument('--save-dir',          type=str,   default=str(SAVE_DIR),
+                        help='Directory to save plot and metrics CSV')
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -249,12 +251,13 @@ def main():
     )
 
     tag = f"r{args.target_roll:.0f}_p{args.target_pitch:.0f}"
-    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
     plot_model_result(result, args.target_roll, args.target_pitch,
-                      SAVE_DIR / f"{_safe_label(result['label'])}_{tag}.png",
+                      save_dir / f"{_safe_label(result['label'])}_{tag}.png",
                       target_va=TARGET_VA_KPH)
     save_metrics([result], args.target_roll, args.target_pitch,
-                 SAVE_DIR / f"metrics_{tag}_{_safe_label(result['label'])}.csv")
+                 save_dir / f"metrics_{tag}_{_safe_label(result['label'])}.csv")
 
 
 if __name__ == '__main__':
