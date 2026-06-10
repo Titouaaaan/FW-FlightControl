@@ -56,7 +56,7 @@ from fw_flightcontrol.physics.utils import (
 )
 from fw_flightcontrol.physics.physics_prior import PhysicsPrior
 from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel
-from fw_flightcontrol.physics.tests.mppi_test import MPPIController, rollout_trajectories
+from fw_flightcontrol.physics.mppi import MPPIController, rollout_trajectories
 
 # ============================================================================
 # PATHS
@@ -68,7 +68,7 @@ MODELS_DIR    = _PHYSICS_DIR / 'models'
 CONFIG_DIR    = str(_FC_DIR / 'config')
 NOATMO_YAML   = str(_FC_DIR / 'config' / 'env' / 'jsbsim' / 'noatmo.yaml')
 TRAINING_YAML = str(_PHYSICS_DIR / 'training_params.yaml')
-SAVE_DIR      = _FC_DIR / 'data' / 'iterative_mppi_easytarget_H20_samples1000'
+SAVE_DIR      = Path(__file__).parent.parent / 'data' / 'plots' / 'full_analysis'
 
 DT           = 0.01
 STEPS_20S    = 2000   # 20 s at 0.01 s/step
@@ -471,6 +471,8 @@ def main():
                         choices=['none', 'plot_anim', 'plot_end', 'ext_log', 'fgear', 'fgear_plot'],
                         help='Visualization mode for the main env of each run (default: none). '
                              'plot_anim requires: sudo apt install python3-tk')
+    parser.add_argument('--save-dir',         type=str, default=str(SAVE_DIR),
+                        help='Directory to save plots and metrics CSV')
     args = parser.parse_args()
 
     device   = torch.device(args.device)
@@ -518,14 +520,16 @@ def main():
             render_mode=args.render_mode,
         ))
 
-    print(f"\nSaving plots to {SAVE_DIR}/")
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nSaving plots to {save_dir}/")
     for res in results:
         fname = f"{_safe_label(res['label'])}_{tag}_plots.png"
-        plot_model_result(res, args.target_roll, args.target_pitch, SAVE_DIR / fname,
+        plot_model_result(res, args.target_roll, args.target_pitch, save_dir / fname,
                           target_va=TARGET_VA_KPH)
 
     save_metrics(results, args.target_roll, args.target_pitch,
-                 SAVE_DIR / f"metrics_{tag}.csv")
+                 save_dir / f"metrics_{tag}.csv")
 
 # example to run:
 # python full_mppi_analysis.py --target-roll 55 --target-pitch 28 --mppi-samples 500 --steps 2000

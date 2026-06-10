@@ -471,7 +471,7 @@ def main(cfg: DictConfig):
         print_trajectory_summary(trajectory_results)
         
         # Save trajectory data to CSV file
-        output_file = f'../data/trajectory_data_pid_converged.csv'
+        output_file = str(Path(__file__).parent / 'trajectory_data_pid_converged.csv')
         csv_file = save_trajectory_data_to_csv(trajectory_results, output_file)
         
         print(f"\n{'='*100}")

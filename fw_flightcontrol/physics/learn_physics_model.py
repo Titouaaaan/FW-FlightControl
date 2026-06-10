@@ -411,7 +411,7 @@ def main(resume_checkpoint: Optional[str] = None):
         start_epoch  = resume_state['start_epoch']
 
     # Load data
-    csv_path = Path(__file__).parent.parent / "data" / "updated_trajectory_data_progressive_noatmo_2.0.csv"
+    csv_path = Path(__file__).parent / "data" / "updated_trajectory_data_progressive_noatmo_2.0.csv"
     train_loader, val_loader, _, denorm_factors, min_bounds = load_trajectory_data(str(csv_path), config)
     denorm_factors_torch = torch.tensor(denorm_factors, dtype=torch.float32, device=device)
     min_bounds_torch     = torch.tensor(min_bounds,     dtype=torch.float32, device=device)

@@ -181,7 +181,7 @@ def main():
     print("Approach: Teacher Forcing via odeint() - Prior Only (No Residuals)")
     print("="*100 + "\n")
     
-    csv_path = Path('/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl/fw_flightcontrol/data/updated_trajectory_data_noatmo.csv')
+    csv_path = Path(__file__).parent.parent / 'data' / 'updated_trajectory_data_noatmo.csv'
     
     if not csv_path.exists():
         print(f"Error: {csv_path} not found!")
