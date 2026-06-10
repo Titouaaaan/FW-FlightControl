@@ -23,7 +23,7 @@ from fw_flightcontrol.physics.utils import (
 
 DT            = 0.01
 TARGET_VA_KPH = 60.0
-SAVE_DIR      = Path(__file__).parent.parent.parent / 'data' / 'blabla'
+SAVE_DIR      = Path(__file__).parent.parent.parent / 'data' / 'sanity-check'
 
 
 # ── Control loop ───────────────────────────────────────────────────────────────

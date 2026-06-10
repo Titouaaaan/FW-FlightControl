@@ -37,19 +37,24 @@ class HybridDynamicsODE(nn.Module):
     """
     def __init__(self, hybrid_model: nn.Module, device: torch.device = torch.device('cpu'),
                  denorm_factors: torch.Tensor = None, min_bounds: torch.Tensor = None,
-                 norm_type: Optional[str] = None):
+                 norm_type: Optional[str] = None, residual_clamp: float = None):
         super().__init__()
         self.model = hybrid_model
         self.device = device
         self.current_action = None
+        self.current_prev_action = None
         self.denorm_factors = denorm_factors  # (max-min)/2 for bounds, std for data-driven
         self.min_bounds = min_bounds          # min for bounds, mean for data-driven
         self.norm_type = norm_type            # 'bounds_normalization' | 'data_driven_normalization' | None
+        self.residual_clamp = residual_clamp
         self._capture_next = False
         self.captured_residual_norm = None
 
     def set_action(self, action: torch.Tensor):
         self.current_action = action
+
+    def set_prev_action(self, prev_action):
+        self.current_prev_action = prev_action
 
     def arm_capture(self):
         """Arm to capture the residual norm on the next forward call (k1 for RK4).
@@ -82,7 +87,9 @@ class HybridDynamicsODE(nn.Module):
             if self.model.with_prior:
                 dx_dt = self.model.physics_prior(state_raw, self.current_action)
             if self.model.with_residual:
-                residual_output = self.model.residual_network(state_raw, self.current_action)
+                residual_output = self.model.residual_network(state_raw, self.current_action, self.current_prev_action)
+                if self.residual_clamp is not None:
+                    residual_output = residual_output.clamp(-self.residual_clamp, self.residual_clamp)
                 if self._capture_next:
                     self.captured_residual_norm = torch.norm(residual_output, p=2, dim=1).mean()
                     self._capture_next = False
@@ -94,7 +101,10 @@ class HybridDynamicsODE(nn.Module):
         # Normalization path: residual sees normalized state, derivatives returned in raw space
         state_norm = self._normalize_state(state_raw)
         prior_deriv = self.model.physics_prior(state_raw, self.current_action)
-        residual_output = self.model.residual_network(state_norm, self.current_action)
+        residual_output = self.model.residual_network(state_norm, self.current_action, self.current_prev_action)
+
+        if self.residual_clamp is not None:
+            residual_output = residual_output.clamp(-self.residual_clamp, self.residual_clamp)
 
         if self._capture_next:
             self.captured_residual_norm = torch.norm(
