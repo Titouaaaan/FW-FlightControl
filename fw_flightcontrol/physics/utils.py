@@ -290,7 +290,11 @@ def log_tensorboard_epoch(
         writer.add_scalar('Epoch/val_loss_regularization', val_metrics['loss_regularization'],  epoch)
 
     if grad_norm is not None:
-        writer.add_scalar('Gradients/norm', grad_norm, epoch)
+        if isinstance(grad_norm, dict):
+            for k, v in grad_norm.items():
+                writer.add_scalar(f'Gradients/{k}', v, epoch)
+        else:
+            writer.add_scalar('Gradients/norm', grad_norm, epoch)
 
     if current_lr is not None:
         writer.add_scalar('Training/learning_rate', current_lr, epoch)

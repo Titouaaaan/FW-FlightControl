@@ -32,7 +32,7 @@ from fw_flightcontrol.physics.physics_prior import PhysicsPrior
 from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel
 from fw_flightcontrol.physics.training_objective import train_aphynity_epoch, HybridDynamicsODE
 from fw_flightcontrol.physics.utils import (
-    load_config, load_trajectory_data, compute_actual_scales, get_norm_type,
+    load_config, load_trajectory_data, get_norm_type,
     normalize_state_torch, denormalize_state_torch,
     log_epoch_summary, log_tensorboard_epoch, save_checkpoint,
 )
@@ -68,6 +68,7 @@ def initialize_models(config: Dict, device: torch.device) -> Tuple[PhysicsAugmen
         action_dim=net_config['action_dim'],
         hidden_dims=net_config['hidden_dims'],
         activation=net_config['activation'],
+        use_batch_norm=net_config['use_batch_norm'],
     )
     num_residual_params = sum(p.numel() for p in residual_network.parameters())
     print(f"  ✓ Created MLP with {num_residual_params:,} trainable parameters")

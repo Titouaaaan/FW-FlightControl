@@ -173,5 +173,5 @@ logging:
   
   # Output directories
   checkpoint_dir: ./checkpoints
-  checkpoint_subdirectory: exp_v1.0
+  checkpoint_subdirectory: REPRODUCE_MODELv2
   log_dir: ./logs
