@@ -1,2 +1,0 @@
-label,steps,terminated,avg_step_time_ms,roll_mean_err_deg,roll_converged_step,roll_converged_s,roll_ss_mean_err_deg,roll_ss_std_deg,pitch_mean_err_deg,pitch_converged_step,pitch_converged_s,pitch_ss_mean_err_deg,pitch_ss_std_deg
-hybrid_model,2000,True,352.19,2.82,721,7.21,0.36,0.18,4.05,never,never,2.34,0.22

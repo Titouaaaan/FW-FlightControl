@@ -1,7 +1,0 @@
-label,steps,terminated,avg_step_time_ms,roll_mean_err_deg,roll_converged_step,roll_converged_s,roll_ss_mean_err_deg,roll_ss_std_deg,pitch_mean_err_deg,pitch_converged_step,pitch_converged_s,pitch_ss_mean_err_deg,pitch_ss_std_deg
-PID,2000,True,0.35,5.40,never,never,1.88,0.29,3.28,373,3.73,0.96,1.19
-Prior_only,2000,True,706.24,2.99,1107,11.07,0.36,0.42,6.39,never,never,4.57,0.73
-data_norm_model,2000,True,702.79,2.40,424,4.24,0.44,0.27,5.91,never,never,4.99,0.40
-hard_targets_residual_model_v0.1,2000,True,710.50,2.79,307,3.07,0.33,0.38,9.02,never,never,7.33,0.46
-mppi_data_model,2000,True,705.20,20.46,never,never,22.20,6.15,36.19,never,never,49.91,5.90
-JSBSim_env,2000,True,14097.07,1.75,148,1.48,0.18,0.17,3.29,never,never,1.60,0.22

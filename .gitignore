@@ -25,11 +25,13 @@ fw_flightcontrol/eval/waypoint_tracking/outputs/trajectories/*
 
 fw_flightcontrol/physics/plots
 
-fw_flightcontrol/data/updated_trajectory_data_progressive_noatmo_2.0.csv
-fw_flightcontrol/data/trajectory_data_nominal_and_hard_targets.csv
-fw_flightcontrol/data/trajectory_data_pid_pe.csv
-fw_flightcontrol/data/trajectory_data_mppi_prior.csv
-fw_flightcontrol/data/trajectory_data_pid_converged.csv
+fw_flightcontrol/physics/data/plots
+
+fw_flightcontrol/physics/data/trajectory_data_nominal_and_hard_targets.csv
+fw_flightcontrol/physics/data/trajectory_data_pid_pe.csv
+fw_flightcontrol/physics/data/trajectory_data_mppi_prior.csv
+fw_flightcontrol/physics/data/trajectory_data_pid_converged.csv
+fw_flightcontrol/physics/data/updated_trajectory_data_noatmo.csv
 
 # Exceptions
 !fw_flightcontrol/eval/outputs/icinco/
