@@ -1,110 +1,59 @@
-# Training parameters for hybrid physics-augmented world model
-# This config controls all aspects of APHYNITY training
-
-# ============================================================================
-# NETWORK ARCHITECTURE
-# ============================================================================
 network:
-  # State and action dimensions
   state_dim: 8          # [phi, theta, Va, p, q, r, alpha, beta]
   action_dim: 3         # [delta_a, delta_e, throttle]
   
-  # Residual network hidden layers
   hidden_dims: [256,256]
   activation: relu
   use_batch_norm: false
 
 
-# ============================================================================
-# TRAINING HYPERPARAMETERS
-# ============================================================================
 training:
-  # Trajectory prediction horizon (number of simulation steps)
   # Each step is 0.01 seconds, so horizon=20 means 0.2 seconds prediction
   horizon: 10
-  
-  # Batch parameters
   batch_size: 256
   num_epochs: 1000
   
-  # Actual learning rate is set via aphynity.tau_1 (passed to Adam optimizer)
-  
-  # Learning rate scheduler (optional)
   scheduler:
     enabled: true
-    type: 'steplr'        # Options: 'steplr', 'exponential', 'cosine'
-    step_size: 20         # Decay every N epochs
-    gamma: 0.7            # Multiply LR by this factor (0.7 = 30% reduction per step)
-    min_lr: 0.0001        # Floor - don't go below this
+    type: 'steplr'        
+    step_size: 20         
+    gamma: 0.7           
+    min_lr: 0.0001        
+    grad_clip_norm: 3.0
   
-  # Gradient clipping for stability
-  grad_clip_norm: 3.0
-  
-  # Validation frequency
-  val_freq: 1           # Validate every epoch
-  checkpoint_freq: 10   # Save checkpoint every N epochs
+  val_freq: 1           
+  checkpoint_freq: 10   
 
 
-# ============================================================================
-# APHYNITY DUAL ASCENT PARAMETERS
-# ============================================================================
 aphynity:
-  # Learning rate coefficient (handled by Adam optimizer)
-  tau_1: 0.001            # Learning rate for Adam optimizer (official APHYNITY pendulum uses 1e-3)
-                          # Passed to optimizer, NOT applied as gradient scaling
-  # Lagrange multiplier initialization and update
-  lambda_init: 1.0        # Initial λ (balanced: reg=1.0, trajectory_loss weighted by λ)
+  tau_1: 0.001            # Learning rate for Adam optimizer 
+  lambda_init: 1.0       
   tau_2: 0.01              # Step size for dual ascent: λ_{j+1} = λ_j + τ_2 * L_traj
-                          # Conservative value; can increase to 1.0 after verifying numerical stability
-  
-  # Lagrange multiplier bounds
-  # NOTE: Official APHYNITY has NO upper bound - lambda grows naturally
-  # Setting to high value for safety (detects pathological loss explosion only)
+
   lambda_max: 100000.0      
-  lambda_min: 0.01         # Prevent numerical issues at very low values
+  lambda_min: 0.01         
 
 
-# ============================================================================
-# ODE INTEGRATION SETTINGS
-# ============================================================================
 integration:
-  # Simulation step size (100 Hz environment)
-  dt: 0.01
-  
-  # Integration method for HybridDynamicsModel
-  # Options: 
-  #   'rk4' - 4th order Runge-Kutta (faster, adequate accuracy for training)
-  #   'dopri8' - 8th order (slower, higher accuracy, better for fine-tuned testing)
-  method: rk4
-  
-  # For adaptive step solvers (torchdiffeq odeint parameters)
+  dt: 0.01  # Simulation step size (100 Hz environment)
+  method: rk4 # dopri8 also works but is more costly
   rtol: 1.0e-5
   atol: 1.0e-6
 
-
-# ============================================================================
-# DATA HANDLING
-# ============================================================================
 data:
-  # Train/val/test split
   train_fraction: 0.85
   val_fraction: 0.1
   test_fraction: 0.05
   
-  # Sequence sampling
   random_seed: 0
   shuffle: true
 
 
-# ============================================================================
-# LOGGING AND CHECKPOINTING
-# ============================================================================
 logging:
   verbose: true
-  log_freq: 10          # Log metrics every N batches
+  log_freq: 10          
   tensorboard: true
   
-  # Output directories
   checkpoint_dir: ./checkpoints
   checkpoint_subdirectory: REPRODUCE_MODELv2
   log_dir: ./logs
