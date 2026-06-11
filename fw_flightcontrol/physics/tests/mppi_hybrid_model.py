@@ -32,9 +32,6 @@ def run_mppi_hybrid(
     env,
     hybrid_model,
     model_config,
-    norm_scale,
-    norm_offset,
-    norm_type,
     target_roll:  float,
     target_pitch: float,
     max_steps:    int,
@@ -47,18 +44,6 @@ def run_mppi_hybrid(
 
     Prints per-step state and a summary at the end.
     Returns a result dict in the same format as run_mppi_oracle.
-
-    Args:
-        env           : initialized JSBSim gymnasium environment
-        hybrid_model  : loaded HybridDynamicsModel (eval mode)
-        model_config  : training config dict
-        norm_scale / norm_offset / norm_type : normalization from checkpoint
-        target_roll/pitch : attitude setpoints [°]
-        max_steps     : maximum simulation steps
-        mppi_cfg      : samples, horizon, temperature, noise_std, residual_clamp
-        seed          : numpy RNG seed
-        device        : torch device
-        log_every     : print a row every N steps (0 = silent)
     """
     thr_ref, restore = _throttle_patch(env)
 
@@ -103,8 +88,7 @@ def run_mppi_hybrid(
             for i in range(n_iters):
                 sampled = controller.sample_actions()
                 trajs   = rollout_trajectories(
-                    obs, sampled, hybrid_model, model_config,
-                    norm_scale, norm_offset, norm_type, device,
+                    obs, sampled, hybrid_model, model_config, device,
                     residual_clamp=mppi_cfg.get('residual_clamp'),
                 )
                 costs = compute_costs(trajs, target_roll, target_pitch)
@@ -191,13 +175,13 @@ def main():
     parser.add_argument('--mppi-temperature',  type=float, default=0.5)
     parser.add_argument('--mppi-noise-std',    type=float, default=0.4)
     parser.add_argument('--min-std',           type=float, default=0.05,
-                        help='sig floor — prevents over-exploitation (eq. 5 of TD-MPC)')
+                        help='sigma floor — prevents over-exploitation')
     parser.add_argument('--mppi-iters',        type=int,   default=1,
                         help='MPPI refinement passes per step (default: 1)')
     parser.add_argument('--num-elites',        type=int,   default=64,
-                        help='Top-k trajectories used for mu/sig update (TD-MPC: 64 of 512)')
+                        help='Top-k trajectories used for mu/sigma update')
     parser.add_argument('--momentum',          type=float, default=0.1,
-                        help='Mean momentum across iterations (TD-MPC: 0.1)')
+                        help='Mean momentum across iterations')
     parser.add_argument('--residual-clamp',    type=float, default=None,
                         help='Clamp residual output to [-x, x] to prevent OOD explosion')
     parser.add_argument('--seed',              type=int,   default=42)
@@ -210,7 +194,7 @@ def main():
 
     device = torch.device(args.device)
 
-    hybrid_model, model_config, norm_scale, norm_offset, norm_type = load_config_and_model(
+    hybrid_model, model_config = load_config_and_model(
         args.checkpoint, args.config, device
     )
 
@@ -240,7 +224,7 @@ def main():
     )
 
     result = run_mppi_hybrid(
-        env, hybrid_model, model_config, norm_scale, norm_offset, norm_type,
+        env, hybrid_model, model_config,
         target_roll=args.target_roll,
         target_pitch=args.target_pitch,
         max_steps=args.steps,
@@ -262,20 +246,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-'''
-Notes:
-
-for hybrid model: iterations seems to hurt the model, 
-higher noise (0.5) allows to reach the target but we get oscillations and model cant
-seem to converge
-with low noise it converges but always to a value slightly lower (2.5° lower than the target)
-low noise also gives less action oscillation
-
-for temperature 0.5 seems best
-
-concerning top k candidates (testing rn need to update)
-
-concenrining horizon, 40 works best, 20 degrades only slightly
-
-'''

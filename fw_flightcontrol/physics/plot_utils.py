@@ -306,15 +306,17 @@ def plot_all_epoch_metrics(log_dir, env_name=DEFAULT_ENV_NAME):
 
 
 if __name__ == '__main__':
-    # Extract and plot from most recent training run
-    log_dir = Path('/d/tguerin/Documents/TDMPC_WORKSPACE/FW-FlightControl/fw_flightcontrol/logs/tensorboard/20260420_140233')
-    env_name = 'uav_env'  # Save plots to plots/uav_env/
-    
+    import argparse
+    parser = argparse.ArgumentParser(description='Generate training plots from TensorBoard logs')
+    parser.add_argument('log_dir', type=str, help='Path to TensorBoard log directory')
+    parser.add_argument('--env-name', type=str, default='uav_env',
+                        help='Environment name for output folder (default: uav_env)')
+    args = parser.parse_args()
+
+    log_dir = Path(args.log_dir)
     if not log_dir.exists():
         print(f"Error: Log directory not found: {log_dir}")
         exit(1)
-    
-    # Generate all plots
-    saved_figs = plot_all_epoch_metrics(log_dir, env_name=env_name)
-    
+
+    saved_figs = plot_all_epoch_metrics(log_dir, env_name=args.env_name)
     print("Plot generation complete!")

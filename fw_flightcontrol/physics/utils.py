@@ -25,8 +25,6 @@ STATE_NAMES = [
     "AoS   (s9) [rad]",
 ]
 
-PREV_ACTION_COLS = ['s_t_10', 's_t_11']
-
 
 # ============================================================================
 # CONFIG
@@ -47,13 +45,8 @@ def clean_state_dict_for_compilation(state_dict: Dict) -> Dict:
 
 
 # ============================================================================
-# NORMALIZATION
+# NORMALIZATION  (data-driven: z-score  s_norm = (s - mean) / std)
 # ============================================================================
-
-def get_norm_type(config: Dict) -> Optional[str]:
-    """Return the normalization type string from config, or None."""
-    return config['data'].get('normalization_type')
-
 
 def compute_data_norm_params(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     """Compute per-state mean and std from a (training) dataframe."""
@@ -68,48 +61,19 @@ def compute_data_norm_params(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     return np.array(means, dtype=np.float32), np.array(stds, dtype=np.float32)
 
 
-def normalize_state_np(
-    state: np.ndarray,
-    scale: np.ndarray,
-    offset: np.ndarray,
-    norm_type: str,
-) -> np.ndarray:
-    """Normalize a numpy state array.
-
-    bounds_normalization:      s_norm = (s - offset) / scale - 1
-    data_driven_normalization: s_norm = (s - offset) / scale
-    """
-    if norm_type == 'bounds_normalization':
-        return (state - offset) / scale - 1.0
-    if norm_type == 'data_driven_normalization':
-        return (state - offset) / scale
-    raise ValueError(f"Unknown normalization type: {norm_type!r}")
+def normalize_state_np(state: np.ndarray, scale: np.ndarray, offset: np.ndarray) -> np.ndarray:
+    """Normalize a numpy state array: s_norm = (s - mean) / std."""
+    return (state - offset) / scale
 
 
-def normalize_state_torch(
-    state: torch.Tensor,
-    scale: torch.Tensor,
-    offset: torch.Tensor,
-    norm_type: str,
-) -> torch.Tensor:
-    if norm_type == 'bounds_normalization':
-        return (state - offset) / scale - 1.0
-    if norm_type == 'data_driven_normalization':
-        return (state - offset) / scale
-    raise ValueError(f"Unknown normalization type: {norm_type!r}")
+def normalize_state_torch(state: torch.Tensor, scale: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+    """Normalize a torch state tensor: s_norm = (s - mean) / std."""
+    return (state - offset) / scale
 
 
-def denormalize_state_torch(
-    state: torch.Tensor,
-    scale: torch.Tensor,
-    offset: torch.Tensor,
-    norm_type: str,
-) -> torch.Tensor:
-    if norm_type == 'bounds_normalization':
-        return (state + 1.0) * scale + offset
-    if norm_type == 'data_driven_normalization':
-        return state * scale + offset
-    raise ValueError(f"Unknown normalization type: {norm_type!r}")
+def denormalize_state_torch(state: torch.Tensor, scale: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+    """Denormalize a torch state tensor: s = s_norm * std + mean."""
+    return state * scale + offset
 
 
 # ============================================================================
@@ -125,8 +89,6 @@ class TrajectoryDataset(torch.utils.data.Dataset):
                 'initial_states': torch.tensor(seq['initial_state'], dtype=torch.float32),
                 'actions':        torch.tensor(seq['actions'],        dtype=torch.float32),
                 'states':         torch.tensor(seq['states'],         dtype=torch.float32),
-                **({'prev_actions': torch.tensor(seq['prev_actions'], dtype=torch.float32)}
-                   if 'prev_actions' in seq else {}),
             }
             for seq in sequences
         ]
@@ -139,20 +101,18 @@ class TrajectoryDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def collate_fn(batch: List[Dict]) -> Dict:
-        result = {
+        return {
             'initial_states': torch.stack([b['initial_states'] for b in batch]),
             'actions':        torch.stack([b['actions']        for b in batch]),
             'states':         torch.stack([b['states']         for b in batch]),
         }
-        if 'prev_actions' in batch[0]:
-            result['prev_actions'] = torch.stack([b['prev_actions'] for b in batch])
-        return result
 
 
 def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     """Load trajectory CSV and return (train_loader, val_loader, test_loader, norm_scale, norm_offset).
 
-    norm_scale = std, norm_offset = mean (data-driven, computed from training split).
+    norm_scale = std, norm_offset = mean (computed from training split).
+    States are always normalized before being stored in the dataset.
     """
     print(f"\nLoading training data from {csv_path}...")
     df = pd.read_csv(csv_path)
@@ -165,7 +125,6 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     state_cols      = [f's_t_{i}'   for i in STATE_INDICES]
     action_cols     = [f'a_t_{i}'   for i in range(action_dim)]
     next_state_cols = [f's_t+1_{i}' for i in STATE_INDICES]
-    has_prev_action = all(c in df.columns for c in PREV_ACTION_COLS)
 
     trajectories = sorted(df['trajectory_id'].unique().tolist())
     np.random.seed(config['data'].get('random_seed', 42))
@@ -178,8 +137,7 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     val_ids   = set(trajectories[n_train:n_train + n_val])
     test_ids  = set(trajectories[n_train + n_val:])
 
-    norm_type = get_norm_type(config)
-    train_df  = df[df['trajectory_id'].isin(train_ids)]
+    train_df = df[df['trajectory_id'].isin(train_ids)]
     norm_offset, norm_scale = compute_data_norm_params(train_df)
     print(f"\nData-driven normalization (from {len(train_df)} training rows):")
     print(f"  Mean (norm_offset): {norm_offset}")
@@ -197,26 +155,17 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
         states[:, 2]      = states[:, 2] / 3.6
         next_states[:, 2] = next_states[:, 2] / 3.6
 
-        prev_actions = group[PREV_ACTION_COLS].values if has_prev_action else None
-
         traj_sequences = []
         for start_idx in range(len(states) - horizon):
-            seq_states      = states[start_idx:start_idx + horizon]
+            seq_states      = normalize_state_np(states[start_idx:start_idx + horizon],      norm_scale, norm_offset)
             seq_actions     = actions[start_idx:start_idx + horizon]
-            seq_next_states = next_states[start_idx:start_idx + horizon]
+            seq_next_states = normalize_state_np(next_states[start_idx:start_idx + horizon], norm_scale, norm_offset)
 
-            if norm_type is not None:
-                seq_states      = normalize_state_np(seq_states,      norm_scale, norm_offset, norm_type)
-                seq_next_states = normalize_state_np(seq_next_states, norm_scale, norm_offset, norm_type)
-
-            entry = {
+            traj_sequences.append({
                 'initial_state': seq_states[0].copy(),
                 'actions':       seq_actions.copy(),
                 'states':        seq_next_states.copy(),
-            }
-            if prev_actions is not None:
-                entry['prev_actions'] = prev_actions[start_idx:start_idx + horizon].copy()
-            traj_sequences.append(entry)
+            })
 
         trajectory_sequences_by_traj[traj_id] = traj_sequences
 
@@ -313,10 +262,6 @@ def save_checkpoint(
     lambda_current: float,
     train_history: Dict,
     val_history: Dict,
-    norm_scale: Optional[np.ndarray] = None,
-    norm_offset: Optional[np.ndarray] = None,
-    arch_config: Optional[Dict] = None,
-    norm_type: Optional[str] = None,
 ) -> None:
     """Save a training checkpoint to disk."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -327,21 +272,11 @@ def save_checkpoint(
         'lambda':          lambda_current,
         'train_history':   train_history,
         'val_history':     val_history,
+        'norm_scale':      hybrid_model.norm_scale.cpu().numpy().tolist(),
+        'norm_offset':     hybrid_model.norm_offset.cpu().numpy().tolist(),
     }
     if scheduler is not None:
         checkpoint['scheduler_state'] = scheduler.state_dict()
-    if norm_scale is not None:
-        checkpoint['norm_scale']  = norm_scale.tolist()
-        checkpoint['norm_offset'] = norm_offset.tolist()
-    if norm_type is not None:
-        checkpoint['norm_type'] = norm_type
-    if arch_config is not None:
-        checkpoint['arch_config'] = {
-            'activation':  arch_config.get('activation', 'relu'),
-            'hidden_dims': arch_config.get('hidden_dims', []),
-            'state_dim':   arch_config.get('state_dim', 8),
-            'action_dim':  arch_config.get('action_dim', 3),
-        }
     torch.save(checkpoint, path)
     print(f"Saved checkpoint to {path}")
 

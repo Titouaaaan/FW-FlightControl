@@ -4,7 +4,7 @@ Full MPPI Analysis — side-by-side comparison of all world models.
 
 Runs the same episode with identical MPPI settings for:
   - PID baseline
-  - Physics prior only (residual zeroed out)
+  - Physics prior only (residual disabled via with_residual=False)
   - Each .pt model found in physics/models/
   - JSBSim environment as world model (optional, slow)
 
@@ -23,6 +23,7 @@ Usage:
     python full_mppi_analysis.py --skip-env-model
 """
 
+import os
 import numpy as np
 import sys
 import argparse
@@ -46,7 +47,6 @@ from fw_flightcontrol.agents.pid import PID
 from fw_flightcontrol.physics.utils import (
     get_env_state,
     set_env_state,
-    get_norm_type,
     clean_state_dict_for_compilation,
     suppress_output,
     _throttle_patch,
@@ -56,7 +56,7 @@ from fw_flightcontrol.physics.utils import (
 )
 from fw_flightcontrol.physics.physics_prior import PhysicsPrior
 from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel
-from fw_flightcontrol.physics.mppi import MPPIController, rollout_trajectories
+from fw_flightcontrol.physics.mppi import MPPIController, rollout_trajectories, compute_costs
 
 # ============================================================================
 # PATHS
@@ -70,9 +70,9 @@ NOATMO_YAML   = str(_FC_DIR / 'config' / 'env' / 'jsbsim' / 'noatmo.yaml')
 TRAINING_YAML = str(_PHYSICS_DIR / 'training_params.yaml')
 SAVE_DIR      = Path(__file__).parent.parent / 'data' / 'plots' / 'full_analysis'
 
-DT           = 0.01
-STEPS_20S    = 2000   # 20 s at 0.01 s/step
-TARGET_VA_KPH = 60.0  # fixed cruise-speed target [km/h]
+DT            = 0.01
+STEPS_20S     = 2000   # 20 s at 0.01 s/step
+TARGET_VA_KPH = 60.0   # fixed cruise-speed target [km/h]
 
 
 # ============================================================================
@@ -87,7 +87,6 @@ def make_env(render_mode: str = 'none', telemetry_file: str = '') -> gym.Env:
     except Exception:
         cfg = OmegaConf.create({'env': {}})
     cfg.env.jsbsim = OmegaConf.load(NOATMO_YAML)
-    import os
     if render_mode != 'none' and not telemetry_file:
         os.makedirs('telemetry', exist_ok=True)
         telemetry_file = 'telemetry/telemetry.csv'
@@ -101,7 +100,9 @@ def make_env(render_mode: str = 'none', telemetry_file: str = '') -> gym.Env:
 # MODEL LOADING
 # ============================================================================
 
-def load_model(model_path: str, device: torch.device):
+def load_model(model_path: str, device: torch.device,
+               with_prior: bool = True, with_residual: bool = True) -> tuple:
+    """Load a hybrid model from checkpoint. Returns (hybrid_model, config)."""
     import yaml
     with open(TRAINING_YAML) as f:
         config = yaml.safe_load(f)
@@ -110,14 +111,13 @@ def load_model(model_path: str, device: torch.device):
     with suppress_output():
         raw = torch.load(model_path, map_location=device)
 
-    denorm_factors = min_bounds = None
     if isinstance(raw, dict) and 'residual_state' in raw:
         residual_state = clean_state_dict_for_compilation(raw['residual_state'])
-        if 'norm_scale' in raw and 'norm_offset' in raw:
-            denorm_factors = torch.tensor(raw['norm_scale'], dtype=torch.float32, device=device)
-            min_bounds     = torch.tensor(raw['norm_offset'], dtype=torch.float32, device=device)
+        norm_scale  = torch.tensor(raw['norm_scale'],  dtype=torch.float32, device=device)
+        norm_offset = torch.tensor(raw['norm_offset'], dtype=torch.float32, device=device)
     else:
         residual_state = clean_state_dict_for_compilation(raw)
+        norm_scale = norm_offset = None
 
     def _infer_hidden(sd):
         dims, i = [], 0
@@ -127,7 +127,7 @@ def load_model(model_path: str, device: torch.device):
             i += 2
         return dims
 
-    net = config['network']
+    net    = config['network']
     hidden = _infer_hidden(residual_state) or net['hidden_dims']
 
     residual = PhysicsAugmented(
@@ -140,19 +140,14 @@ def load_model(model_path: str, device: torch.device):
     method = config.get('integration', {}).get('method', 'rk4')
     hybrid = HybridDynamicsModel(
         physics_prior=physics_prior, residual_network=residual,
-        with_prior=True, with_residual=True, integration_method=method,
+        with_prior=with_prior, with_residual=with_residual,
+        integration_method=method,
     ).to(device).eval()
 
-    norm_type = get_norm_type(config)
-    if norm_type is not None and denorm_factors is None:
-        p = config.get('normalization_params', {})
-        if p:
-            denorm_factors = torch.tensor(p['norm_scale'], dtype=torch.float32, device=device)
-            min_bounds     = torch.tensor(p['norm_offset'], dtype=torch.float32, device=device)
-        else:
-            norm_type = None
+    hybrid.norm_scale  = norm_scale
+    hybrid.norm_offset = norm_offset
 
-    return hybrid, config, denorm_factors, min_bounds, norm_type
+    return hybrid, config
 
 
 # ============================================================================
@@ -277,26 +272,13 @@ def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
         for _ in range(max_steps):
             t0    = time.time()
             saved = get_env_state(main_env)
-            best  = np.zeros(3)
 
-            for _ in range(n_iters):
+            for i in range(n_iters):
                 sampled = controller.sample_actions()
                 costs   = _rollout_env(rollout_env, saved, sampled,
-                                       target_roll_rad, target_pitch_rad, TARGET_VA_KPH, va_weight)
-
-                valid = np.isfinite(costs)
-                if not valid.any():
-                    continue
-                nan_pen = np.nanmax(costs[valid]) * 10.0
-                cs = np.where(valid, costs, nan_pen)
-                w  = np.exp(-(cs - cs.min()) / controller.temperature)
-                w /= w.sum()
-                controller.mean_actions = np.einsum('k,khd->hd', w, sampled)
-                best = controller.mean_actions[0].copy()
-                best[:2] = np.clip(best[:2], -1.0, 1.0)
-                best[2]  = np.clip(best[2],  0.0,  1.0)
-
-            controller._shift_mean()
+                                       target_roll_rad, target_pitch_rad,
+                                       TARGET_VA_KPH, va_weight)
+                best = controller.update(costs, sampled, shift=(i == n_iters - 1))
 
             throttle_ref[0] = float(best[2])
             obs, _, term, trunc, _ = main_env.step(best[:2])
@@ -334,10 +316,11 @@ def run_mppi_env(target_roll: float, target_pitch: float, max_steps: int,
 def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
                    target_pitch: float, max_steps: int, mppi_cfg: dict,
                    seed: int, device: torch.device,
+                   with_residual: bool = True,
                    residual_clamp: Optional[float] = None,
                    render_mode: str = 'none') -> dict:
     if model_path is not None:
-        hybrid, config, denorm_factors, min_bounds, norm_type = load_model(model_path, device)
+        hybrid, config = load_model(model_path, device, with_prior=True, with_residual=with_residual)
     else:
         import yaml
         with open(TRAINING_YAML) as f:
@@ -352,10 +335,9 @@ def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
         method = config.get('integration', {}).get('method', 'rk4')
         hybrid = HybridDynamicsModel(
             physics_prior=physics_prior, residual_network=residual,
-            with_prior=True, with_residual=True, integration_method=method,
+            with_prior=True, with_residual=False, integration_method=method,
         ).to(device).eval()
-        denorm_factors = min_bounds = norm_type = None
-        residual_clamp = 0.0
+        hybrid.norm_scale = hybrid.norm_offset = None
 
     with suppress_output():
         env = make_env(render_mode=render_mode,
@@ -370,10 +352,9 @@ def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
     controller.reset()
     obs, _ = env.reset(options={"fgear_target_roll": target_roll, "fgear_target_pitch": target_pitch})
 
-    target_roll_rad  = np.deg2rad(target_roll)
-    target_pitch_rad = np.deg2rad(target_pitch)
-    va_weight        = mppi_cfg.get('va_weight', 0.1)
-    env.unwrapped.set_target_state(np.array([target_roll_rad, target_pitch_rad]))
+    env.unwrapped.set_target_state(
+        np.array([np.deg2rad(target_roll), np.deg2rad(target_pitch)])
+    )
 
     roll_hist, pitch_hist, va_hist, p_hist, q_hist, r_hist = [], [], [], [], [], []
     actions_hist, step_times = [], []
@@ -383,37 +364,16 @@ def run_mppi_model(label: str, model_path: Optional[str], target_roll: float,
 
     with tqdm(total=max_steps, desc=label, unit='step', leave=True) as pbar:
         for _ in range(max_steps):
-            t0   = time.time()
-            best = np.zeros(3)
+            t0 = time.time()
 
-            for _ in range(n_iters):
-                sampled = controller.sample_actions()
-
+            for i in range(n_iters):
+                sampled      = controller.sample_actions()
                 trajectories = rollout_trajectories(
-                    obs, sampled, hybrid, config,
-                    denorm_factors, min_bounds, norm_type, device,
+                    obs, sampled, hybrid, config, device,
                     residual_clamp=residual_clamp,
                 )
-
-                roll_errs  = np.abs(trajectories[:, :, 0] - target_roll_rad)
-                pitch_errs = np.abs(trajectories[:, :, 1] - target_pitch_rad)
-                va_errs    = np.abs(trajectories[:, :, 2] - TARGET_VA_KPH / 3.6) / (TARGET_VA_KPH / 3.6)
-                # Normalize by π/2 so attitude errors are dimensionless on [0,1] scale.
-                costs = np.sum((roll_errs + pitch_errs) / (np.pi / 2) + va_weight * va_errs, axis=1)
-
-                valid = np.isfinite(costs)
-                if not valid.any():
-                    continue
-                nan_pen = np.nanmax(costs[valid]) * 10.0
-                cs = np.where(valid, costs, nan_pen)
-                w  = np.exp(-(cs - cs.min()) / controller.temperature)
-                w /= w.sum()
-                controller.mean_actions = np.einsum('k,khd->hd', w, sampled)
-                best = controller.mean_actions[0].copy()
-                best[:2] = np.clip(best[:2], -1.0, 1.0)
-                best[2]  = np.clip(best[2],  0.0,  1.0)
-
-            controller._shift_mean()
+                costs = compute_costs(trajectories, target_roll, target_pitch)
+                best  = controller.update(costs, sampled, shift=(i == n_iters - 1))
 
             throttle_ref[0] = float(best[2])
             obs, _, term, trunc, _ = env.step(best[:2])
@@ -460,7 +420,7 @@ def main():
     parser.add_argument('--mppi-noise-std',   type=float, default=0.5)
     parser.add_argument('--mppi-va-weight',   type=float, default=1)
     parser.add_argument('--mppi-iters',       type=int,   default=None,
-                        help='Iterative MPPI: number of refinement passes per timestep (TD-MPC style). '
+                        help='Iterative MPPI: number of refinement passes per timestep. '
                              'Omit for vanilla single-pass MPPI.')
     parser.add_argument('--seed',             type=int,   default=42)
     parser.add_argument('--device',           type=str,
@@ -506,7 +466,8 @@ def main():
             max_steps=args.steps, mppi_cfg=mppi_cfg, seed=args.seed, device=device,
             render_mode=args.render_mode,
         ))
-    
+
+    # Prior-only ablation: same config but with_residual=False
     results.append(run_mppi_model(
         label='Prior_only', model_path=None,
         target_roll=args.target_roll, target_pitch=args.target_pitch,
@@ -531,7 +492,6 @@ def main():
     save_metrics(results, args.target_roll, args.target_pitch,
                  save_dir / f"metrics_{tag}.csv")
 
-# example to run:
-# python full_mppi_analysis.py --target-roll 55 --target-pitch 28 --mppi-samples 500 --steps 2000
+
 if __name__ == '__main__':
     main()

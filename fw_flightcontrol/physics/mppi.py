@@ -32,9 +32,7 @@ import fw_jsbgym  # noqa: F401 — registers gym envs as side effect
 from fw_flightcontrol.physics.physics_prior import PhysicsPrior
 from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel
 from fw_flightcontrol.physics.training_objective import HybridDynamicsODE
-from fw_flightcontrol.physics.utils import (
-    load_config, get_norm_type, clean_state_dict_for_compilation,
-)
+from fw_flightcontrol.physics.utils import load_config, clean_state_dict_for_compilation
 
 
 # ── Model loading ──────────────────────────────────────────────────────────────
@@ -43,37 +41,39 @@ def load_config_and_model(
     model_path: str,
     config_path: str,
     device: torch.device,
-) -> Tuple[HybridDynamicsModel, Dict, torch.Tensor, torch.Tensor, Optional[str]]:
+    with_prior: bool = True,
+    with_residual: bool = True,
+) -> Tuple[HybridDynamicsModel, Dict]:
     """Load a hybrid dynamics model from a training checkpoint.
 
+    Norm parameters are read from the checkpoint and attached to the model
+    as hybrid_model.norm_scale / hybrid_model.norm_offset.
+
     Returns:
-        (hybrid_model, config, norm_scale, norm_offset, norm_type)
-        norm_scale / norm_offset encode normalization parameters whose meaning
-        depends on norm_type ('bounds_normalization', 'data_driven_normalization',
-        or None for raw space).
+        (hybrid_model, config)
     """
     print(f"\n{'='*60}\nLOADING MODEL AND CONFIGURATION\n{'='*60}")
     print(f"  config:     {config_path}")
     print(f"  checkpoint: {model_path}")
 
-    config = load_config(config_path)
+    config        = load_config(config_path)
     physics_prior = PhysicsPrior()
     print("  ✓ Physics prior initialized (frozen)")
 
     raw = torch.load(model_path, map_location=device)
-    norm_scale = norm_offset = None
 
     if isinstance(raw, dict) and 'residual_state' in raw:
         residual_state = clean_state_dict_for_compilation(raw['residual_state'])
         saved_epoch    = raw.get('epoch', '?')
         saved_lambda   = raw.get('lambda', '?')
-        if 'norm_scale' in raw and 'norm_offset' in raw:
-            norm_scale  = torch.tensor(raw['norm_scale'],  dtype=torch.float32, device=device)
-            norm_offset = torch.tensor(raw['norm_offset'], dtype=torch.float32, device=device)
-            print("  ✓ Normalization parameters loaded from checkpoint")
+        norm_scale  = torch.tensor(raw['norm_scale'],  dtype=torch.float32, device=device)
+        norm_offset = torch.tensor(raw['norm_offset'], dtype=torch.float32, device=device)
+        print("  ✓ Normalization parameters loaded from checkpoint")
     else:
         residual_state = clean_state_dict_for_compilation(raw)
         saved_epoch = saved_lambda = '?'
+        norm_scale = norm_offset = None
+        print("  ⚠ Bare state dict — no norm parameters found")
 
     def _infer_hidden_dims(sd):
         dims, i = [], 0
@@ -85,64 +85,34 @@ def load_config_and_model(
 
     net_config      = config['network']
     inferred_hidden = _infer_hidden_dims(residual_state)
-    if inferred_hidden != net_config['hidden_dims']:
+    if inferred_hidden and inferred_hidden != net_config['hidden_dims']:
         print(f"  ⚠ Architecture mismatch: config={net_config['hidden_dims']}, "
               f"checkpoint={inferred_hidden}. Using checkpoint.")
-
-    # Prefer activation embedded in the checkpoint; old checkpoints default to 'relu'.
-    if isinstance(raw, dict) and 'arch_config' in raw:
-        ckpt_activation = raw['arch_config'].get('activation', 'relu')
-        if ckpt_activation != net_config.get('activation'):
-            print(f"  ⚠ Activation override: checkpoint={ckpt_activation!r}, "
-                  f"config={net_config.get('activation')!r}. Using checkpoint.")
-        net_config = dict(net_config)
-        net_config['activation'] = ckpt_activation
-        print(f"  ✓ Architecture loaded from checkpoint (activation={ckpt_activation!r})")
-    else:
-        net_config = dict(net_config)
-        net_config['activation'] = 'relu'
-        print(f"  ⚠ No arch_config in checkpoint — defaulting activation to 'relu'.")
-
-    # Infer prev_action_dim from first-layer input width
-    first_layer_in  = residual_state.get('network.0.weight', torch.empty(0, net_config['state_dim'] + net_config['action_dim'])).shape[1]
-    prev_action_dim = max(0, first_layer_in - net_config['state_dim'] - net_config['action_dim'])
-
-    # Prefer norm_type embedded in the checkpoint; fall back to config
-    if isinstance(raw, dict) and 'norm_type' in raw:
-        norm_type = raw['norm_type']
-    else:
-        norm_type = get_norm_type(config)
 
     residual_network = PhysicsAugmented(
         state_dim=net_config['state_dim'],
         action_dim=net_config['action_dim'],
         hidden_dims=inferred_hidden or net_config['hidden_dims'],
-        activation=net_config['activation'],
-        prev_action_dim=prev_action_dim,
+        activation=net_config.get('activation', 'relu'),
+        use_batch_norm=net_config.get('use_batch_norm', False),
     )
     residual_network.load_state_dict(residual_state)
     print(f"  ✓ Residual network: {sum(p.numel() for p in residual_network.parameters()):,} params "
-          f"(epoch={saved_epoch}, λ={saved_lambda}, prev_action_dim={prev_action_dim})")
+          f"(epoch={saved_epoch}, λ={saved_lambda})")
 
     hybrid_model = HybridDynamicsModel(
         physics_prior=physics_prior,
         residual_network=residual_network,
+        with_prior=with_prior,
+        with_residual=with_residual,
     ).to(device).eval()
-    print(f"  ✓ Hybrid model ready on {device}")
-    print(f"  Normalization: {norm_type or 'none (raw space)'}")
-
-    if norm_type is not None and norm_scale is None:
-        if 'normalization_params' in config:
-            p           = config['normalization_params']
-            norm_scale  = torch.tensor(p['norm_scale'],  dtype=torch.float32, device=device)
-            norm_offset = torch.tensor(p['norm_offset'], dtype=torch.float32, device=device)
-            print("  ✓ Normalization parameters loaded from config")
-        else:
-            print(f"  ⚠ No normalization parameters found — disabling {norm_type}")
-            norm_type = None
-
+    hybrid_model.norm_scale  = norm_scale
+    hybrid_model.norm_offset = norm_offset
+    print(f"  ✓ Hybrid model ready on {device} "
+          f"(with_prior={with_prior}, with_residual={with_residual})")
     print('='*60 + '\n')
-    return hybrid_model, config, norm_scale, norm_offset, norm_type
+
+    return hybrid_model, config
 
 
 # ── Environment initialization ─────────────────────────────────────────────────
@@ -174,9 +144,6 @@ def rollout_trajectories(
     actions: np.ndarray,
     hybrid_model: HybridDynamicsModel,
     config: Dict,
-    norm_scale: Optional[torch.Tensor],
-    norm_offset: Optional[torch.Tensor],
-    norm_type: Optional[str],
     device: torch.device,
     residual_clamp: Optional[float] = None,
 ) -> np.ndarray:
@@ -188,7 +155,6 @@ def rollout_trajectories(
     Args:
         current_state: (14,) env observation
         actions:       (N, H, action_dim)
-        norm_scale / norm_offset / norm_type: normalization parameters from checkpoint
 
     Returns:
         trajectories: (N, H, 8) in raw physical units
@@ -205,19 +171,7 @@ def rollout_trajectories(
     states_raw     = states_raw.unsqueeze(0).expand(num_samples, -1).clone()
     actions_tensor = torch.tensor(actions, dtype=torch.float32, device=device)
 
-    ode = HybridDynamicsODE(
-        hybrid_model, device,
-        denorm_factors=norm_scale, min_bounds=norm_offset,
-        norm_type=norm_type, residual_clamp=residual_clamp,
-    )
-
-    # If the residual network uses prev_action, seed it from obs indices 10, 11
-    # (s_t_10, s_t_11 = prev aileron, prev elevator — matches PREV_ACTION_COLS)
-    prev_action_dim = getattr(hybrid_model.residual_network, 'prev_action_dim', 0)
-    if prev_action_dim > 0:
-        prev_action_init = torch.tensor(
-            current_state[10:10 + prev_action_dim], dtype=torch.float32, device=device,
-        ).unsqueeze(0).expand(num_samples, -1).clone()
+    ode = HybridDynamicsODE(hybrid_model, device, residual_clamp=residual_clamp)
 
     trajectories = torch.empty(num_samples, horizon, states_raw.shape[1], device=device)
     invalid      = torch.zeros(num_samples, dtype=torch.bool, device=device)
@@ -228,9 +182,6 @@ def rollout_trajectories(
 
     for step in range(horizon):
         ode.set_action(actions_tensor[:, step, :])
-        if prev_action_dim > 0:
-            pa = prev_action_init if step == 0 else actions_tensor[:, step - 1, :prev_action_dim]
-            ode.set_prev_action(pa)
         k1 = ode(0.0, states_raw)
         k2 = ode(0.0, states_raw + half_dt * k1)
         k3 = ode(0.0, states_raw + half_dt * k2)
@@ -431,15 +382,10 @@ class MPPIController:
         target_pitch:   float,
         hybrid_model:   HybridDynamicsModel,
         config:         Dict,
-        norm_scale:     Optional[torch.Tensor],
-        norm_offset:    Optional[torch.Tensor],
-        norm_type:      Optional[str],
         device:         torch.device,
         residual_clamp: Optional[float] = None,
     ) -> Tuple[np.ndarray, Dict]:
         """One MPPI step using the hybrid dynamics model as rollout backend.
-
-        Cost: sum of |roll_error| + |pitch_error| over the horizon (radians).
 
         Returns:
             best_action: (action_dim,)
@@ -451,15 +397,13 @@ class MPPIController:
 
         t_rollout    = time.time()
         trajectories = rollout_trajectories(
-            current_state, sampled, hybrid_model,
-            config, norm_scale, norm_offset, norm_type, device,
+            current_state, sampled, hybrid_model, config, device,
             residual_clamp=residual_clamp,
         )
         time_rollout = time.time() - t_rollout
 
         costs = compute_costs(trajectories, target_roll, target_pitch)
-
-        best = self.update(costs, sampled)
+        best  = self.update(costs, sampled)
 
         valid_costs = costs[np.isfinite(costs)]
         info = {

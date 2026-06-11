@@ -14,15 +14,14 @@ This hybrid approach combines model-based constraints with learned corrections.
 
 import torch
 import torch.nn as nn
-from torchdiffeq import odeint
 
 
 class PhysicsAugmented(nn.Module):
     """
     Learned residual network that corrects physics prior predictions.
 
-    Input: current state s and action u
-    Output: residual corrections Δ(ds/dt) to add to physics prior
+    Input: current state s (normalized) and action u
+    Output: residual corrections Δ(ds/dt) in normalized space
 
     We use a simple MLP architecture for efficiency and stability.
     The network is initialized with small weights to ensure the residuals
@@ -34,19 +33,16 @@ class PhysicsAugmented(nn.Module):
                  action_dim: int = 3,
                  hidden_dims: list = None,
                  activation: str = 'relu',
-                 use_batch_norm: bool = False,
-                 prev_action_dim: int = 0):
+                 use_batch_norm: bool = False):
         super().__init__()
 
         if hidden_dims is None:
             hidden_dims = [128, 128]
 
-        self.state_dim = state_dim
+        self.state_dim  = state_dim
         self.action_dim = action_dim
-        self.prev_action_dim = prev_action_dim
-        self.output_dim = state_dim  # Output residuals have same dimension as state derivatives
+        self.output_dim = state_dim
 
-        # Choose activation function
         if activation == 'relu':
             self.activation = nn.ReLU()
         elif activation == 'tanh':
@@ -58,11 +54,9 @@ class PhysicsAugmented(nn.Module):
 
         self.use_batch_norm = use_batch_norm
 
-        # Build the MLP: [state, action, (prev_action)] -> hidden layers -> residual corrections
         layers = []
-        input_dim = state_dim + action_dim + prev_action_dim
+        input_dim = state_dim + action_dim
 
-        # Hidden layers with optional batch norm
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(input_dim, hidden_dim))
             if use_batch_norm:
@@ -70,12 +64,9 @@ class PhysicsAugmented(nn.Module):
             layers.append(self.activation)
             input_dim = hidden_dim
 
-        # Output layer: no activation (residuals are unbounded)
         layers.append(nn.Linear(input_dim, self.output_dim))
-
         self.network = nn.Sequential(*layers)
 
-        # Initialize weights to small values for stable residual learning
         self._init_weights()
 
     def _init_weights(self):
@@ -84,27 +75,23 @@ class PhysicsAugmented(nn.Module):
                 nn.init.normal_(layer.weight, mean=0.0, std=0.01)
                 nn.init.zeros_(layer.bias)
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor,
-                prev_action: torch.Tensor = None) -> torch.Tensor:
-        parts = [state, action]
-        if self.prev_action_dim > 0 and prev_action is not None:
-            parts.append(prev_action)
-        x = torch.cat(parts, dim=-1)
-        return self.network(x)
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return self.network(torch.cat([state, action], dim=-1))
 
 
 class HybridDynamicsModel(nn.Module):
     """
     Combines physics prior and learned residual network into a unified dynamics model.
 
-    This allows for flexible ablation studies:
-    - Physics only: with_prior=True, with_residual=False
-    - Learning only: with_prior=False, with_residual=True
-    - Hybrid: with_prior=True, with_residual=True (full model)
+    Ablation flags:
+    - with_prior=True,  with_residual=False : physics only
+    - with_prior=False, with_residual=True  : residual only
+    - with_prior=True,  with_residual=True  : full hybrid model (default)
 
-    The combined dynamics are: ds/dt = F_p(s,u) + F_a(s,u)
+    The combined dynamics are: ds_raw/dt = F_p(s_raw, u) + F_a(s_norm, u) * std
 
-    Supports multiple ODE integration methods for accuracy vs speed tradeoff.
+    norm_scale and norm_offset are set after checkpoint loading and travel with
+    the model. Integration is handled externally via HybridDynamicsODE.
     """
 
     def __init__(self,
@@ -115,62 +102,38 @@ class HybridDynamicsModel(nn.Module):
                  integration_method: str = 'rk4'):
         super().__init__()
 
-        self.physics_prior = physics_prior
-        self.residual_network = residual_network
-        self.with_prior = with_prior
-        self.with_residual = with_residual
+        self.physics_prior     = physics_prior
+        self.residual_network  = residual_network
+        self.with_prior        = with_prior
+        self.with_residual     = with_residual
         self.integration_method = integration_method
 
         if integration_method not in ['rk4', 'dopri8', 'semi_implicit_euler']:
-            raise ValueError(f"integration_method must be 'rk4', 'dopri8', or 'semi_implicit_euler', got '{integration_method}'")
+            raise ValueError(
+                f"integration_method must be 'rk4', 'dopri8', or 'semi_implicit_euler', "
+                f"got '{integration_method}'"
+            )
+
+        # Normalization parameters — set externally after checkpoint loading.
+        # Plain attributes (not buffers) so they don't interfere with state_dict.
+        # Must be on the same device as the model when used.
+        self.norm_scale  = None  # std  per state dimension
+        self.norm_offset = None  # mean per state dimension
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        dx_dt_combined = torch.zeros_like(state)
+        """Compute combined state derivative in raw physical space.
+
+        Expects state in raw (physical) units. The residual network receives the
+        normalized state internally; its output is scaled back to raw units.
+        """
+        dx_dt = torch.zeros_like(state)
 
         if self.with_prior:
-            dx_dt_physics = self.physics_prior(state, action)
-            dx_dt_combined = dx_dt_physics
+            dx_dt = self.physics_prior(state, action)
 
         if self.with_residual:
-            residuals = self.residual_network(state, action)
-            if self.with_prior:
-                dx_dt_combined = dx_dt_combined + residuals
-            else:
-                dx_dt_combined = residuals
+            state_norm    = (state - self.norm_offset) / self.norm_scale
+            residual_out  = self.residual_network(state_norm, action)
+            dx_dt         = dx_dt + residual_out * self.norm_scale
 
-        return dx_dt_combined
-
-    def integrate_rk4(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        def ode_dynamics(t, state_t):
-            return self(state_t, action)
-        t_eval = torch.tensor([0.0, 0.01], dtype=state.dtype, device=state.device)
-        trajectory = odeint(ode_dynamics, state, t_eval, method='rk4')
-        return trajectory[-1]
-
-    def integrate_dop853(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        def ode_dynamics(t, state_t):
-            return self(state_t, action)
-        t_eval = torch.tensor([0.0, 0.01], dtype=state.dtype, device=state.device)
-        trajectory = odeint(ode_dynamics, state, t_eval, method='dopri8', rtol=1e-8, atol=1e-9)
-        return trajectory[-1]
-
-    def integrate_semi_implicit_euler(self, state: torch.Tensor, action: torch.Tensor, dt: float = 0.01) -> torch.Tensor:
-        derivatives = self(state, action)
-        state_dim = state.shape[-1]
-        half_dim = state_dim // 2
-        positions = state[:, :half_dim]
-        velocities = state[:, half_dim:]
-        dvel_dt = derivatives[:, half_dim:]
-        velocities_new = velocities + dvel_dt * dt
-        positions_new = positions + velocities_new * dt
-        return torch.cat([positions_new, velocities_new], dim=-1)
-
-    def integrate(self, state: torch.Tensor, action: torch.Tensor, dt: float = 0.01) -> torch.Tensor:
-        if self.integration_method == 'rk4':
-            return self.integrate_rk4(state, action)
-        elif self.integration_method == 'dopri8':
-            return self.integrate_dop853(state, action)
-        elif self.integration_method == 'semi_implicit_euler':
-            return self.integrate_semi_implicit_euler(state, action, dt=dt)
-        else:
-            raise ValueError(f"Unknown integration method: {self.integration_method}")
+        return dx_dt

@@ -2,18 +2,14 @@
 """
 Training script for hybrid physics-augmented world model using APHYNITY.
 
-This script implements the complete training pipeline:
+Pipeline:
 1. Load configuration from training_params.yaml
 2. Initialize physics prior and residual network
-3. Load trajectory data from CSV
-4. Train residual network using APHYNITY objective
-5. Validate on held-out test set
-6. Save checkpoints and training metrics
-
-The key insight: combined physics-learning approach where we start with a
-physics prior (which captures the known aerodynamic structure) and learn
-a residual network to correct systematic errors. This is more data-efficient
-and generalizes better than learning from scratch.
+3. Load trajectory data from CSV; compute normalization parameters
+4. Attach norm parameters to the model (saved in every checkpoint)
+5. Train residual network using APHYNITY objective
+6. Validate on held-out set
+7. Save checkpoints and TensorBoard metrics
 """
 
 import torch
@@ -21,7 +17,6 @@ import yaml
 import argparse
 from pathlib import Path
 from typing import Dict, Tuple, Optional
-import pandas as pd
 import numpy as np
 from tqdm import tqdm
 from torchdiffeq import odeint
@@ -32,7 +27,7 @@ from fw_flightcontrol.physics.physics_prior import PhysicsPrior
 from fw_flightcontrol.physics.physics_augmented import PhysicsAugmented, HybridDynamicsModel
 from fw_flightcontrol.physics.training_objective import train_aphynity_epoch, HybridDynamicsODE
 from fw_flightcontrol.physics.utils import (
-    load_config, load_trajectory_data, get_norm_type,
+    load_config, load_trajectory_data,
     normalize_state_torch, denormalize_state_torch,
     log_epoch_summary, log_tensorboard_epoch, save_checkpoint,
 )
@@ -43,25 +38,16 @@ from fw_flightcontrol.physics.utils import (
 # ============================================================================
 
 def initialize_models(config: Dict, device: torch.device) -> Tuple[PhysicsAugmented, HybridDynamicsModel]:
-    """
-    Initialize physics prior and residual network.
-
-    The physics prior is loaded from pre-computed aerodynamic coefficients
-    and is never trained (frozen). The residual network is trained to learn
-    corrections to the physics prior's predictions.
-    """
+    """Initialize physics prior (frozen) and residual network (trainable)."""
     print("\n" + "="*80)
     print("INITIALIZING MODELS")
     print("="*80)
 
-    # Physics prior (frozen, not trained)
-    print("\nPhysics Prior:")
     physics_prior = PhysicsPrior()
+    print("\nPhysics Prior:")
     print("  ✓ Loaded aerodynamic coefficients from aero_coefficients.yaml")
     print("  ✓ Model is frozen (non-trainable)")
 
-    # Residual network (trainable)
-    print("\nResidual Network:")
     net_config = config['network']
     residual_network = PhysicsAugmented(
         state_dim=net_config['state_dim'],
@@ -71,14 +57,12 @@ def initialize_models(config: Dict, device: torch.device) -> Tuple[PhysicsAugmen
         use_batch_norm=net_config['use_batch_norm'],
     )
     num_residual_params = sum(p.numel() for p in residual_network.parameters())
-    print(f"  ✓ Created MLP with {num_residual_params:,} trainable parameters")
-
     input_size = net_config['state_dim'] + net_config['action_dim']
-    architecture_str = f"{input_size} -> " + " -> ".join(map(str, net_config['hidden_dims'])) + f" -> {net_config['state_dim']}"
-    print(f"  ✓ Architecture: {architecture_str}")
+    arch_str = f"{input_size} -> " + " -> ".join(map(str, net_config['hidden_dims'])) + f" -> {net_config['state_dim']}"
+    print(f"\nResidual Network:")
+    print(f"  ✓ Created MLP with {num_residual_params:,} trainable parameters")
+    print(f"  ✓ Architecture: {arch_str}")
 
-    # Hybrid model combines both
-    print("\nHybrid Dynamics Model:")
     integration_method = config.get('integration', {}).get('method', 'rk4')
     hybrid_model = HybridDynamicsModel(
         physics_prior=physics_prior,
@@ -88,6 +72,7 @@ def initialize_models(config: Dict, device: torch.device) -> Tuple[PhysicsAugmen
         integration_method=integration_method
     )
     hybrid_model = hybrid_model.to(device)
+    print(f"\nHybrid Dynamics Model:")
     print(f"  ✓ Initialized (ds/dt = F_p + F_a)")
     print(f"  ✓ Integration method: {integration_method}")
     print(f"  ✓ Model moved to {device}")
@@ -96,16 +81,13 @@ def initialize_models(config: Dict, device: torch.device) -> Tuple[PhysicsAugmen
 
 
 def load_checkpoint(checkpoint_path: str, residual_network: PhysicsAugmented, optimizer, scheduler, device: torch.device) -> Dict:
-    """
-    Load a checkpoint and restore training state.
-
-    Returns:
-        Dictionary with restored state: epoch, lambda_current, train_history, val_history
-    """
+    """Load a checkpoint and restore training state."""
+    from fw_flightcontrol.physics.utils import clean_state_dict_for_compilation
     print(f"\nLoading checkpoint from {checkpoint_path}...")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    residual_network.load_state_dict(checkpoint['residual_state'])
+    residual_state = clean_state_dict_for_compilation(checkpoint['residual_state'])
+    residual_network.load_state_dict(residual_state)
     print("  ✓ Restored network weights")
 
     optimizer.load_state_dict(checkpoint['optimizer_state'])
@@ -122,8 +104,6 @@ def load_checkpoint(checkpoint_path: str, residual_network: PhysicsAugmented, op
 
     print(f"  ✓ Resuming from epoch {start_epoch}")
     print(f"  ✓ Restored λ={lambda_current:.6f}")
-    print(f"  ✓ Training history: {len(train_history['loss_total'])} epochs")
-    print(f"  ✓ Validation history: {len(val_history['loss_total'])} rounds")
 
     return {
         'start_epoch':    start_epoch,
@@ -134,31 +114,16 @@ def load_checkpoint(checkpoint_path: str, residual_network: PhysicsAugmented, op
 
 
 def create_optimizer(residual_network: PhysicsAugmented, config: Dict):
-    """
-    Create optimizer for residual network parameters.
-
-    We only optimize the residual network weights. The physics prior
-    is frozen and provides fixed baseline predictions.
-
-    Returns:
-        tuple: (optimizer, scheduler, min_lr) if scheduler enabled
-               (optimizer, None, None) if scheduler disabled
-    """
+    """Create Adam optimizer and optional StepLR scheduler for the residual network."""
     aphynity_config = config['aphynity']
     train_config    = config['training']
 
-    # tau_1 is NOT a gradient scaling factor; it IS the Adam learning rate (APHYNITY paper)
     learning_rate = aphynity_config['tau_1']
-    optimizer = torch.optim.Adam(
-        residual_network.parameters(),
-        lr=learning_rate,
-        betas=(0.9, 0.999)
-    )
-    print(f"Created Adam optimizer with lr={learning_rate} (from aphynity.tau_1)")
+    optimizer = torch.optim.Adam(residual_network.parameters(), lr=learning_rate, betas=(0.9, 0.999))
+    print(f"Created Adam optimizer with lr={learning_rate}")
 
     scheduler = None
     min_lr    = None
-
     scheduler_config = train_config.get('scheduler', {})
     if scheduler_config.get('enabled', False):
         if scheduler_config.get('type') == 'steplr':
@@ -184,34 +149,24 @@ def run_validation_epoch(
     config: Dict,
     device: torch.device,
     lambda_current: float,
-    norm_type: Optional[str],
-    denorm_factors_torch: Optional[torch.Tensor],
-    min_bounds_torch: Optional[torch.Tensor],
-    per_state_scales_torch: Optional[torch.Tensor],
     epoch: int,
     num_epochs: int,
 ) -> Dict:
     """Run one full validation pass and return averaged loss metrics."""
-    horizon = config['training']['horizon']
+    horizon    = config['training']['horizon']
+    ode_method = config['integration']['method']
+    dt         = config['integration']['dt']
 
     hybrid_model.eval()
     val_metrics = {
-        'loss_total':         0,
-        'loss_trajectory':    0,
+        'loss_total':          0,
+        'loss_trajectory':     0,
         'loss_regularization': 0,
-        'batch_count':        0,
+        'batch_count':         0,
     }
 
-    # Build ODE module and t_eval once — reused across all batches
-    ode_module = HybridDynamicsODE(
-        hybrid_model, device,
-        denorm_factors=denorm_factors_torch if norm_type is not None else None,
-        min_bounds=min_bounds_torch if norm_type is not None else None,
-        norm_type=norm_type,
-    ).to(device)
-    t_eval = torch.tensor(
-        [0.0, config['integration']['dt']], dtype=torch.float32, device=device
-    )
+    ode_module = HybridDynamicsODE(hybrid_model, device).to(device)
+    t_eval = torch.tensor([0.0, dt], dtype=torch.float32, device=device)
 
     val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1:3d}/{num_epochs}: Val",
                     leave=False, unit="batch")
@@ -228,49 +183,40 @@ def run_validation_epoch(
 
             for step in range(horizon):
                 action = batch_actions[:, step, :]
-
-                if norm_type is not None:
-                    current_state_raw = denormalize_state_torch(current_state, denorm_factors_torch, min_bounds_torch, norm_type)
-                else:
-                    current_state_raw = current_state
-
-                # arm_capture: residual norm captured from k1, no extra forward pass
+                current_state_raw = denormalize_state_torch(
+                    current_state, hybrid_model.norm_scale, hybrid_model.norm_offset
+                )
                 ode_module.set_action(action)
                 ode_module.arm_capture()
-                solution = odeint(ode_module, current_state_raw, t_eval,
-                                  method=config['integration']['method'],
-                                  rtol=config['integration']['rtol'],
-                                  atol=config['integration']['atol'])
+
+                if ode_method == 'semi_implicit_euler':
+                    derivatives_raw = ode_module(None, current_state_raw)
+                    state_dim = current_state_raw.shape[-1]
+                    half_dim  = state_dim // 2
+                    vel_new   = current_state_raw[:, half_dim:] + derivatives_raw[:, half_dim:] * dt
+                    pos_new   = current_state_raw[:, :half_dim] + vel_new * dt
+                    next_state_raw = torch.cat([pos_new, vel_new], dim=-1).clamp(-1000.0, 1000.0)
+                else:
+                    solution = odeint(ode_module, current_state_raw, t_eval,
+                                      method=ode_method,
+                                      rtol=config['integration']['rtol'],
+                                      atol=config['integration']['atol'])
+                    next_state_raw = solution[-1].clamp(-1000.0, 1000.0)
 
                 if hybrid_model.with_residual and ode_module.captured_residual_norm is not None:
                     residual_norms.append(ode_module.captured_residual_norm)
 
-                next_state_raw = solution[-1].clamp(-1000.0, 1000.0)
-
-                if norm_type is not None:
-                    next_state = normalize_state_torch(next_state_raw, denorm_factors_torch, min_bounds_torch, norm_type)
-                else:
-                    next_state = next_state_raw
-
+                next_state = normalize_state_torch(
+                    next_state_raw, hybrid_model.norm_scale, hybrid_model.norm_offset
+                )
                 predicted_states.append(next_state)
                 current_state = next_state
 
             predicted_trajectory = torch.stack(predicted_states, dim=1)
 
-            # Loss space: normalized for data_driven, raw for bounds/no-norm
-            if norm_type == 'data_driven_normalization':
-                prediction_error = predicted_trajectory - batch_states
-            elif norm_type is not None:
-                predicted_trajectory_raw = denormalize_state_torch(predicted_trajectory, denorm_factors_torch, min_bounds_torch, norm_type)
-                batch_states_raw         = denormalize_state_torch(batch_states,         denorm_factors_torch, min_bounds_torch, norm_type)
-                prediction_error = predicted_trajectory_raw - batch_states_raw
-            else:
-                prediction_error = predicted_trajectory - batch_states
-
-            if config['data'].get('per_state_loss_norm', False):
-                prediction_error = prediction_error / (per_state_scales_torch ** 2)
-            trajectory_loss    = torch.norm(prediction_error, p=2, dim=2).mean()
-            regularization_loss = torch.stack(residual_norms).mean()
+            trajectory_loss     = torch.norm(predicted_trajectory - batch_states, p=2, dim=2).mean()
+            regularization_loss = torch.stack(residual_norms).mean() if residual_norms \
+                                  else torch.tensor(0.0, device=device)
 
             batch_loss_total = regularization_loss.item() + lambda_current * trajectory_loss.item()
             val_metrics['loss_total']          += batch_loss_total
@@ -290,58 +236,33 @@ def run_validation_epoch(
 
 
 # ============================================================================
-# PRINT HELPERS (startup summaries)
+# PRINT HELPERS
 # ============================================================================
 
-def _print_training_config(
-    config: Dict,
-    num_epochs: int,
-    batch_size: int,
-    horizon: int,
-    lambda_current: float,
-    tau_2: float,
-    lambda_min: float,
-    lambda_max: float,
-    denorm_factors: np.ndarray,
-) -> None:
-    """Print training configuration summary to stdout."""
+def _print_training_config(config, num_epochs, batch_size, horizon, lambda_current, tau_2, lambda_min, lambda_max):
     aphynity_config = config['aphynity']
     train_config    = config['training']
-
     print("\n" + "="*80)
     print("TRAINING CONFIGURATION")
     print("="*80)
-
-    print("\nTraining Loop:")
+    print(f"\nTraining Loop:")
     print(f"  • Epochs: {num_epochs}")
     print(f"  • Batch size: {batch_size}")
     print(f"  • Learning rate: {aphynity_config['tau_1']}")
     print(f"  • Grad clipping: {train_config['grad_clip_norm']}")
-
-    print("\nAPHYNITY Objective:")
+    print(f"\nAPHYNITY Objective:")
     print(f"  • Prediction horizon: {horizon} steps (~{horizon*config['integration']['dt']:.2f}s)")
     print(f"  • Initial λ: {lambda_current}")
     print(f"  • λ step size (τ_2): {tau_2}")
     print(f"  • λ bounds: [{lambda_min}, {lambda_max}]")
 
-    if config['data'].get('per_state_loss_norm', False):
-        print("\nPer-state loss normalization (half-range scales):")
-        print(f"  • Scales: {denorm_factors}")
 
-
-def _build_hyperparams_text(
-    config: Dict,
-    batch_size: int,
-    horizon: int,
-    aphynity_config: Dict,
-    train_config: Dict,
-) -> str:
-    """Build a markdown-formatted hyperparameter summary for TensorBoard."""
+def _build_hyperparams_text(config, batch_size, horizon, aphynity_config, train_config):
     return f"""
 ## Training Hyperparameters
 
 **Learning:**
-- Learning Rate: {aphynity_config['tau_1']} (from aphynity.tau_1)
+- Learning Rate: {aphynity_config['tau_1']}
 - Optimizer: Adam
 - Gradient Clip Norm: {train_config.get('grad_clip_norm', 1.0)}
 
@@ -377,11 +298,6 @@ def _build_hyperparams_text(
 # ============================================================================
 
 def main(resume_checkpoint: Optional[str] = None):
-    """Main training script entrypoint.
-
-    Args:
-        resume_checkpoint: Path to checkpoint to resume from. If None, starts from scratch.
-    """
     print("\n" + "="*80)
     print("HYBRID PHYSICS-AUGMENTED WORLD MODEL TRAINING")
     print("="*80)
@@ -396,13 +312,10 @@ def main(resume_checkpoint: Optional[str] = None):
 
     residual_network, hybrid_model = initialize_models(config, device)
 
-    # Compile the two sub-modules that are called inside the ODE loop on every forward pass.
-    # physics_prior benefits most (many fused trig/element-wise ops → fewer CUDA kernel launches).
-    # residual_network also benefits (MLP forward fused into fewer ops).
-    hybrid_model.physics_prior     = torch.compile(hybrid_model.physics_prior)
-    hybrid_model.residual_network  = torch.compile(hybrid_model.residual_network)
+    hybrid_model.physics_prior    = torch.compile(hybrid_model.physics_prior)
+    hybrid_model.residual_network = torch.compile(hybrid_model.residual_network)
 
-    optimizer, scheduler, min_lr   = create_optimizer(residual_network, config)
+    optimizer, scheduler, min_lr = create_optimizer(residual_network, config)
 
     start_epoch  = 0
     resume_state = None
@@ -410,35 +323,18 @@ def main(resume_checkpoint: Optional[str] = None):
         resume_state = load_checkpoint(resume_checkpoint, residual_network, optimizer, scheduler, device)
         start_epoch  = resume_state['start_epoch']
 
-    # Load data
     csv_path = Path(__file__).parent / "data" / "updated_trajectory_data_progressive_noatmo_2.0.csv"
-    train_loader, val_loader, _, denorm_factors, min_bounds = load_trajectory_data(str(csv_path), config)
-    denorm_factors_torch = torch.tensor(denorm_factors, dtype=torch.float32, device=device)
-    min_bounds_torch     = torch.tensor(min_bounds,     dtype=torch.float32, device=device)
-    norm_type = get_norm_type(config)
+    train_loader, val_loader, _, norm_scale, norm_offset = load_trajectory_data(str(csv_path), config)
 
-    # Log the exact norm params that will be embedded in every checkpoint.
-    # These must match what test_physics_model.py uses — copy them to config.normalization_params
-    # if re-running evaluation with a different seed.
-    if norm_type == 'data_driven_normalization':
-        print("\n" + "="*60)
-        print("NORMALIZATION PARAMS (embed these in config if evaluating later)")
-        print("="*60)
-        print(f"  norm_scale  (std):  {denorm_factors.tolist()}")
-        print(f"  norm_offset (mean): {min_bounds.tolist()}")
+    # Attach normalization parameters to the model so they travel with every checkpoint
+    norm_scale_t  = torch.tensor(norm_scale,  dtype=torch.float32, device=device)
+    norm_offset_t = torch.tensor(norm_offset, dtype=torch.float32, device=device)
+    hybrid_model.norm_scale  = norm_scale_t
+    hybrid_model.norm_offset = norm_offset_t
+    print(f"\nNormalization parameters attached to model:")
+    print(f"  norm_scale  (std):  {norm_scale.tolist()}")
+    print(f"  norm_offset (mean): {norm_offset.tolist()}")
 
-    # Per-state loss scaling (optional)
-    per_state_scales_torch = None
-    if config['data'].get('per_state_loss_norm', False):
-        print("\n  Computing actual per-state scales from training data...")
-        df = pd.read_csv(str(csv_path))
-        actual_scales = compute_actual_scales(df)
-        per_state_scales_torch = torch.tensor(actual_scales, dtype=torch.float32, device=device)
-        print(f"  Actual scales (mean |gt|): {actual_scales}")
-        print(f"  Config denorm factors: {denorm_factors}")
-        print(f"  Ratio (under-weighting): {denorm_factors / actual_scales}")
-
-    # Hyperparameters
     train_config    = config['training']
     aphynity_config = config['aphynity']
 
@@ -457,7 +353,6 @@ def main(resume_checkpoint: Optional[str] = None):
     lambda_min     = aphynity_config['lambda_min']
     lambda_max     = aphynity_config['lambda_max']
 
-    # TensorBoard
     run_name = f"{datetime.now().strftime('%y%m%d')}_{checkpoint_subdir}"
     log_base  = Path(__file__).parent.parent / "logs" / "tensorboard"
     log_dir   = log_base / run_name
@@ -465,7 +360,7 @@ def main(resume_checkpoint: Optional[str] = None):
     writer = SummaryWriter(str(log_dir))
 
     _print_training_config(config, num_epochs, batch_size, horizon,
-                           lambda_current, tau_2, lambda_min, lambda_max, denorm_factors)
+                           lambda_current, tau_2, lambda_min, lambda_max)
 
     if resume_state:
         train_history = resume_state['train_history']
@@ -485,7 +380,6 @@ def main(resume_checkpoint: Optional[str] = None):
 
     for epoch in tqdm(range(start_epoch, num_epochs), desc="Training", unit="epoch"):
 
-        # Log config and hyperparams once at start of training
         if epoch == start_epoch:
             writer.add_text('Config/full_config', config_yaml)
             writer.add_text('Hyperparameters/text_summary',
@@ -514,10 +408,6 @@ def main(resume_checkpoint: Optional[str] = None):
                 ode_rtol=config['integration']['rtol'],
                 ode_atol=config['integration']['atol'],
                 dt=config['integration']['dt'],
-                denorm_factors=denorm_factors_torch if norm_type is not None else None,
-                min_bounds=min_bounds_torch if norm_type is not None else None,
-                per_state_scales=per_state_scales_torch,
-                norm_type=norm_type,
             )
 
             epoch_metrics['loss_total']          += metrics['loss_total']
@@ -527,7 +417,6 @@ def main(resume_checkpoint: Optional[str] = None):
 
             lambda_current = max(lambda_min, min(metrics['lambda_new'], lambda_max))
 
-            # Per-batch TensorBoard (high-resolution)
             writer.add_scalar('Batch/loss_total',          metrics['loss_total'],          global_step)
             writer.add_scalar('Batch/loss_trajectory',     metrics['loss_trajectory'],     global_step)
             writer.add_scalar('Batch/loss_regularization', metrics['loss_regularization'], global_step)
@@ -544,7 +433,6 @@ def main(resume_checkpoint: Optional[str] = None):
                 'λ':       f"{lambda_current:.4f}",
             })
 
-        # Average loss metrics over batches
         for key in ['loss_total', 'loss_trajectory', 'loss_regularization']:
             epoch_metrics[key] /= epoch_metrics['batch_count']
         if epoch_metrics['batch_count'] > 0:
@@ -560,9 +448,7 @@ def main(resume_checkpoint: Optional[str] = None):
         val_metrics = None
         if (epoch + 1) % val_freq == 0:
             val_metrics = run_validation_epoch(
-                hybrid_model, val_loader, config, device, lambda_current,
-                norm_type, denorm_factors_torch, min_bounds_torch, per_state_scales_torch,
-                epoch, num_epochs,
+                hybrid_model, val_loader, config, device, lambda_current, epoch, num_epochs,
             )
             val_history['loss_total'].append(val_metrics['loss_total'])
             val_history['loss_trajectory'].append(val_metrics['loss_trajectory'])
@@ -593,8 +479,6 @@ def main(resume_checkpoint: Optional[str] = None):
                 checkpoint_base_dir / f"epoch_{epoch+1}.pt",
                 epoch, hybrid_model, optimizer, scheduler,
                 lambda_current, train_history, val_history,
-                norm_scale=denorm_factors if norm_type is not None else None,
-                norm_offset=min_bounds    if norm_type is not None else None,
             )
 
     print("\n" + "="*80)
@@ -603,14 +487,11 @@ def main(resume_checkpoint: Optional[str] = None):
     print(f"Final λ: {lambda_current:.4f}")
     print(f"Total epochs trained: {len(train_history['loss_total'])}")
 
-    # Save final model (same format as epoch checkpoints so test script can read norm params)
     final_path = checkpoint_base_dir / "final_model.pt"
     final_path.parent.mkdir(parents=True, exist_ok=True)
     save_checkpoint(
         final_path, num_epochs - 1, hybrid_model, optimizer, scheduler,
         lambda_current, train_history, val_history,
-        norm_scale=denorm_factors if norm_type is not None else None,
-        norm_offset=min_bounds    if norm_type is not None else None,
     )
 
     writer.close()
@@ -621,11 +502,7 @@ def main(resume_checkpoint: Optional[str] = None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train hybrid physics-augmented world model')
-    parser.add_argument(
-        '--resume',
-        type=str,
-        default=None,
-        help='Path to checkpoint to resume from (e.g., fw_flightcontrol/physics/checkpoints/epoch_100.pt)'
-    )
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
     args = parser.parse_args()
     main(resume_checkpoint=args.resume)

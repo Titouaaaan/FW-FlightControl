@@ -14,10 +14,6 @@ C_L_q: 3.87            # JSBSim 2020 x8.xml
 # Drag coefficients (from JSBSim 2020 x8.xml) - EXACT VALUES
 C_D0: 0.0197           # JSBSim 2020 x8.xml
 C_D_alpha: 0.0791      # JSBSim 2020 x8.xml
-C_D_alpha2: 1.0555     # JSBSim 2020 x8.xml - quadratic term, not currently used
-C_D_beta1: -0.0058     # JSBSim 2020 x8.xml - not currently used
-C_D_beta2: 0.1478      # JSBSim 2020 x8.xml - not currently used
-C_D_p: 0.0             # JSBSim 2020 x8.xml - not currently used
 C_D_delta_e: 0.0633    # JSBSim 2020 x8.xml
 
 # Side force coefficients (from JSBSim 2020 x8.xml) - EXACT VALUES
@@ -26,7 +22,6 @@ C_Y_beta: -0.2239      # JSBSim 2020 x8.xml
 C_Y_p: -0.1374         # JSBSim 2020 x8.xml
 C_Y_r: 0.0839          # JSBSim 2020 x8.xml
 C_Y_delta_a: 0.0433    # JSBSim 2020 x8.xml
-C_Y_delta_r: 0.0       # Not used (no rudder control)
 
 # Rolling moment coefficients (from JSBSim 2020 x8.xml) - EXACT VALUES
 C_l0: 0.0              # JSBSim 2020 x8.xml
@@ -34,14 +29,12 @@ C_l_beta: -0.0849      # JSBSim 2020 x8.xml
 C_l_p: -0.4042         # JSBSim 2020 x8.xml
 C_l_r: 0.0555          # JSBSim 2020 x8.xml
 C_l_delta_a: 0.1202    # JSBSim 2020 x8.xml
-C_l_delta_r: 0.0       # Not used (no rudder control)
 
 # Pitching moment coefficients (from JSBSim 2020 x8.xml) - EXACT VALUES
 C_m0: 0.0227           # JSBSim 2020 x8.xml
 C_m_alpha: -0.4629     # JSBSim 2020 x8.xml
 C_m_q: -1.3012         # JSBSim 2020 x8.xml
 C_m_delta_e: -0.2292   # JSBSim 2020 x8.xml
-C_m_fp: -0.2168        # Not used (no flaps)
 
 # Yawing moment coefficients (from JSBSim 2020 x8.xml) - EXACT VALUES
 C_n0: 0.0              # JSBSim 2020 x8.xml
@@ -49,7 +42,6 @@ C_n_beta: 0.0283       # JSBSim 2020 x8.xml
 C_n_p: 0.0044          # JSBSim 2020 x8.xml
 C_n_r: -0.072          # JSBSim 2020 x8.xml
 C_n_delta_a: -0.00339  # JSBSim 2020 x8.xml
-C_n_delta_r: 0.0       # Not used (no rudder control)
 
 # Aircraft physical parameters
 g: 9.81           # m/s^2
@@ -73,11 +65,6 @@ mass: 3.3640
 # Propulsion
 C_p: 26.244        # Direct thrust model: T = C_p * throttle (from JSBSim investigation)
                    # Max thrust at full throttle (1.0): 5.9 lbs = 26.244 N
-                   # Note: Linear with throttle, independent of airspeed
-
-# Throttle (DEPRECATED - now dynamic from action[2] in the physics model)
-# This value is no longer used; throttle is extracted from the 3rd action dimension at runtime
-throttle: 0.5     # [DEPRECATED] kept for reference only
 
 
 # ============================================================
@@ -95,9 +82,6 @@ throttle: 0.5     # [DEPRECATED] kept for reference only
 # C_L_q              | --        | 3.87        | 3.87
 # C_D0               | 0.0197    | 0.0107      | 0.01970001
 # C_D_alpha          | 0.0791    | -0.00955    | 0.07909146
-# C_D_alpha2         | 1.06      | 1.1         | 1.05546999
-# C_D_beta1          | -0.00584  | -2.34E-19   | -0.00584298
-# C_D_beta2          | 0.148     | 0.115       | 0.14781193
 # C_D_delta_e        | 0.0633    | 0.0196      | 0.0633474
 # C_Y0               | 0.00316   | 1.08E-08    | 0.0 (JSBSim)
 # C_Y_beta           | -0.224    | -0.194      | -0.22387216
