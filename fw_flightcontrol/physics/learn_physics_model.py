@@ -198,25 +198,6 @@ def run_validation_epoch(
     return val_metrics
 
 
-
-def _print_training_config(config, num_epochs, batch_size, horizon, lambda_current, tau_2, lambda_min, lambda_max):
-    aphynity_config = config['aphynity']
-    train_config    = config['training']
-    print("\n" + "="*80)
-    print("TRAINING CONFIGURATION")
-    print("="*80)
-    print(f"\nTraining Loop:")
-    print(f"  • Epochs: {num_epochs}")
-    print(f"  • Batch size: {batch_size}")
-    print(f"  • Learning rate: {aphynity_config['tau_1']}")
-    print(f"  • Grad clipping: {train_config['grad_clip_norm']}")
-    print(f"\nAPHYNITY Objective:")
-    print(f"  • Prediction horizon: {horizon} steps (~{horizon*config['integration']['dt']:.2f}s)")
-    print(f"  • Initial λ: {lambda_current}")
-    print(f"  • λ step size (τ_2): {tau_2}")
-    print(f"  • λ bounds: [{lambda_min}, {lambda_max}]")
-
-
 def _build_hyperparams_text(config, batch_size, horizon, aphynity_config, train_config):
     return f"""
 ## Training Hyperparameters
@@ -305,9 +286,6 @@ def main(resume_checkpoint: Optional[str] = None):
     log_dir   = log_base / run_name
     log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(str(log_dir))
-
-    _print_training_config(config, num_epochs, batch_size, horizon,
-                           lambda_current, tau_2, lambda_min, lambda_max)
 
     if resume_state:
         train_history = resume_state['train_history']

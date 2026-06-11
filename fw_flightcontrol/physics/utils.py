@@ -26,10 +26,6 @@ STATE_NAMES = [
 ]
 
 
-# ============================================================================
-# CONFIG
-# ============================================================================
-
 def load_config(config_path: str) -> Dict:
     """Load training configuration from YAML file."""
     with open(config_path, 'r') as f:
@@ -43,10 +39,6 @@ def clean_state_dict_for_compilation(state_dict: Dict) -> Dict:
         return {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
     return state_dict
 
-
-# ============================================================================
-# NORMALIZATION  (data-driven: z-score  s_norm = (s - mean) / std)
-# ============================================================================
 
 def compute_data_norm_params(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     """Compute per-state mean and std from a (training) dataframe."""
@@ -75,10 +67,6 @@ def denormalize_state_torch(state: torch.Tensor, scale: torch.Tensor, offset: to
     """Denormalize a torch state tensor: s = s_norm * std + mean."""
     return state * scale + offset
 
-
-# ============================================================================
-# DATA LOADING
-# ============================================================================
 
 class TrajectoryDataset(torch.utils.data.Dataset):
     """Dataset wrapping trajectory sequences as fixed-length sliding windows."""
@@ -114,7 +102,6 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     norm_scale = std, norm_offset = mean (computed from training split).
     States are always normalized before being stored in the dataset.
     """
-    print(f"\nLoading training data from {csv_path}...")
     df = pd.read_csv(csv_path)
     print(f"Loaded {len(df)} transitions from {df['trajectory_id'].nunique()} trajectories")
 
@@ -139,9 +126,6 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
 
     train_df = df[df['trajectory_id'].isin(train_ids)]
     norm_offset, norm_scale = compute_data_norm_params(train_df)
-    print(f"\nData-driven normalization (from {len(train_df)} training rows):")
-    print(f"  Mean (norm_offset): {norm_offset}")
-    print(f"  Std  (norm_scale):  {norm_scale}")
 
     trajectory_sequences_by_traj: Dict = {}
 
@@ -177,9 +161,6 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
     val_seqs   = build_seqs(val_ids)
     test_seqs  = build_seqs(test_ids)
 
-    print(f"\nTrain/Val/Test split (trajectory level):")
-    print(f"  Trajectories: {len(train_ids)} train | {len(val_ids)} val | {len(test_ids)} test")
-    print(f"  Sequences:    {len(train_seqs)} train | {len(val_seqs)} val | {len(test_seqs)} test")
 
     def make_loader(seqs, shuffle=False):
         return torch.utils.data.DataLoader(
@@ -193,10 +174,6 @@ def load_trajectory_data(csv_path: str, config: Dict) -> Tuple:
 
     return make_loader(train_seqs, shuffle=True), make_loader(val_seqs), make_loader(test_seqs), norm_scale, norm_offset
 
-
-# ============================================================================
-# LOGGING
-# ============================================================================
 
 def log_epoch_summary(
     epoch: int,
@@ -281,10 +258,6 @@ def save_checkpoint(
     print(f"Saved checkpoint to {path}")
 
 
-# ============================================================================
-# CONTROL EVALUATION UTILITIES
-# ============================================================================
-
 def compute_convergence_stats(
     history_deg: List[float],
     target_deg: float,
@@ -310,10 +283,6 @@ def compute_convergence_stats(
         'steady_std': float(np.std(np.array(history_deg)[steady_slice])),
     }
 
-
-# ============================================================================
-# JSBSim ENV STATE SAVE / RESTORE
-# ============================================================================
 
 def get_env_state(env) -> dict:
     """Snapshot the physical state of a JSBSim env for later restoration."""
@@ -369,10 +338,6 @@ def set_env_state(env, state: dict) -> None:
     sim[prp.aileron_cmd]   = state['aileron_cmd']
     sim[prp.elevator_cmd]  = state['elevator_cmd']
 
-
-# ============================================================================
-# TEST SCRIPT UTILITIES
-# ============================================================================
 
 @contextmanager
 def suppress_output():
