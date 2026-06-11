@@ -1,33 +1,11 @@
-#!/usr/bin/env python3
-"""
-Residual learning network and hybrid dynamics model for aircraft dynamics.
-
-The key insight: the physics prior captures the basic aerodynamic equations,
-but real aircraft have modeling errors (unmodeled effects, coefficient uncertainties).
-We use a learned residual network F_a to correct these errors:
-
-    ds/dt = F_p(s, u) + F_a(s, u)
-
-where F_p is the frozen physics prior and F_a is the learnable residual network.
-This hybrid approach combines model-based constraints with learned corrections.
-"""
-
+#!/usr/bin/env python3"""Residual learning network and hybrid dynamics model for aircraft dynamics.The key insight: the physics prior captures the basic aerodynamic equations,but real aircraft have modeling errors (unmodeled effects, coefficient uncertainties).We use a learned residual network F_a to correct these errors:    ds/dt = F_p(s, u) + F_a(s, u)where F_p is the frozen physics prior and F_a is the learnable residual network.This hybrid approach combines model-based constraints with learned corrections."""
 import torch
 import torch.nn as nn
-
 
 class PhysicsAugmented(nn.Module):
     """
     Learned residual network that corrects physics prior predictions.
-
-    Input: current state s (normalized) and action u
-    Output: residual corrections Δ(ds/dt) in normalized space
-
-    We use a simple MLP architecture for efficiency and stability.
-    The network is initialized with small weights to ensure the residuals
-    start near zero, letting the physics prior dominate early training.
     """
-
     def __init__(self,
                  state_dim: int = 8,
                  action_dim: int = 3,
@@ -82,18 +60,8 @@ class PhysicsAugmented(nn.Module):
 class HybridDynamicsModel(nn.Module):
     """
     Combines physics prior and learned residual network into a unified dynamics model.
-
-    Ablation flags:
-    - with_prior=True,  with_residual=False : physics only
-    - with_prior=False, with_residual=True  : residual only
-    - with_prior=True,  with_residual=True  : full hybrid model (default)
-
     The combined dynamics are: ds_raw/dt = F_p(s_raw, u) + F_a(s_norm, u) * std
-
-    norm_scale and norm_offset are set after checkpoint loading and travel with
-    the model. Integration is handled externally via HybridDynamicsODE.
     """
-
     def __init__(self,
                  physics_prior,
                  residual_network,
@@ -114,9 +82,6 @@ class HybridDynamicsModel(nn.Module):
                 f"got '{integration_method}'"
             )
 
-        # Normalization parameters — set externally after checkpoint loading.
-        # Plain attributes (not buffers) so they don't interfere with state_dict.
-        # Must be on the same device as the model when used.
         self.norm_scale  = None  # std  per state dimension
         self.norm_offset = None  # mean per state dimension
 

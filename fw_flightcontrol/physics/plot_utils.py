@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-Plotting utilities for APHYNITY training visualization.
-
-This module provides functions to extract TensorBoard logs and generate
-publication-quality figures following scientific visualization standards:
-- Clear titles and captions
-- Proper axis labels with units
-- Variability measures (error bars, confidence intervals)
-- Consistent styling and color schemes
-"""
-
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches

@@ -1,24 +1,8 @@
-"""
-Training objectives for hybrid physics-augmented world model.
-
-This module implements APHYNITY-style training, which optimizes the residual
-network in the context of multi-step prediction. The key idea is that we want
-to minimize compounding errors over H steps, not just single-step errors.
-
-The APHYNITY loss has two components:
-1. Regularization term: ||F_a(s,u)||^2 — keeps residuals small
-2. Trajectory error: λ * Σ||s_pred - s_true||^2 — minimizes multi-step errors
-
-The parameter λ is updated via dual ascent, automatically balancing the two terms.
-States in the dataset are normalized; the ODE integration runs in raw physical space.
-"""
-
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 from torchdiffeq import odeint
 from typing import Dict
-
 from .utils import normalize_state_torch, denormalize_state_torch
 
 
@@ -93,20 +77,7 @@ def train_aphynity_epoch(
     ode_atol: float = 1e-5,
     dt: float = 0.01,
 ) -> Dict:
-    """
-    Train residual network using APHYNITY (Augmented Physics with Newton's method).
 
-    Unrolls an H-step trajectory, minimizes:
-        L = ||F_a|| + λ * Σ||s_pred - s_true||^2
-
-    λ is updated via dual ascent: λ_{j+1} = λ_j + τ₂ * L_traj
-
-    Args:
-        trajectory_batch: dict with
-            'initial_states': (B, 8) normalized starting state
-            'actions':        (B, H, 3) action sequence
-            'states':         (B, H, 8) normalized ground-truth states s_1..s_H
-    """
     initial_states      = trajectory_batch['initial_states'].to(device)
     actions             = trajectory_batch['actions'].to(device)
     ground_truth_states = trajectory_batch['states'].to(device)

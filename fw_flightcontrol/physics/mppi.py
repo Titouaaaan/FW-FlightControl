@@ -1,20 +1,3 @@
-"""
-MPPI (Model Predictive Path Integral) — backend-agnostic library.
-
-MPPIController is decoupled from any rollout backend:
-
-    Generic usage (any backend):
-        sampled = controller.sample_actions()
-        costs   = your_rollout_fn(sampled, ...)   # JSBSim, hybrid model, etc.
-        best    = controller.update(costs, sampled)
-
-    Hybrid model convenience wrapper:
-        best, info = controller.optimize(obs, target_roll, target_pitch,
-                                         hybrid_model, ...)
-
-This file contains no executable code — only importable functions and classes.
-"""
-
 import time
 import sys
 from pathlib import Path
@@ -35,8 +18,6 @@ from fw_flightcontrol.physics.training_objective import HybridDynamicsODE
 from fw_flightcontrol.physics.utils import load_config, clean_state_dict_for_compilation
 
 
-# ── Model loading ──────────────────────────────────────────────────────────────
-
 def load_config_and_model(
     model_path: str,
     config_path: str,
@@ -52,13 +33,8 @@ def load_config_and_model(
     Returns:
         (hybrid_model, config)
     """
-    print(f"\n{'='*60}\nLOADING MODEL AND CONFIGURATION\n{'='*60}")
-    print(f"  config:     {config_path}")
-    print(f"  checkpoint: {model_path}")
-
     config        = load_config(config_path)
     physics_prior = PhysicsPrior()
-    print("  ✓ Physics prior initialized (frozen)")
 
     raw = torch.load(model_path, map_location=device)
 
@@ -85,9 +61,6 @@ def load_config_and_model(
 
     net_config      = config['network']
     inferred_hidden = _infer_hidden_dims(residual_state)
-    if inferred_hidden and inferred_hidden != net_config['hidden_dims']:
-        print(f"  ⚠ Architecture mismatch: config={net_config['hidden_dims']}, "
-              f"checkpoint={inferred_hidden}. Using checkpoint.")
 
     residual_network = PhysicsAugmented(
         state_dim=net_config['state_dim'],
@@ -97,8 +70,6 @@ def load_config_and_model(
         use_batch_norm=net_config.get('use_batch_norm', False),
     )
     residual_network.load_state_dict(residual_state)
-    print(f"  ✓ Residual network: {sum(p.numel() for p in residual_network.parameters()):,} params "
-          f"(epoch={saved_epoch}, λ={saved_lambda})")
 
     hybrid_model = HybridDynamicsModel(
         physics_prior=physics_prior,
@@ -108,14 +79,8 @@ def load_config_and_model(
     ).to(device).eval()
     hybrid_model.norm_scale  = norm_scale
     hybrid_model.norm_offset = norm_offset
-    print(f"  ✓ Hybrid model ready on {device} "
-          f"(with_prior={with_prior}, with_residual={with_residual})")
-    print('='*60 + '\n')
 
     return hybrid_model, config
-
-
-# ── Environment initialization ─────────────────────────────────────────────────
 
 def initialize_environment(cfg: DictConfig) -> gym.Env:
     """Create the JSBSim gymnasium environment from a Hydra config.
@@ -135,8 +100,6 @@ def initialize_environment(cfg: DictConfig) -> gym.Env:
         print(f"  ✗ Environment init failed: {e}")
         return None
 
-
-# ── Hybrid model rollout ───────────────────────────────────────────────────────
 
 @torch.no_grad()
 def rollout_trajectories(
@@ -207,24 +170,6 @@ def compute_costs(
     target_roll:  float,
     target_pitch: float,
 ) -> np.ndarray:
-    """Compute per-trajectory MPPI costs from a (N, H, >=3) trajectory array.
-
-    Trajectories must have [roll_rad, pitch_rad, Va_ms, ...] in the last dim.
-    NaN trajectories (diverged or terminated early) receive NaN cost.
-
-    Each channel is normalised by its tolerance before RMSE. Each term is then
-    capped at 5× tolerance to prevent a single far-off objective from dominating
-    the sum and causing MPPI to sacrifice an already-met objective. The three
-    terms are summed (not averaged) so temperature λ acts on the raw total.
-
-    Args:
-        trajectories: (N, H, >=3) — roll [rad], pitch [rad], Va [m/s]
-        target_roll:  roll setpoint [°]
-        target_pitch: pitch setpoint [°]
-
-    Returns:
-        costs: (N,) — NaN for invalid trajectories
-    """
     target_roll_rad  = np.deg2rad(target_roll)
     target_pitch_rad = np.deg2rad(target_pitch)
     target_va_ms     = 60.0 / 3.6
@@ -284,29 +229,20 @@ class MPPIController:
         self.horizon      = horizon
         self.action_dim   = action_dim
         self.num_samples  = num_samples
-        self.temperature  = temperature  # λ
-        self.noise_std    = noise_std    # initial / maximum σ, reset each decision step
-        self.min_std      = min_std      # σ floor — prevents over-exploitation (eq. 5)
-        self.num_elites   = num_elites   # top-k for eq. 4 (TD-MPC: 64 of 512)
-        self.momentum     = momentum     # mean momentum across iterations (TD-MPC: 0.1)
+        self.temperature  = temperature  
+        self.noise_std    = noise_std    
+        self.min_std      = min_std      
+        self.num_elites   = num_elites   
+        self.momentum     = momentum     
         self.mean_actions  = np.zeros((horizon, action_dim))
-        self.current_sigma = noise_std   # adaptive σ, updated by update()
+        self.current_sigma = noise_std   
 
     def reset(self) -> None:
-        """Reset the warm-started mean sequence and σ to initial values."""
         self.mean_actions          = np.zeros((self.horizon, self.action_dim))
         self.mean_actions[:, 2]    = 0.3  # throttle warm-start
         self.current_sigma         = self.noise_std
 
     def sample_actions(self) -> np.ndarray:
-        """Sample N candidate action sequences around the current mean.
-
-        All N trajectories are sampled from N(μ, σ²I) as in TD-MPC (eq. 3/4).
-        Throttle uses half sigma to avoid pile-up at the [0,1] boundary.
-
-        Returns:
-            actions: (N, H, action_dim)
-        """
         noise_ae = np.random.normal(0, self.current_sigma,       (self.num_samples, self.horizon, 2))
         noise_t  = np.random.normal(0, self.current_sigma * 0.5, (self.num_samples, self.horizon))
 
@@ -317,25 +253,6 @@ class MPPIController:
 
     def update(self, costs: np.ndarray, sampled_actions: np.ndarray,
                shift: bool = True) -> np.ndarray:
-        """Apply MPPI weighting, update μ and σ, and return the best action.
-
-        Matches TD-MPC (eq. 4 + eq. 5): updates both mean and sigma after
-        each iteration. sigma is clamped to min_std to prevent over-exploitation.
-
-        Args:
-            costs:           (N,) scalar cost per trajectory. Non-finite values
-                             are replaced with a large penalty (10× max valid cost).
-            sampled_actions: (N, H, action_dim)
-            shift:           if True (default), advance the mean sequence by one
-                             step (warm-start for next decision step). Pass False
-                             for intermediate iterations within a single step so
-                             the plan is not advanced prematurely.
-
-        Returns:
-            best_action: (action_dim,) first step of the updated mean sequence,
-                         clipped to valid control ranges. Returns zeros if all
-                         costs are non-finite.
-        """
         valid = np.isfinite(costs)
         if not valid.any():
             best = self.mean_actions[0].copy()
@@ -347,7 +264,6 @@ class MPPIController:
 
         costs_safe = np.where(valid, costs, np.nanmax(costs[valid]) * 10.0)
 
-        # ── Top-k elite filtering (eq. 4) ─────────────────────────────────
         k = min(self.num_elites, int(valid.sum()), len(costs_safe) - 1)
         elite_idx     = np.argpartition(costs_safe, k)[:k]
         elite_costs   = costs_safe[elite_idx]
@@ -356,13 +272,9 @@ class MPPIController:
         w = np.exp(-(elite_costs - elite_costs.min()) / self.temperature)
         w /= w.sum()
 
-        # ── μ update with momentum (eq. 4) ────────────────────────────────
         weighted_mean     = np.einsum('k,khd->hd', w, elite_actions)
         self.mean_actions = (1.0 - self.momentum) * weighted_mean + self.momentum * self.mean_actions
 
-        # ── σ update (eq. 4 + eq. 5) ──────────────────────────────────────
-        # Weighted std of elite actions around the new mean, then clamp to
-        # min_std to prevent σ from collapsing and locking into a local optimum.
         diff         = elite_actions - self.mean_actions[None, :, :]
         weighted_var = np.einsum('k,khd->hd', w, diff ** 2)
         self.current_sigma = float(max(np.sqrt(np.mean(weighted_var)), self.min_std))
@@ -385,12 +297,6 @@ class MPPIController:
         device:         torch.device,
         residual_clamp: Optional[float] = None,
     ) -> Tuple[np.ndarray, Dict]:
-        """One MPPI step using the hybrid dynamics model as rollout backend.
-
-        Returns:
-            best_action: (action_dim,)
-            info:        dict with timing and cost statistics
-        """
         t0 = time.time()
 
         sampled = self.sample_actions()

@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-Training script for hybrid physics-augmented world model using APHYNITY.
-
-Pipeline:
-1. Load configuration from training_params.yaml
-2. Initialize physics prior and residual network
-3. Load trajectory data from CSV; compute normalization parameters
-4. Attach norm parameters to the model (saved in every checkpoint)
-5. Train residual network using APHYNITY objective
-6. Validate on held-out set
-7. Save checkpoints and TensorBoard metrics
-"""
-
 import torch
 import yaml
 import argparse
@@ -32,21 +19,8 @@ from fw_flightcontrol.physics.utils import (
     log_epoch_summary, log_tensorboard_epoch, save_checkpoint,
 )
 
-
-# ============================================================================
-# MODEL INITIALIZATION
-# ============================================================================
-
 def initialize_models(config: Dict, device: torch.device) -> Tuple[PhysicsAugmented, HybridDynamicsModel]:
-    """Initialize physics prior (frozen) and residual network (trainable)."""
-    print("\n" + "="*80)
-    print("INITIALIZING MODELS")
-    print("="*80)
-
     physics_prior = PhysicsPrior()
-    print("\nPhysics Prior:")
-    print("  ✓ Loaded aerodynamic coefficients from aero_coefficients.yaml")
-    print("  ✓ Model is frozen (non-trainable)")
 
     net_config = config['network']
     residual_network = PhysicsAugmented(
@@ -72,10 +46,6 @@ def initialize_models(config: Dict, device: torch.device) -> Tuple[PhysicsAugmen
         integration_method=integration_method
     )
     hybrid_model = hybrid_model.to(device)
-    print(f"\nHybrid Dynamics Model:")
-    print(f"  ✓ Initialized (ds/dt = F_p + F_a)")
-    print(f"  ✓ Integration method: {integration_method}")
-    print(f"  ✓ Model moved to {device}")
 
     return residual_network, hybrid_model
 
@@ -120,7 +90,6 @@ def create_optimizer(residual_network: PhysicsAugmented, config: Dict):
 
     learning_rate = aphynity_config['tau_1']
     optimizer = torch.optim.Adam(residual_network.parameters(), lr=learning_rate, betas=(0.9, 0.999))
-    print(f"Created Adam optimizer with lr={learning_rate}")
 
     scheduler = None
     min_lr    = None
@@ -133,15 +102,9 @@ def create_optimizer(residual_network: PhysicsAugmented, config: Dict):
                 gamma=scheduler_config.get('gamma', 0.7)
             )
             min_lr = scheduler_config.get('min_lr', 1e-5)
-            print(f"Created StepLR scheduler: step_size={scheduler_config.get('step_size', 20)}, "
-                  f"gamma={scheduler_config.get('gamma', 0.7)}, min_lr={min_lr}")
 
     return optimizer, scheduler, min_lr
 
-
-# ============================================================================
-# VALIDATION
-# ============================================================================
 
 def run_validation_epoch(
     hybrid_model: HybridDynamicsModel,
@@ -235,9 +198,6 @@ def run_validation_epoch(
     return val_metrics
 
 
-# ============================================================================
-# PRINT HELPERS
-# ============================================================================
 
 def _print_training_config(config, num_epochs, batch_size, horizon, lambda_current, tau_2, lambda_min, lambda_max):
     aphynity_config = config['aphynity']
@@ -293,19 +253,9 @@ def _build_hyperparams_text(config, batch_size, horizon, aphynity_config, train_
 """
 
 
-# ============================================================================
-# MAIN
-# ============================================================================
-
 def main(resume_checkpoint: Optional[str] = None):
-    print("\n" + "="*80)
-    print("HYBRID PHYSICS-AUGMENTED WORLD MODEL TRAINING")
-    print("="*80)
-    print(f"{'Resume Mode: ' + resume_checkpoint if resume_checkpoint else 'Fresh Start Mode'}")
-
     config_path = Path(__file__).parent / 'training_params.yaml'
     config = load_config(str(config_path))
-    print(f"\nLoaded configuration from {config_path}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -331,9 +281,6 @@ def main(resume_checkpoint: Optional[str] = None):
     norm_offset_t = torch.tensor(norm_offset, dtype=torch.float32, device=device)
     hybrid_model.norm_scale  = norm_scale_t
     hybrid_model.norm_offset = norm_offset_t
-    print(f"\nNormalization parameters attached to model:")
-    print(f"  norm_scale  (std):  {norm_scale.tolist()}")
-    print(f"  norm_offset (mean): {norm_offset.tolist()}")
 
     train_config    = config['training']
     aphynity_config = config['aphynity']
@@ -369,11 +316,6 @@ def main(resume_checkpoint: Optional[str] = None):
     else:
         train_history = {'loss_total': [], 'loss_trajectory': [], 'loss_regularization': [], 'lambda_history': []}
         val_history   = {'loss_total': [], 'loss_trajectory': [], 'loss_regularization': []}
-
-    print("\n" + "="*80)
-    print("TRAINING")
-    print("="*80)
-    print(f"Training epochs {start_epoch} to {num_epochs-1} (total: {num_epochs - start_epoch})")
 
     global_step = 0
     config_yaml = yaml.dump(config, default_flow_style=False)
@@ -444,7 +386,6 @@ def main(resume_checkpoint: Optional[str] = None):
         train_history['loss_regularization'].append(epoch_metrics['loss_regularization'])
         train_history['lambda_history'].append(lambda_current)
 
-        # ── Validate ───────────────────────────────────────────────────────
         val_metrics = None
         if (epoch + 1) % val_freq == 0:
             val_metrics = run_validation_epoch(
@@ -455,7 +396,6 @@ def main(resume_checkpoint: Optional[str] = None):
             val_history['loss_regularization'].append(val_metrics['loss_regularization'])
             hybrid_model.train()
 
-        # ── LR Scheduler ──────────────────────────────────────────────────
         current_lr = None
         if scheduler is not None:
             scheduler.step()
@@ -464,7 +404,6 @@ def main(resume_checkpoint: Optional[str] = None):
                     param_group['lr'] = min_lr
             current_lr = optimizer.param_groups[0]['lr']
 
-        # ── Log ────────────────────────────────────────────────────────────
         if (epoch + 1) % log_freq == 0:
             log_epoch_summary(epoch, num_epochs, epoch_metrics, val_metrics, lambda_current)
 
@@ -473,19 +412,12 @@ def main(resume_checkpoint: Optional[str] = None):
         ]}
         log_tensorboard_epoch(writer, epoch, epoch_metrics, val_metrics, lambda_current, grad_metrics, current_lr)
 
-        # ── Checkpoint ─────────────────────────────────────────────────────
         if (epoch + 1) % checkpoint_freq == 0:
             save_checkpoint(
                 checkpoint_base_dir / f"epoch_{epoch+1}.pt",
                 epoch, hybrid_model, optimizer, scheduler,
                 lambda_current, train_history, val_history,
             )
-
-    print("\n" + "="*80)
-    print("TRAINING COMPLETE")
-    print("="*80)
-    print(f"Final λ: {lambda_current:.4f}")
-    print(f"Total epochs trained: {len(train_history['loss_total'])}")
 
     final_path = checkpoint_base_dir / "final_model.pt"
     final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -496,8 +428,6 @@ def main(resume_checkpoint: Optional[str] = None):
 
     writer.close()
     print(f"TensorBoard logs saved to: {log_dir}")
-    print(f"  → Run: tensorboard --logdir {log_base}")
-    print("  → Then open http://localhost:6006 in your browser")
 
 
 if __name__ == '__main__':
